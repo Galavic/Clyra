@@ -3,12 +3,19 @@ name: Clyra installers
 # Builds downloadable installers without publishing a release or updating any feed.
 on:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Platforms to build
+        type: choice
+        default: all
+        options: [all, windows, macos, linux]
 
 permissions:
   contents: read
 
 jobs:
   windows:
+    if: inputs.platform == 'all' || inputs.platform == 'windows'
     runs-on: windows-2022
     timeout-minutes: 90
     defaults:
@@ -38,6 +45,7 @@ jobs:
           if-no-files-found: error
 
   macos:
+    if: inputs.platform == 'all' || inputs.platform == 'macos'
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +70,7 @@ jobs:
           if-no-files-found: error
 
   linux:
+    if: inputs.platform == 'all' || inputs.platform == 'linux'
     strategy:
       fail-fast: false
       matrix:

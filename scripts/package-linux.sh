@@ -71,11 +71,15 @@ if command -v dpkg-deb >/dev/null && command -v dpkg-shlibdeps >/dev/null; then
   cp "$STAGE/licenses/fonts/"* "$DEB_ROOT/usr/share/doc/clyra/licenses/fonts/"
   mkdir -p "$DEB_ROOT/debian"
   printf 'Source: clyra\nSection: devel\nPriority: optional\nMaintainer: Clyra <noreply@localhost>\n\nPackage: clyra\nArchitecture: any\nDescription: Coding agent workspace\n' >"$DEB_ROOT/debian/control"
-  DEPS="$(cd "$DEB_ROOT" && dpkg-shlibdeps -O -eusr/bin/clyra | sed -n 's/^shlibs:Depends=//p')"
+  # The WebKit helper is embedded in the Rust executable and extracted at runtime.
+  # Its shared libraries are invisible when inspecting only the main executable.
+  HELPER="$(find "$(dirname "$BIN")/build" -type f -name clyra-webkit -print -quit)"
+  test -n "$HELPER" || { echo 'Compiled Linux browser helper not found'; exit 1; }
+  DEPS="$(cd "$DEB_ROOT" && dpkg-shlibdeps -O -eusr/bin/clyra -e"$HELPER" | sed -n 's/^shlibs:Depends=//p')"
   test -n "$DEPS" || { echo 'Could not resolve Linux runtime dependencies'; exit 1; }
   rm -rf "$DEB_ROOT/debian"
   printf 'Package: clyra\nVersion: %s\nArchitecture: %s\nMaintainer: Clyra <noreply@localhost>\nSection: devel\nPriority: optional\nDepends: %s\nDescription: Coding agent workspace\n A desktop workspace for coding agents and autonomous Dots.\n' \
-    "$VERSION" "$DEB_ARCH" "$DEPS" >"$DEB_ROOT/DEBIAN/control"
+    "$VERSION" "$DEB_ARCH" "$DEPS, libvulkan1" >"$DEB_ROOT/DEBIAN/control"
   dpkg-deb --root-owner-group --build "$DEB_ROOT" "$OUT_DIR/clyra-$VERSION-linux-$ARCH.deb"
   rm -rf "$DEB_ROOT"
 fi
