@@ -8,14 +8,22 @@ Control your coding agents (Claude Code, Codex, Cursor, Devin, Grok, Hermes, Pi,
 
 Every device runs a small engine that stores sessions on that device. A new installation starts in local-only mode without an account or a network connection.
 
-## Install and run locally (Linux)
+## Desktop installers (Windows, macOS, Linux)
+
+Build and download the desktop installers through [Clyra installers](https://github.com/Galavic/Clyra/actions/workflows/installers.yml).
+Windows uses a setup `.exe`, macOS uses a `.dmg` for Apple silicon or Intel, and Linux
+uses a `.deb` or a portable `.tar.gz` for x64 or ARM64. See [installer instructions](dist/INSTALLERS.md).
+
+## Run locally (Linux)
 
 ```bash
-curl -fsSL https://zeron.sh/install.sh | sh
+# Install the downloaded desktop package first:
+sudo apt install ./clyra-0.2.83-linux-x86_64.deb
 clyra status
 ```
 
-The installer starts the daemon immediately and keeps it running across reboots. No sign-in or sync configuration is required.
+Open Clyra from your application menu. No sign-in or sync configuration is required
+for local use. To install an always-on user daemon, run `clyra daemon install`.
 
 The desktop sidebar browser also needs the [Linux browser runtime](docs/reference/linux-browser.md).
 
@@ -53,7 +61,8 @@ clyra daemon start
 
 On macOS: use the desktop release, or build `clyra` from source and run `clyra daemon install` to install the launchd service.
 
-On Windows: extract the portable release ZIP and run `clyra.exe`. Keep `clyra-update.json` beside it for in-app updates. See the [development notes](docs/reference/windows-development.md) for source builds.
+On Windows: open the setup installer. A portable ZIP is also available; extract it
+and run `clyra.exe`. See the [development notes](docs/reference/windows-development.md) for source builds.
 
 ---
 
