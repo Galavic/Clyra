@@ -2,12 +2,12 @@
 
 use std::sync::Arc;
 
-use gpui::{Entity, SharedString, Subscription, Task};
-use gpui_base::input::EditorState;
-use zeron_proto::{
+use clyra_proto::{
     WorkspaceFileText, WorkspaceLineEnding, WorkspaceReadOnlyReason, WorkspaceTextEncoding,
     WorkspaceWritableEncoding, WorkspaceWritableLineEnding,
 };
+use gpui::{Entity, SharedString, Subscription, Task};
+use gpui_base::input::EditorState;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct DocumentKey {
@@ -383,7 +383,7 @@ fn writable_line_ending(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeron_proto::WorkspaceTextEncoding;
+    use clyra_proto::WorkspaceTextEncoding;
 
     fn key(path: &str) -> DocumentKey {
         DocumentKey {

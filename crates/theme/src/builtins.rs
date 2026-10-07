@@ -12,7 +12,7 @@ pub fn builtin_registry() -> &'static ThemeRegistry {
     static REGISTRY: OnceLock<ThemeRegistry> = OnceLock::new();
     REGISTRY.get_or_init(|| ThemeRegistry {
         families: vec![
-            family("zeron", "Zeron", vec![zeron_light(), zeron_dark()]),
+            family("clyra", "Clyra", vec![clyra_light(), clyra_dark()]),
             family(
                 "vscode-default",
                 "VS Code Default",
@@ -236,32 +236,35 @@ const ANSI_LIGHT: [&str; 16] = [
     "#71717a", "#b91c1c", "#15803d", "#92400e", "#1d4ed8", "#7e22ce", "#155e75", "#18181b",
 ];
 
-fn zeron_dark() -> ThemeVariant {
+fn clyra_dark() -> ThemeVariant {
     variant(Seeds {
-        id: "zeron-dark",
-        family_id: "zeron",
-        name: "Zeron Dark",
+        id: "clyra-dark",
+        family_id: "clyra",
+        name: "Clyra Dark",
         appearance: Appearance::Dark,
         treatment: SurfaceTreatment::Frosted,
-        background: "#060606",
-        shell: "#0d0d0d",
-        raised: "#343438",
-        card: "#0e0e0e",
-        text: "#e8e8ea",
-        muted: "#a9a9ae",
-        faint: "#85858a",
-        accent: "#8b7cf6",
+        // Pure neutral blacks with a clear step between planes: the window,
+        // the shell, and the cards/elevated surfaces each read as their own
+        // layer. The accent stays Clyra violet.
+        background: "#080808",
+        shell: "#101010",
+        raised: "#262626",
+        card: "#1a1a1a",
+        text: "#f2f2f2",
+        muted: "#a3a3a3",
+        faint: "#7d7d7d",
+        accent: "#a78bfa",
         danger: "#f87171",
         warning: "#facc15",
         success: "#34d399",
-        terminal_background: "#090909",
+        terminal_background: "#0b0b0b",
         ansi: ANSI_DARK,
         syntax: [
-            "#92929a", "#8b7cf6", "#34d399", "#facc15", "#c084fc", "#60a5fa", "#f472b6", "#e8e8ea",
-            "#a1a1aa", "#f472b6", "#22d3ee", "#f87171",
+            "#8e8e8e", "#a78bfa", "#34d399", "#facc15", "#c084fc", "#60a5fa", "#f472b6", "#f2f2f2",
+            "#a3a3a3", "#f472b6", "#22d3ee", "#f87171",
         ],
         source: source(
-            "zeron-dark",
+            "clyra-dark",
             "native",
             "https://github.com/zeronsh/comet",
             "d138049",
@@ -270,11 +273,11 @@ fn zeron_dark() -> ThemeVariant {
     })
 }
 
-fn zeron_light() -> ThemeVariant {
+fn clyra_light() -> ThemeVariant {
     variant(Seeds {
-        id: "zeron-light",
-        family_id: "zeron",
-        name: "Zeron Light",
+        id: "clyra-light",
+        family_id: "clyra",
+        name: "Clyra Light",
         appearance: Appearance::Light,
         treatment: SurfaceTreatment::Frosted,
         background: "#ffffff",
@@ -284,18 +287,18 @@ fn zeron_light() -> ThemeVariant {
         text: "#303035",
         muted: "#62626a",
         faint: "#797981",
-        accent: "#5b43e8",
+        accent: "#7c3aed",
         danger: "#dc2626",
         warning: "#a16207",
         success: "#15803d",
         terminal_background: "#fafafa",
         ansi: ANSI_LIGHT,
         syntax: [
-            "#6b7280", "#5b43e8", "#15803d", "#a16207", "#7e22ce", "#2563eb", "#be185d", "#303035",
+            "#6b7280", "#7c3aed", "#15803d", "#a16207", "#7e22ce", "#2563eb", "#be185d", "#303035",
             "#52525b", "#be185d", "#0e7490", "#b91c1c",
         ],
         source: source(
-            "zeron-light",
+            "clyra-light",
             "native",
             "https://github.com/zeronsh/comet",
             "d138049",

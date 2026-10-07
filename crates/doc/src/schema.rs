@@ -319,7 +319,7 @@ impl SessionDoc {
     }
 
     /// A single atomic value prevents tokens and capacity from tearing on sync.
-    pub fn context_usage(&self) -> Option<zeron_proto::ContextUsage> {
+    pub fn context_usage(&self) -> Option<clyra_proto::ContextUsage> {
         let loro::ValueOrContainer::Value(LoroValue::String(value)) =
             self.doc.get_map("meta").get("contextUsage")?
         else {
@@ -334,7 +334,7 @@ impl SessionDoc {
         window: Option<u64>,
     ) -> Result<(), DocError> {
         let previous = self.context_usage().unwrap_or_default();
-        let next = zeron_proto::ContextUsage {
+        let next = clyra_proto::ContextUsage {
             tokens: tokens.or(previous.tokens),
             window: window.filter(|n| *n > 0).or(previous.window),
         };
@@ -722,7 +722,7 @@ impl SessionDoc {
                             loro::ValueOrContainer::Value(v) => serde_json::to_value(v).ok(),
                             _ => None,
                         })
-                        .and_then(|j| serde_json::from_value::<zeron_proto::ToolCall>(j).ok())
+                        .and_then(|j| serde_json::from_value::<clyra_proto::ToolCall>(j).ok())
                         .is_some_and(|c| c.is_subagent_spawn());
                     if !is_spawn {
                         return Ok(false);
@@ -742,6 +742,59 @@ impl SessionDoc {
             }
         }
         Ok(false)
+    }
+
+    /// Backfill `diffStats` on tool parts that have none — edits folded before
+    /// line counts were derived from the call payload. `stats` is keyed by
+    /// `(entry id, part id)`; an empty list is written as-is and marks "no
+    /// payload to count", so a later sweep skips the part. Parts that already
+    /// carry stats are never touched. Returns how many parts were written.
+    pub fn backfill_diff_stats(
+        &self,
+        stats: &std::collections::HashMap<(String, String), Vec<crate::parts::ToolDiffStat>>,
+    ) -> Result<usize, DocError> {
+        let as_str = |value: Option<loro::ValueOrContainer>| match value {
+            Some(loro::ValueOrContainer::Value(LoroValue::String(s))) => Some(s.to_string()),
+            _ => None,
+        };
+        let messages = self.doc.get_list("messages");
+        let mut written = 0;
+        for i in 0..messages.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(entry))) =
+                messages.get(i)
+            else {
+                continue;
+            };
+            let Some(entry_id) = as_str(entry.get("id")) else {
+                continue;
+            };
+            let Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) =
+                entry.get("parts")
+            else {
+                continue;
+            };
+            for j in 0..parts.len() {
+                let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) =
+                    parts.get(j)
+                else {
+                    continue;
+                };
+                if part.get("diffStats").is_some() {
+                    continue;
+                }
+                let Some(part_id) = as_str(part.get("id")) else {
+                    continue;
+                };
+                if let Some(stats) = stats.get(&(entry_id.clone(), part_id)) {
+                    part.insert("diffStats", loro_value_from_json(&serde_json::to_value(stats)?))?;
+                    written += 1;
+                }
+            }
+        }
+        if written > 0 {
+            self.doc.commit();
+        }
+        Ok(written)
     }
 
     /// Export a snapshot (persistence) — `ExportMode::Snapshot`.
@@ -1050,7 +1103,7 @@ pub fn join_continuation_entries(entries: Vec<SessionMessageEntry>) -> Vec<Sessi
 
 /// Incremental streaming writer for one assistant entry.
 ///
-/// Port of zeron's `DocSegmentWriter` diff discipline: called with the *folded* parts of the
+/// Port of clyra's `DocSegmentWriter` diff discipline: called with the *folded* parts of the
 /// live segment (from `fold_event_into_parts`) at each commit tick, it diffs against what's in
 /// the doc and writes only the delta:
 /// - trailing text growth → `LoroText` append (RLE-merged),
@@ -1353,7 +1406,7 @@ pub fn materialize_tail(
 mod tests {
     use super::*;
     use crate::parts::fold_event_into_parts;
-    use zeron_proto::{AgentEvent, ToolCall};
+    use clyra_proto::{AgentEvent, ToolCall};
 
     #[test]
     fn opening_tail_bounds_parts_and_preserves_continuation_ids() {
@@ -1479,7 +1532,7 @@ mod tests {
         let mut w = SegmentWriter::begin(&doc, "e1", "dev", 1).unwrap();
         let mut part = MessagePart::Tool {
             id: "call_alpha".into(),
-            call: zeron_proto::ToolCall::Unknown {
+            call: clyra_proto::ToolCall::Unknown {
                 name: "Agent: alpha".into(),
                 input: None,
             },
@@ -1532,7 +1585,7 @@ mod tests {
         // subtype and turned Run chips into dead spawn links, 2026-08-20).
         let doc = SessionDoc::init("c1").unwrap();
         let mut w = SegmentWriter::begin(&doc, "e1", "dev", 1).unwrap();
-        let tool = |id: &str, call: zeron_proto::ToolCall| MessagePart::Tool {
+        let tool = |id: &str, call: clyra_proto::ToolCall| MessagePart::Tool {
             id: id.into(),
             call,
             is_error: false,
@@ -1550,13 +1603,13 @@ mod tests {
         let parts = vec![
             tool(
                 "toolu_bash",
-                zeron_proto::ToolCall::Exec {
+                clyra_proto::ToolCall::Exec {
                     command: "git clone …".into(),
                 },
             ),
             tool(
                 "toolu_spawn",
-                zeron_proto::ToolCall::Unknown {
+                clyra_proto::ToolCall::Unknown {
                     name: "Agent: scan".into(),
                     input: None,
                 },
@@ -1813,7 +1866,7 @@ mod tests {
                 id: "t1".into(),
                 is_error: false,
                 output: Some("total 0\nmore lines".into()),
-                diff: Some(zeron_proto::ToolDiff {
+                diff: Some(clyra_proto::ToolDiff {
                     path: "/w/a.rs".into(),
                     old_text: Some("old\n".into()),
                     new_text: "new\n".into(),
@@ -1869,7 +1922,7 @@ mod tests {
                 is_error: false,
                 resolved: true,
                 output: Some("full inline output\nline 2".into()),
-                diff: Some(zeron_proto::ToolDiff {
+                diff: Some(clyra_proto::ToolDiff {
                     path: "/w/a.rs".into(),
                     old_text: Some("old".into()),
                     new_text: "new".into(),
@@ -2045,7 +2098,7 @@ mod context_usage_tests {
             .unwrap();
         assert_eq!(
             replica.context_usage(),
-            Some(zeron_proto::ContextUsage {
+            Some(clyra_proto::ContextUsage {
                 tokens: Some(0),
                 window: Some(200_000)
             })

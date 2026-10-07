@@ -24,16 +24,17 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
-use zeron_proto::{
+use clyra_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
+use clyra_proto::{
     FileSearchMatch, HarnessId, RunRequest, SandboxLevel, SlashCommand, UserInputAnswer,
     UserInputQuestion, capabilities,
 };
-use zeron_rpc::{RpcError, methods};
+use clyra_rpc::{RpcError, methods};
 
 use crate::appshots::{self, CapturedAppshot};
 use crate::attachments::{self, StagedAttachment};
 use crate::composer_markdown::{self, in_code};
+use crate::mascot::Mascot;
 use crate::motion;
 use crate::notice::{NoticeChipIcon, notice_chip};
 use crate::pickers::Pickers;
@@ -45,29 +46,32 @@ use crate::theme::Theme;
 // Constants + pure decision logic
 // ---------------------------------------------------------------------------
 
-/// Expanded-mode textarea vertical padding: `pt-4 pb-1` (zeron composer.tsx
+/// Expanded-mode textarea vertical padding: `pt-4 pb-1` (clyra composer.tsx
 /// line 578) = 16 + 4.
 pub const TEXTAREA_PAD_V: f32 = 20.0;
 /// The expanded textarea BOX (content + padding) is clamped by the original's
 /// auto-grow effect: `ta.style.height = Math.min(Math.max(scrollHeight, 76),
-/// 260)` (zeron composer.tsx line 235). The 76px floor applies even when
+/// 260)` (clyra composer.tsx line 235). The 76px floor applies even when
 /// empty — it's what makes the always-expanded new-chat composer tall.
 pub const TEXTAREA_MIN: f32 = 76.0;
 pub const TEXTAREA_MAX: f32 = 260.0;
 /// Expanded actions row: 2px top + 32px picker + 8px bottom.
 const ACTIONS_BOTTOM_PAD: f32 = 8.0;
 pub const ACTIONS_ROW_HEIGHT: f32 = 2.0 + 32.0 + ACTIONS_BOTTOM_PAD;
-/// The pill's 1px hairline, top + bottom (`rounded-[26px] border`).
-pub const PILL_BORDER_V: f32 = 2.0;
+/// The card's border width. The border shares the attached bands' tray color,
+/// so the bands read as the border thickening around the input.
+const PILL_BORDER_WIDTH: f32 = 3.0;
+/// The card's border, top + bottom.
+pub const PILL_BORDER_V: f32 = 2.0 * PILL_BORDER_WIDTH;
 /// Corner radius shared by the composer and the queue tray behind it.
 pub(crate) const COMPOSER_RADIUS: f32 = 26.0;
-/// Expanded composer bounds: 120px when empty, 304px at the content cap.
+/// Expanded composer bounds: 124px when empty, 308px at the content cap.
 pub const COMPOSER_MIN_HEIGHT: f32 = TEXTAREA_MIN + ACTIONS_ROW_HEIGHT + PILL_BORDER_V;
 pub const COMPOSER_MAX_HEIGHT: f32 = TEXTAREA_MAX + ACTIONS_ROW_HEIGHT + PILL_BORDER_V;
 /// Compact pill, border-box: one-line textarea `py-3` (24) + one 22.75px line
-/// (scrollHeight rounds to 47 in the original) + the 2px hairline = 49. The
+/// (scrollHeight rounds to 47 in the original) + the border = 53. The
 /// compact cluster (`py-1.5` + h-8 = 44) is shorter, so the textarea wins.
-pub const COMPACT_TOTAL_HEIGHT: f32 = 49.0;
+pub const COMPACT_TOTAL_HEIGHT: f32 = 47.0 + PILL_BORDER_V;
 /// `max-w-3xl`: stable outer width of the centered composer column.
 pub const COMPOSER_MAX_WIDTH: f32 = 768.0;
 /// The queue reads as a narrower tray emerging from behind the composer.
@@ -76,11 +80,81 @@ const QUEUE_SIDE_INSET: f32 = 16.0;
 /// from behind it instead of as a separate rounded pill.
 pub(crate) const QUEUE_COMPOSER_OVERLAP: f32 = 18.0;
 /// The original floating selector rows use the same 20px chip height as the
-/// established-thread footer. Their surrounding rows own no plate or border.
+/// established-thread footer. Both rows render as attached bands inside the
+/// composer's outer border (header/footer strips): the row content keeps its
+/// height and the band centers it, so the strips breathe like the reference
+/// while sharing the card's border, radius and plate.
 const NEW_THREAD_SELECTOR_ROW_HEIGHT: f32 = 20.0;
 // Accommodate the 24px usage indicator and PR badge without overflowing the
 // row's equal 8px top/bottom gutters.
 const SESSION_FOOTER_HEIGHT: f32 = 24.0;
+/// Vertical breathing room around the band rows. The strips center their
+/// 20/24px rows, landing both bands on the same full height.
+const TOP_BAND_PAD_V: f32 = 8.0;
+const BOTTOM_BAND_PAD_V: f32 = 6.0;
+/// Full attached-band heights (row + padding), animated by the route chrome.
+const TOP_BAND_HEIGHT: f32 = NEW_THREAD_SELECTOR_ROW_HEIGHT + 2.0 * TOP_BAND_PAD_V;
+const BOTTOM_BAND_HEIGHT: f32 = SESSION_FOOTER_HEIGHT + 2.0 * BOTTOM_BAND_PAD_V;
+/// On the new-chat canvas the git band (checkout + branch) stays folded
+/// away until the pointer reaches it. The hover target is an invisible strip
+/// under the card (within the composer's bottom padding), the card's lower
+/// edge, and the band itself once open.
+const GIT_BAND_HOVER_ZONE: f32 = Theme::SPACE_LG;
+const GIT_BAND_HOVER_EDGE: f32 = 14.0;
+const GIT_BAND_HOVER_KEY: &str = "composer-git-band";
+
+/// Rounds the input body where it meets an attached band: the tray color
+/// fills the corner fillets outside the body's rounded shape, so the input
+/// reads as a card with four rounded corners sitting on the band tray.
+/// `top`/`bottom` are the corner radii on each side; zero means no band there
+/// (the outer card's own rounding clips that edge).
+///
+/// Each fillet is a ring quad (inner radius `r`, outer radius past the
+/// corner's diagonal) clipped to the corner square — quads share the card's
+/// draw order with the band quads, so the fillets composite exactly like the
+/// bands (paths inside the frosted layer draw in a separate batch).
+fn paint_body_band_corners(
+    bounds: Bounds<Pixels>,
+    top: f32,
+    bottom: f32,
+    tray: gpui::Hsla,
+    window: &mut Window,
+) {
+    let x0 = f32::from(bounds.origin.x);
+    let y0 = f32::from(bounds.origin.y);
+    let x1 = x0 + f32::from(bounds.size.width);
+    let y1 = y0 + f32::from(bounds.size.height);
+    let max_r = ((x1 - x0).min(y1 - y0) / 2.0).max(0.0);
+    for (radius, is_top) in [(top, true), (bottom, false)] {
+        let r = radius.min(max_r);
+        if r < 0.5 {
+            continue;
+        }
+        // Ring thickness reaches the corner (distance r·√2 from the center)
+        // plus a pixel of slack for antialiasing.
+        let t = r * (std::f32::consts::SQRT_2 - 1.0) + 1.0;
+        let outer = r + t;
+        let cy = if is_top { y0 + r } else { y1 - r };
+        let clip_y = if is_top { y0 } else { y1 - r };
+        for (cx, clip_x) in [(x0 + r, x0), (x1 - r, x1 - r)] {
+            let clip = Bounds::new(point(px(clip_x), px(clip_y)), size(px(r), px(r)));
+            let ring = Bounds::new(
+                point(px(cx - outer), px(cy - outer)),
+                size(px(2.0 * outer), px(2.0 * outer)),
+            );
+            window.with_content_mask(Some(gpui::ContentMask { bounds: clip }), |window| {
+                window.paint_quad(quad(
+                    ring,
+                    px(outer),
+                    gpui::transparent_black(),
+                    px(t),
+                    tray,
+                    BorderStyle::Solid,
+                ));
+            });
+        }
+    }
+}
 
 /// Route chrome dissolves around the middle of the shared-element move. The
 /// two ramps never overlap, which avoids duplicate picker ids/popovers while
@@ -165,7 +239,7 @@ pub fn input_content_height(wrapped_lines: usize) -> f32 {
 /// Total expanded composer height (border-box) for a content height: the
 /// textarea BOX (content + `pt-4 pb-1`) clamps to 76–260 exactly like the
 /// original's auto-grow effect, then the actions row and the hairline
-/// ride on top. Range 120–304.
+/// ride on top. Range 124–308.
 pub fn composer_total_height(content_height: f32) -> f32 {
     (content_height + TEXTAREA_PAD_V).clamp(TEXTAREA_MIN, TEXTAREA_MAX)
         + ACTIONS_ROW_HEIGHT
@@ -280,7 +354,7 @@ fn input_drag_scroll_delta(
     distance.signum() * (distance.abs() * 0.2).clamp(1.0, line_height)
 }
 
-/// Staged-attachment strip metrics (zeron attachment-ui.tsx AttachmentStrip:
+/// Staged-attachment strip metrics (clyra attachment-ui.tsx AttachmentStrip:
 /// `flex flex-wrap gap-2 px-4 pt-3`, `size-14` thumbs).
 pub const STRIP_THUMB: f32 = 56.0;
 pub const STRIP_GAP: f32 = 8.0;
@@ -384,8 +458,8 @@ impl FlipMorph {
 // expanded, a bottom-justified row when compact) and only the TEXT glides
 // with the sweeping top edge. The helpers below are the pure math.
 
-/// Send/attach center sits 25px above the expanded pill's bottom (8px
-/// padding + half the 32px control zone + 1px border), versus 24.5px in
+/// Send/attach center sits 27px above the expanded pill's bottom (8px
+/// padding + half the 32px control zone + 3px border), versus 26.5px in
 /// compact. The morph glides this optical adjustment instead of snapping.
 pub const CLUSTER_Y_DELTA: f32 =
     ACTIONS_BOTTOM_PAD + 16.0 + PILL_BORDER_V / 2.0 - COMPACT_TOTAL_HEIGHT / 2.0;
@@ -865,7 +939,7 @@ const MENTION_TOOLTIP_HEIGHT: f32 = 24.0;
 const MENTION_SIDE_PAD: &str = "\u{00A0}";
 /// A private URI scheme keeps file mentions distinguishable from ordinary
 /// Markdown links pasted into the composer.
-use zeron_proto::file_mentions::{FILE_MENTION_SCHEME, local_file_link, local_path_is_safe};
+use clyra_proto::file_mentions::{FILE_MENTION_SCHEME, local_file_link, local_path_is_safe};
 
 /// A restorable point in the input's history: text plus where the caret and
 /// selection sat when the edit landed.
@@ -934,7 +1008,7 @@ fn dropped_file_mention(
 }
 
 fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
-    zeron_proto::file_mentions::file_mention_links(text)
+    clyra_proto::file_mentions::file_mention_links(text)
         .into_iter()
         .map(|link| FileMentionLink {
             range: link.range,
@@ -1177,7 +1251,7 @@ impl TextProjection {
     fn project(raw: &str, active: Option<Range<usize>>, compact: bool) -> Self {
         let mut links = file_mention_links(raw);
         links.extend(
-            zeron_proto::invocation::invocation_links(raw)
+            clyra_proto::invocation::invocation_links(raw)
                 .into_iter()
                 .map(|(range, invocation)| FileMentionLink {
                     range,
@@ -1394,7 +1468,7 @@ pub struct SentMentionSpan {
 /// is safe to call for every user row.
 pub fn sent_mention_display(raw: &str) -> Option<(String, Vec<SentMentionSpan>)> {
     if !raw.contains(FILE_MENTION_SCHEME)
-        && !raw.contains(zeron_proto::invocation::INVOCATION_SCHEME)
+        && !raw.contains(clyra_proto::invocation::INVOCATION_SCHEME)
     {
         return None;
     }
@@ -1778,7 +1852,7 @@ pub struct ComposerInput {
     /// Raw Markdown → chip display projection from the last layout pass.
     projection: TextProjection,
     syntax_source: String,
-    syntax_spans: Vec<zeron_syntax::HighlightSpan>,
+    syntax_spans: Vec<clyra_syntax::HighlightSpan>,
     syntax_task: Option<Task<()>>,
     /// Inline completion preview: painted in faint ink after the text while
     /// the caret sits at the end (palette tab-completion). Owned by the
@@ -2775,8 +2849,8 @@ impl ComposerInput {
                 continue;
             }
             text.push_str(&self.content[at..link.range.start]);
-            text.push_str(&zeron_proto::invocation::invocation_prompt(
-                &zeron_proto::file_mentions::file_mention_prompt(&self.content[link.range.clone()]),
+            text.push_str(&clyra_proto::invocation::invocation_prompt(
+                &clyra_proto::file_mentions::file_mention_prompt(&self.content[link.range.clone()]),
             ));
             at = link.range.end;
         }
@@ -3518,7 +3592,7 @@ impl ComposerInput {
         }
         // Rebuild this even for an empty draft. Otherwise deleting the final
         // mention can leave its previous paint geometry alive while the
-        // placeholder is already being shaped, tinting "Do anything" for a
+        // placeholder is already being shaped, tinting "Ask for follow-up changes" for a
         // frame (or longer when no subsequent layout is requested).
         self.refresh_projection();
         let (display, is_placeholder) = if self.content.is_empty() {
@@ -4630,7 +4704,7 @@ pub enum ComposerEvent {
     /// chat, even when the user has selected another chat in the meantime.
     WorktreeSetup {
         chat_id: String,
-        setup_action: Option<zeron_proto::ProjectActionRun>,
+        setup_action: Option<clyra_proto::ProjectActionRun>,
         setup_error: Option<String>,
         target_device_id: Option<String>,
     },
@@ -4946,7 +5020,7 @@ fn skill_display_name(name: &str) -> String {
         .join(" ")
 }
 
-/// Commands implemented by Zeron, independently of the provider protocol.
+/// Commands implemented by Clyra, independently of the provider protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceCommand {
     Model,
@@ -4966,27 +5040,27 @@ impl WorkspaceCommand {
             (
                 Self::Model,
                 "model",
-                "Zeron: choose agent, model, and reasoning",
+                "Clyra: choose agent, model, and reasoning",
                 false,
             ),
-            (Self::New, "new", "Zeron: start a new conversation", false),
+            (Self::New, "new", "Clyra: start a new conversation", false),
             (
                 Self::Resume,
                 "resume",
-                "Zeron: search and open conversations",
+                "Clyra: search and open conversations",
                 false,
             ),
-            (Self::Settings, "settings", "Zeron: open settings", false),
-            (Self::Diff, "diff", "Zeron: open changes", true),
-            (Self::Files, "files", "Zeron: open project files", true),
-            (Self::Terminal, "terminal", "Zeron: open a terminal", true),
+            (Self::Settings, "settings", "Clyra: open settings", false),
+            (Self::Diff, "diff", "Clyra: open changes", true),
+            (Self::Files, "files", "Clyra: open project files", true),
+            (Self::Terminal, "terminal", "Clyra: open a terminal", true),
             (
                 Self::Rename,
                 "rename",
-                "Zeron: rename this conversation",
+                "Clyra: rename this conversation",
                 true,
             ),
-            (Self::Stop, "stop", "Zeron: stop the active run", true),
+            (Self::Stop, "stop", "Clyra: stop the active run", true),
         ]
     }
 }
@@ -5000,14 +5074,14 @@ fn with_workspace_commands(
         if needs_chat && !in_chat {
             continue;
         }
-        // Keep provider commands intact. Explicit Zeron names remain available
+        // Keep provider commands intact. Explicit Clyra names remain available
         // when a provider owns the unqualified name.
         let mut name = name.to_string();
         while rows.iter().any(|row| row.name == name) {
-            name = format!("zeron:{name}");
+            name = format!("clyra:{name}");
         }
         rows.push(InvocationCandidate {
-            invocation: zeron_proto::invocation::Invocation::Command { name: name.clone() },
+            invocation: clyra_proto::invocation::Invocation::Command { name: name.clone() },
             name,
             description: description.into(),
             input_hint: None,
@@ -5037,17 +5111,17 @@ struct InvocationCandidate {
     name: String,
     description: String,
     input_hint: Option<String>,
-    invocation: zeron_proto::invocation::Invocation,
+    invocation: clyra_proto::invocation::Invocation,
 }
 
 fn invocation_insertion(
-    invocation: &zeron_proto::invocation::Invocation,
+    invocation: &clyra_proto::invocation::Invocation,
     supported: bool,
 ) -> String {
     if !supported
         && matches!(
             invocation,
-            zeron_proto::invocation::Invocation::Command { .. }
+            clyra_proto::invocation::Invocation::Command { .. }
         )
     {
         invocation.prompt_text()
@@ -5058,8 +5132,8 @@ fn invocation_insertion(
 
 fn references_require_update(text: &str, supported: bool) -> bool {
     !supported
-        && (!zeron_proto::invocation::invocation_links(text).is_empty()
-            || !zeron_proto::file_mentions::file_mention_links(text).is_empty())
+        && (!clyra_proto::invocation::invocation_links(text).is_empty()
+            || !clyra_proto::file_mentions::file_mention_links(text).is_empty())
 }
 
 /// Slash-command completion state: like [`FileMentionState`] but the
@@ -5115,7 +5189,7 @@ fn mention_response_is_current(state: &FileMentionState, request: u64) -> bool {
 fn mention_error_message(err: &RpcError) -> SharedString {
     match err {
         RpcError::UnknownMethod(_) => {
-            "The session's device runs an older zeron — update it to search its files".into()
+            "The session's device runs an older clyra — update it to search its files".into()
         }
         RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
         RpcError::BadParams(_) | RpcError::Failed(_) => "File search failed".into(),
@@ -5125,9 +5199,9 @@ fn mention_error_message(err: &RpcError) -> SharedString {
 /// A failed command discovery, translated for the popup.
 fn invocation_candidates(
     commands: Vec<SlashCommand>,
-    skills: Vec<zeron_proto::invocation::Skill>,
+    skills: Vec<clyra_proto::invocation::Skill>,
 ) -> Vec<InvocationCandidate> {
-    use zeron_proto::invocation::{
+    use clyra_proto::invocation::{
         valid_invocation_name, valid_skill_command_name, valid_skill_path,
     };
     // A remote engine may use an older catalog decoder. Every visible choice
@@ -5160,7 +5234,7 @@ fn invocation_candidates(
             input_hint: c.input_hint,
             name: c.name.clone(),
             description: c.description,
-            invocation: zeron_proto::invocation::Invocation::Command { name: c.name },
+            invocation: clyra_proto::invocation::Invocation::Command { name: c.name },
         })
         .chain(
             skills
@@ -5170,12 +5244,12 @@ fn invocation_candidates(
                     workspace_command: None,
                     input_hint: None,
                     name: s.name.clone(),
-                    description: if zeron_proto::invocation::native_skill_identity(&s.path) {
+                    description: if clyra_proto::invocation::native_skill_identity(&s.path) {
                         s.description.clone()
                     } else {
                         format!("{} — {}", s.description, s.path)
                     },
-                    invocation: zeron_proto::invocation::Invocation::Skill {
+                    invocation: clyra_proto::invocation::Invocation::Skill {
                         name: s.name,
                         path: s.path,
                         command: s.command,
@@ -5187,7 +5261,7 @@ fn invocation_candidates(
 
 fn merge_invocation_results(
     commands: Result<Vec<SlashCommand>, RpcError>,
-    skills: Result<Option<Vec<zeron_proto::invocation::Skill>>, RpcError>,
+    skills: Result<Option<Vec<clyra_proto::invocation::Skill>>, RpcError>,
     skill_only: bool,
 ) -> Result<(Vec<InvocationCandidate>, bool, Option<SharedString>), RpcError> {
     match (commands, skills) {
@@ -5217,9 +5291,9 @@ fn slash_error_message(err: &RpcError, skill: bool) -> SharedString {
     match err {
         RpcError::UnknownMethod(_) => {
             if skill {
-                "Skills require an updated engine on the selected device. Restart that device’s Zeron after updating.".into()
+                "Skills require an updated engine on the selected device. Restart that device’s Clyra after updating.".into()
             } else {
-                "Commands require an updated engine on the selected device. Restart that device’s Zeron after updating.".into()
+                "Commands require an updated engine on the selected device. Restart that device’s Clyra after updating.".into()
             }
         }
         RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
@@ -5235,12 +5309,14 @@ fn slash_error_message(err: &RpcError, skill: bool) -> SharedString {
 
 pub struct Composer {
     pub(crate) state: Entity<AppState>,
+    dot_briefing: Option<String>,
     pub(crate) input: Entity<ComposerInput>,
     /// Draft displaced while a queued message occupies the composer.
     pub(crate) queue_edit_draft: Option<(String, Vec<StagedAttachment>, Vec<CapturedAppshot>)>,
     /// Composer actions row plus the new-session floating target tab
-    /// ([`Pickers::render_new_thread_target_selectors`]).
-    pickers: Entity<Pickers>,
+    /// ([`Pickers::render_new_thread_target_selectors`]). Also the shell's
+    /// route to the effective harness (the account-usage strip).
+    pub(crate) pickers: Entity<Pickers>,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
     drafts: HashMap<String, String>,
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
@@ -5282,6 +5358,13 @@ pub struct Composer {
     /// The state observer consumes it to distinguish that handoff from normal
     /// session navigation, which must continue to snap.
     launching_new_chat: bool,
+    /// Agent filesystem permissions for the next run (toolbar access chip).
+    /// Rides `RunRequest.sandbox` at send time; defaults to workspace-write.
+    sandbox: SandboxLevel,
+    /// Glitch pet state (frames live here; the advance timer below notifies).
+    mascot: Mascot,
+    /// Frame-advance loop while the pet animates (one task; ends itself).
+    mascot_task: Option<Task<()>>,
     pub(crate) failure: Option<SharedString>,
     /// The chat key `failure` belongs to (`None` = global, e.g. "Engine not
     /// connected"). Chat-scoped failures survive navigation and render only
@@ -5364,6 +5447,10 @@ pub struct Composer {
     model_handoff_from: f32,
     model_handoff_morph: Option<FlipMorph>,
     model_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    /// Measured slot of the toolbar access (sandbox) chip — same canvas
+    /// pattern as `model_bounds`. Lets the model handoff math account for
+    /// the chip's width in the expanded actions row.
+    access_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     dock_frame: Option<crate::composer_dock::DockFrame>,
     /// The shared clock owns this frame's height, including its final step.
     dock_height_changed: bool,
@@ -5438,12 +5525,30 @@ impl Composer {
         }
     }
 
+    pub fn set_dot_briefing(&mut self, briefing: Option<String>, cx: &mut Context<Self>) {
+        self.dot_briefing = briefing;
+        cx.notify();
+    }
+
+    pub(crate) fn dot_prompt(&self, text: &str) -> String {
+        match &self.dot_briefing {
+            Some(briefing) if !text.trim().is_empty() => format!(
+                "<!-- clyra-dot-context -->\n{briefing}\n\n{}\n\n<!-- clyra-dot-message -->\n{text}",
+                clyra_engine::automations::DOT_COORDINATION
+            ),
+            _ => text.to_string(),
+        }
+    }
+
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         cx.on_release(|this, cx| this.release_queue_previews(cx))
             .detach();
         let input = cx.new(|cx| {
-            let mut input =
-                ComposerInput::with_context("Do anything…", MESSAGE_COMPOSER_CONTEXT, cx);
+            let mut input = ComposerInput::with_context(
+                "Ask for follow-up changes",
+                MESSAGE_COMPOSER_CONTEXT,
+                cx,
+            );
             input.enable_mentions();
             input
         });
@@ -5513,6 +5618,7 @@ impl Composer {
         let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
         let mut composer = Self {
             state,
+            dot_briefing: None,
             input,
             queue_edit_draft: None,
             pickers,
@@ -5562,7 +5668,14 @@ impl Composer {
             queue_previews: HashMap::new(),
             queue_removing: HashSet::new(),
             queue_shortcut_revealed: false,
-            expanded_mode: false,
+            // The composer no longer collapses: it always renders the
+            // expanded pill (like a new chat), so typing never rearranges
+            // the toolbar. The flip bookkeeping below stays as measurement
+            // state but collapse commits are disabled.
+            expanded_mode: true,
+            sandbox: SandboxLevel::WorkspaceWrite,
+            mascot: Mascot::new(),
+            mascot_task: None,
             flip_epoch: 0,
             compact_capacity: 0.0,
             expanded_anchor: 0.0,
@@ -5576,6 +5689,7 @@ impl Composer {
             model_handoff_from: 1.0,
             model_handoff_morph: None,
             model_bounds: Default::default(),
+            access_bounds: Default::default(),
             dock_frame: None,
             dock_height_changed: false,
             dock_clearance_correction: 0.0,
@@ -6398,7 +6512,7 @@ impl Composer {
                         .await
                         .ok()
                         .and_then(|v| {
-                            serde_json::from_value::<Option<Vec<zeron_proto::invocation::Skill>>>(v)
+                            serde_json::from_value::<Option<Vec<clyra_proto::invocation::Skill>>>(v)
                                 .ok()
                         })
                         .flatten()
@@ -6881,7 +6995,7 @@ impl Composer {
                         .client()
                         .call(methods::LIST_SKILLS, params.clone())
                         .await?;
-                    serde_json::from_value::<Option<Vec<zeron_proto::invocation::Skill>>>(value)
+                    serde_json::from_value::<Option<Vec<clyra_proto::invocation::Skill>>>(value)
                         .map_err(|e| RpcError::Failed(e.to_string()))
                 };
                 let (commands, skills) = futures::join!(commands, skills);
@@ -7294,8 +7408,9 @@ impl Composer {
                 && self.last_rendered_height > 0.0
             {
                 // Both directions share one timeline. The blank canvas is
-                // always expanded; an established session begins compact.
-                self.expanded_mode = returning_to_new_thread;
+                // always expanded, and established sessions stay expanded
+                // too — typing never rearranges the toolbar.
+                self.expanded_mode = true;
                 let now_ms =
                     self.morph_clock.elapsed().as_secs_f32() * 1000.0 / motion::speed_scale();
                 self.flip_morph = Some(FlipMorph::new_thread_transition(
@@ -7352,8 +7467,9 @@ impl Composer {
                     if released {
                         self.wizard = None;
                         self.advance_task = None;
-                        self.input
-                            .update(cx, |input, cx| input.set_placeholder("Do anything…", cx));
+                        self.input.update(cx, |input, cx| {
+                            input.set_placeholder("Ask for follow-up changes", cx)
+                        });
                     }
                 }
             }
@@ -7390,7 +7506,7 @@ impl Composer {
     /// Check before consuming drafts, attachments, or an edited queue row.
     pub(crate) fn check_reference_delivery(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
         if references_require_update(text, self.reference_delivery_supported(cx)) {
-            self.failure = Some("Update the selected device’s Zeron to send file, command, or skill references. Your draft is preserved.".into());
+            self.failure = Some("Update the selected device’s Clyra to send file, command, or skill references. Your draft is preserved.".into());
             self.failure_key = Some(self.current_key.clone());
             cx.notify();
             return false;
@@ -7515,6 +7631,8 @@ impl Composer {
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
     fn send(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
+        let user_text = text.clone();
+        let text = self.dot_prompt(&text);
         if !self.check_reference_delivery(&text, cx) {
             return;
         }
@@ -7537,6 +7655,9 @@ impl Composer {
         // Fully-resolved model/reasoning/options — concrete values (chat config
         // or defaults), so the engine never has to guess a "default".
         let resolved = self.pickers.read(cx).resolved(cx);
+        // Filesystem permissions from the toolbar access chip (read at send
+        // time so the async block below needs no composer access).
+        let sandbox = self.sandbox;
         let existing_cwd = self
             .state
             .read(cx)
@@ -7615,7 +7736,7 @@ impl Composer {
             }
             taken
         });
-        let typed = text.clone();
+        let typed = user_text;
         let text = crate::comments::with_comments(&text, &comments);
         self.preview = None;
         let message_id = uuid::Uuid::new_v4().to_string();
@@ -7733,7 +7854,7 @@ impl Composer {
         // so the doc frame dedups it away).
         let echo = SessionMessageEntry {
             id: message_id.clone(),
-            role: zeron_doc::MessageRole::User,
+            role: clyra_doc::MessageRole::User,
             parts: vec![MessagePart::Text {
                 id: "t0".into(),
                 text: echo_text.clone(),
@@ -7899,7 +8020,7 @@ impl Composer {
                     if should_publish_optimistic_echo(queue) {
                         let refreshed = SessionMessageEntry {
                             id: message_id.clone(),
-                            role: zeron_doc::MessageRole::User,
+                            role: clyra_doc::MessageRole::User,
                             parts: vec![MessagePart::Text {
                                 id: "t0".into(),
                                 text: content.clone(),
@@ -7943,7 +8064,7 @@ impl Composer {
                 // a blocking CreateWorktree relay RPC here: the RPC had no
                 // timeout, so a lost relay frame wedged the send on "Sending…"
                 // forever while the session ran remotely anyway (2026-08-18).
-                let mut run_worktree: Option<zeron_proto::WorktreeSpec> = None;
+                let mut run_worktree: Option<clyra_proto::WorktreeSpec> = None;
                 // The picked ref rides createChat so the session footer names
                 // it from the first frame (it read "Select ref" until the
                 // host's diff reconciler got around to stamping the branch).
@@ -7960,7 +8081,7 @@ impl Composer {
                         }
                         crate::pickers::CheckoutPlan::NewWorktree { base } => {
                             // Footer shows the base until the host stamps the
-                            // actual zeron/<name> branch post-creation. cwd
+                            // actual clyra/<name> branch post-creation. cwd
                             // stays the repo folder — an old host that doesn't
                             // know the spec degrades to the main checkout
                             // instead of failing the run.
@@ -7976,7 +8097,7 @@ impl Composer {
                                 // current checkout state.
                                 let base =
                                     base.clone().unwrap_or_else(|| "HEAD".to_string());
-                                run_worktree = Some(zeron_proto::WorktreeSpec {
+                                run_worktree = Some(clyra_proto::WorktreeSpec {
                                     repo_path: repo_path.clone(),
                                     base,
                                     space_id: space_id.clone(),
@@ -8089,7 +8210,7 @@ impl Composer {
                         reasoning: resolved.reasoning,
                         model_options: resolved.model_options.clone(),
                         cwd,
-                        sandbox: SandboxLevel::WorkspaceWrite,
+                        sandbox,
                         auto_approve: false,
                         resume: None,
                         attachments: attachment_paths,
@@ -8382,7 +8503,7 @@ impl Composer {
         self.input.update(cx, |input, cx| {
             input.set_text("", cx);
             // The panel borrowed the composer input; hand back its identity.
-            input.set_placeholder("Do anything…", cx);
+            input.set_placeholder("Ask for follow-up changes", cx);
             input.set_key_context(MESSAGE_COMPOSER_CONTEXT, cx);
         });
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -8470,7 +8591,7 @@ impl Composer {
 
     // ---- render pieces ----
 
-    /// The agent-asked-a-question panel (zeron question-panel.tsx), rendered in
+    /// The agent-asked-a-question panel (clyra question-panel.tsx), rendered in
     /// place of the composer: the same floating-pill chrome (`rounded-[26px]
     /// border-white/[0.08] bg-white/[0.03] shadow-xl`), uppercase header +
     /// "1/3" counter chip, option rows with number kbd chips, a free-text
@@ -8491,7 +8612,7 @@ impl Composer {
 
         let options = question.options.iter().enumerate().map(|(ix, label)| {
             // Selection reads on the row only while no typed override exists
-            // (typed answers win — zeron question-panel.tsx `isSel`).
+            // (typed answers win — clyra question-panel.tsx `isSel`).
             let picked = wizard.is_picked(ix) && typed_empty;
             div()
                 .id(("wizard-option", ix))
@@ -8508,7 +8629,7 @@ impl Composer {
                 } else {
                     gpui::transparent_black()
                 })
-                // zeron question-panel.tsx option rows: `transition-colors`.
+                // clyra question-panel.tsx option rows: `transition-colors`.
                 .bg(if picked {
                     crate::theme::ink(0.09)
                 } else {
@@ -8569,7 +8690,7 @@ impl Composer {
             .rounded(px(COMPOSER_RADIUS))
             .border_1()
             .border_color(theme.border)
-            .bg(theme.input_glass_bg())
+            .bg(theme.composer_plate_bg(crate::settings::current(cx).composer_opacity))
             .when(!theme.is_frost(), |el| el.shadow_lg())
             .flex()
             .flex_col()
@@ -8678,13 +8799,82 @@ impl Composer {
             .into_any_element()
     }
 
+    /// Sandbox access chip for the expanded actions row: icon + label +
+    /// chevron in the model chip's geometry (h-32, 12px medium). Full access
+    /// paints amber; the other levels stay muted. Click cycles the level;
+    /// the value rides `RunRequest.sandbox` at send time.
+    fn render_access_chip(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = Theme::of(cx);
+        let (label, icon, color) = match self.sandbox {
+            SandboxLevel::ReadOnly => ("Read only", crate::icons::EYE, theme.text_muted),
+            SandboxLevel::WorkspaceWrite => {
+                ("Can edit", crate::icons::KEY_MINIMALISTIC, theme.text_muted)
+            }
+            SandboxLevel::DangerFullAccess => {
+                ("Full access", crate::icons::DANGER_TRIANGLE, theme.warning)
+            }
+        };
+        let measured_access_bounds = self.access_bounds.clone();
+        div()
+            .relative()
+            .child(
+                div()
+                    .id("composer-access")
+                    .h(px(32.0))
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(6.0))
+                    .rounded(px(8.0))
+                    .cursor_pointer()
+                    .bg(motion::hover_blend(
+                        "composer-access",
+                        gpui::transparent_black(),
+                        crate::theme::ink(0.10),
+                    ))
+                    .on_hover(motion::hover_listener("composer-access"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sandbox = match this.sandbox {
+                            SandboxLevel::ReadOnly => SandboxLevel::WorkspaceWrite,
+                            SandboxLevel::WorkspaceWrite => SandboxLevel::DangerFullAccess,
+                            SandboxLevel::DangerFullAccess => SandboxLevel::ReadOnly,
+                        };
+                        cx.notify();
+                    }))
+                    .child(crate::icons::icon(icon).size(px(16.0)).text_color(color))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(color)
+                            .child(SharedString::from(label)),
+                    )
+                    .child(
+                        crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
+                            .size(px(12.0))
+                            .text_color(color),
+                    ),
+            )
+            .child(
+                gpui::canvas(
+                    move |bounds, _, _| measured_access_bounds.set(Some(bounds)),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .into_any_element()
+    }
+
     fn render_send_button(
         &mut self,
         mode: SendButtonMode,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = Theme::of(cx);
-        // Zeron composer-actions.tsx: a size-7 filled circle — up-arrow to
+        // Clyra composer-actions.tsx: a size-7 filled circle — up-arrow to
         // send/queue, a dark rounded square on the same light circle to stop.
         match mode {
             SendButtonMode::Stop => div()
@@ -8728,6 +8918,21 @@ impl Composer {
                     .into_any_element()
             }
         }
+    }
+
+    /// Glitch pet overlay: top-left above the pill. Absolute against the
+    /// surface (which hugs the pill), so it rides pill growth without
+    /// moving any layout — always mounted, only the frame swaps.
+    fn render_mascot(&self) -> gpui::AnyElement {
+        div()
+            .id("composer-mascot")
+            .absolute()
+            .left(px(10.0))
+            .top(px(-30.0))
+            .w(px(36.0))
+            .h(px(30.0))
+            .child(self.mascot.render())
+            .into_any_element()
     }
 }
 
@@ -8860,7 +9065,10 @@ impl Render for Composer {
             has_newline,
             resizing,
         );
-        let committed_flip = next != self.expanded_mode && measured_since_flip;
+        // Collapse commits are disabled: the composer stays expanded once
+        // expanded (which is now its initial state), so only expansions
+        // may commit — and those are no-ops. Typing never flips the layout.
+        let committed_flip = next && next != self.expanded_mode && measured_since_flip;
         if committed_flip {
             self.expanded_mode = next;
             self.flip_epoch = epoch;
@@ -8869,8 +9077,8 @@ impl Render for Composer {
             // an interactive resize.
             self.last_seen_width = 0.0;
         }
-        // New chats render expanded regardless of `expanded_mode` (see below),
-        // so a mode flip there changes nothing visible — never morph it.
+        // Every chat renders expanded (the old compact pill is gone), so a
+        // mode flip here changes nothing visible — never morph it.
         let new_chat = self.state.read(cx).selected_chat.is_none();
         // Morph clock in ms; dividing by the measurement knob stretches the
         // timeline exactly like shell.rs eval_tween's scaled duration.
@@ -8905,7 +9113,7 @@ impl Render for Composer {
         // UP FRONT that a send will queue (a durable local write delivered on
         // reconnect) instead of letting the button imply instant delivery.
         let queue_notice: Option<(SharedString, bool)> = {
-            use zeron_proto::ConnectivityState as S;
+            use clyra_proto::ConnectivityState as S;
             let state = self.state.read(cx);
             let degraded = match state.selected_chat.as_deref() {
                 Some(id) => state.chat_delivery_degraded(id),
@@ -8931,7 +9139,7 @@ impl Render for Composer {
                 (text, offline)
             })
         };
-        // Centered composer column (zeron `mx-auto w-full max-w-3xl`).
+        // Centered composer column (clyra `mx-auto w-full max-w-3xl`).
         let container = div()
             .w_full()
             .max_w(px(COMPOSER_MAX_WIDTH))
@@ -9062,9 +9270,10 @@ impl Render for Composer {
         let staged_count = self.staged().len();
         // The input width excludes the inline controls in compact mode.
         // Wrap against the pill's content width in both modes, accounting
-        // for the outer container padding and the pill's 1px borders.
-        let strip_width_hint =
-            self.last_available_width.unwrap_or(COMPOSER_MAX_WIDTH) - 2.0 * Theme::SPACE_LG - 2.0;
+        // for the outer container padding and the pill's side borders.
+        let strip_width_hint = self.last_available_width.unwrap_or(COMPOSER_MAX_WIDTH)
+            - 2.0 * Theme::SPACE_LG
+            - 2.0 * PILL_BORDER_WIDTH;
         let appshot_count = self.staged_appshots().len();
         let strip_h = attachment_strip_height(staged_count, strip_width_hint);
         let comment_strip_h = comment_strip_height(self.staged_comments(cx).len());
@@ -9202,6 +9411,47 @@ impl Render for Composer {
         });
 
         let send_button = self.render_send_button(mode, cx);
+        let access_chip = self.render_access_chip(cx);
+        // Glitch pet: clip follows composer signals; the frame timer
+        // notifies for each new frame.
+        let reduced = motion::reduced_motion(cx);
+        let pet_changed = self.mascot.resolve(
+            !self.input.read(cx).text().is_empty(),
+            !matches!(mode, SendButtonMode::Send),
+            self.failure.is_some(),
+            matches!(theme.appearance, crate::theme::Appearance::Dark),
+            Instant::now(),
+        );
+        if pet_changed {
+            cx.notify();
+        }
+        if self.mascot.wants_timer(!reduced) && self.mascot_task.is_none() {
+            self.mascot_task = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    let delay = this
+                        .update(cx, |composer, _| composer.mascot.current_delay_ms())
+                        .unwrap_or(120);
+                    cx.background_executor()
+                        .timer(Duration::from_millis(delay))
+                        .await;
+                    let alive = this
+                        .update(cx, |composer, cx| {
+                            if !composer.mascot.wants_timer(!motion::reduced_motion(cx)) {
+                                composer.mascot_task = None;
+                                return false;
+                            }
+                            if composer.mascot.advance() {
+                                cx.notify();
+                            }
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !alive {
+                        break;
+                    }
+                }
+            }));
+        }
         // Attach button — opens the native image picker (the original's hidden
         // `<input type=file accept="image/*" multiple>`); paste/drop also feed
         // the same strip. The leading utility group owns the spacing between
@@ -9215,7 +9465,7 @@ impl Render for Composer {
             .justify_center()
             .rounded_full()
             .cursor_pointer()
-            // zeron composer-actions.tsx attach: `transition-colors`.
+            // clyra composer-actions.tsx attach: `transition-colors`.
             .bg(motion::hover_blend(
                 "composer-attach",
                 gpui::transparent_black(),
@@ -9224,49 +9474,45 @@ impl Render for Composer {
             .on_hover(motion::hover_listener("composer-attach"))
             .on_click(cx.listener(|this, _, _, cx| this.open_file_picker(cx)))
             .child(
-                crate::icons::icon(crate::icons::PAPERCLIP)
+                crate::icons::icon(crate::icons::PLUS)
                     // Its painted bounds are centered in the 24px viewbox;
                     // a larger glyph balances the brand icon without moving
                     // it off-center inside the unchanged 28px hit target.
                     .size(px(18.0))
                     .text_color(theme.text_muted),
             );
+        // Access-level chip (sandbox selector): icon + label + chevron in
+        // the model chip's geometry. Full access paints amber; clicking
+        // cycles Read only → Can edit → Full access.
         // Staged-thumbnail strip (attachment-ui.tsx AttachmentStrip), above
         // the input inside the pill in both modes.
         let strip = self.render_attachment_strip(&theme, cx);
         let appshot_strip = self.render_appshot_strip(&theme, window, cx);
         let comments_chip = self.render_comments_chip(&theme, cx);
 
-        // A translucent cool silver/slate edge sits more naturally on frost
-        // than the general-purpose white/black separator color.
-        let pill_border = if theme.is_frost() {
-            match theme.appearance {
-                crate::theme::Appearance::Dark => gpui::hsla(210.0 / 360.0, 0.18, 0.78, 0.09),
-                crate::theme::Appearance::Light => gpui::hsla(210.0 / 360.0, 0.18, 0.32, 0.10),
-            }
-        } else {
-            theme.border
+        // The border and the attached bands share one recessed tray tone,
+        // darker than the input plate, so the bands read as the border
+        // thickening around the input card.
+        let pill_border = match theme.appearance {
+            crate::theme::Appearance::Dark => gpui::hsla(0.0, 0.0, 0.0, 0.28),
+            crate::theme::Appearance::Light => gpui::hsla(0.0, 0.0, 0.0, 0.07),
         };
         // Compensate for the transcript canvas beneath the frosted surface.
         // Keep the opaque fallback when frost is disabled or unsupported.
-        let pill = div()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    // Padding and action controls are part of the text composer.
-                    // Open menus keep their own keyboard/search focus.
-                    if !this.pickers.read(cx).is_open() {
-                        window.focus(&this.input.focus_handle(cx), cx);
-                    }
-                }),
-            )
-            .rounded(px(surface_radius))
-            .border_1()
-            .border_color(pill_border)
-            .when(theme.is_frost(), |el| el.bg(theme.composer_sidebar_tint()))
-            .when(!theme.is_frost(), |el| {
-                el.bg(theme.input_glass_bg()).shadow_lg()
-            });
+        // The middle body owns no chrome of its own: the outer card below
+        // paints the single border, radius, plate and shadow once around the
+        // top band, this body and the bottom band, so the bands read as part
+        // of the border instead of floating rows.
+        let pill = div().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, window, cx| {
+                // Padding and action controls are part of the text composer.
+                // Open menus keep their own keyboard/search focus.
+                if !this.pickers.read(cx).is_open() {
+                    window.focus(&this.input.focus_handle(cx), cx);
+                }
+            }),
+        );
         // The pill's bottom edge is stationary on screen (the composer sits at
         // the bottom of the shell column; growth moves the TOP edge), so the
         // controls pin to the bottom and only the text glides with the reveal
@@ -9299,6 +9545,19 @@ impl Render for Composer {
             .map_or(strip_width_hint + PILL_BORDER_V, |bounds| {
                 f32::from(bounds.size.width)
             });
+        // The access chip only joins the expanded actions row (attach →
+        // access → model); the compact row keeps the attach → model
+        // adjacency this travel was written for, so only shift when the
+        // expanded body renders. Unmeasured (first expanded frame) reads 0,
+        // the same staleness contract as `model_bounds`.
+        let access_shift = if expanded {
+            self.access_bounds
+                .get()
+                .map_or(0.0, |bounds| f32::from(bounds.size.width))
+                + ACTION_UTILITY_GAP
+        } else {
+            0.0
+        };
         let model_travel = (surface_width
             - PILL_BORDER_V
             - action_inset
@@ -9310,7 +9569,8 @@ impl Render for Composer {
                 .map_or(0.0, |bounds| f32::from(bounds.size.width))
             - ACTION_PRIMARY_GAP
             - 28.0
-            - action_inset)
+            - action_inset
+            - access_shift)
             .max(0.0);
         let (model_side, model_opacity, model_drift) = model_handoff(self.model_handoff_position);
         let model_offset = (model_side - compact_target) * model_travel + model_drift;
@@ -9383,6 +9643,7 @@ impl Render for Composer {
                                 .items_center()
                                 .gap(px(ACTION_UTILITY_GAP))
                                 .child(attach)
+                                .child(access_chip)
                                 .child(model_picker),
                         )
                         .child(send_button),
@@ -9470,17 +9731,192 @@ impl Render for Composer {
             .read(cx)
             .selected_space_row()
             .is_some_and(|space| space.git_detected);
+        let session_chrome = 1.0 - new_thread_chrome;
+        // A bottom band is only worth a footprint when it can show something:
+        // git controls or the usage window. Both are route-stable (the picked
+        // space doesn't change mid-morph), so gating on them never pops.
+        let usage = self.state.read(cx).context_usage;
+        let bottom_expected =
+            has_new_thread_git_selectors || crate::context_usage::has_window(usage);
+        // The lower band keeps a stable footprint while docked (its git and
+        // session rows crossfade inside); undocked it grows continuously with
+        // the session chrome. Either way the height is continuous — the band
+        // never snaps.
+        // New chat: the git band reveals on hover (fading with the shared
+        // hover timeline) and stays while one of its menus is open; sessions
+        // keep their footer band as before.
+        // (The shell hands the composer a dock frame every frame, so this
+        // applies whether or not a route morph is running.)
+        let git_band_on_hover = has_new_thread_git_selectors;
+        let git_band_reveal = if git_band_on_hover {
+            let menu_open = self.pickers.read(cx).is_open();
+            motion::hover_t(GIT_BAND_HOVER_KEY).max(if menu_open { 1.0 } else { 0.0 })
+        } else {
+            1.0
+        };
+        // Folded git band on the new-chat side, full band on the session
+        // side; continuous across the route morph.
+        let git_band_slot = session_chrome + new_thread_chrome * git_band_reveal;
+        let bottom_slot = if self.dock_frame.is_some() {
+            if !bottom_expected {
+                0.0
+            } else if has_new_thread_git_selectors {
+                git_band_slot
+            } else {
+                1.0
+            }
+        } else if !bottom_expected {
+            0.0
+        } else if has_new_thread_git_selectors {
+            git_band_slot
+        } else {
+            session_chrome
+        };
+        let footer = (session_chrome_opacity > 0.0).then(|| {
+            self.pickers
+                .update(cx, |pickers, cx| pickers.render_footer(cx))
+        });
+        // Attached chrome bands: the top project/device strip and the bottom
+        // git/footer strip render INSIDE the composer's outer border, painted
+        // in the border's own color so they read as the border thickening into
+        // a tray. The input body keeps four rounded corners over them: the tray
+        // color wraps into its corner fillets (see `paint_body_band_corners`).
+        let band_bg = pill_border;
+        // Radius just inside the border. gpui clips children to a plain
+        // rectangle, so the bands round their own outer corners to stay
+        // inside the card's rounding instead of poking out behind it.
+        let inner_radius = (surface_radius - PILL_BORDER_WIDTH).max(0.0);
+        let top_band = (new_thread_chrome > 0.0).then(|| {
+            div()
+                .w_full()
+                .h(px(TOP_BAND_HEIGHT * new_thread_chrome))
+                .overflow_hidden()
+                .flex()
+                .items_center()
+                .justify_end()
+                .px(px(10.0))
+                .bg(band_bg)
+                .rounded_t(px(inner_radius))
+                .opacity(new_thread_chrome_opacity)
+                .children(new_thread_target_selectors)
+        });
+        let bottom_band_height = BOTTOM_BAND_HEIGHT * bottom_slot;
+        let bottom_band = (bottom_band_height > 0.0).then(|| {
+            div()
+                .w_full()
+                .h(px(bottom_band_height))
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .bg(band_bg)
+                .rounded_b(px(inner_radius))
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(SESSION_FOOTER_HEIGHT))
+                        .relative()
+                        .when(new_thread_chrome_opacity > 0.0, |slot| {
+                            slot.child(
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .px(px(10.0))
+                                    .flex()
+                                    .items_center()
+                                    .opacity(new_thread_chrome_opacity)
+                                    .children(new_thread_git_selectors),
+                            )
+                        })
+                        .when(session_chrome_opacity > 0.0, |slot| {
+                            slot.child(
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .w_full()
+                                    .h(px(SESSION_FOOTER_HEIGHT))
+                                    .flex()
+                                    .items_center()
+                                    .opacity(session_chrome_opacity)
+                                    .child(div().flex_1().min_w_0().children(footer.flatten()))
+                                    .children(crate::context_usage::has_window(usage).then(|| {
+                                        div().flex_none().pr(px(10.0)).child(
+                                            crate::context_usage::render(
+                                                usage,
+                                                self.state.clone(),
+                                                &theme,
+                                            ),
+                                        )
+                                    })),
+                            )
+                        }),
+                )
+        });
+        // Corner radii for the body's band-facing edges, growing with each
+        // band's footprint so the rounding never pops as the bands animate.
+        let body_radius = inner_radius;
+        let body_top_radius = if top_band.is_some() {
+            body_radius * new_thread_chrome.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let body_bottom_radius = if bottom_band.is_some() {
+            body_radius * bottom_slot.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let body = div()
+            .relative()
+            .w_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .when(body_top_radius > 0.0 || body_bottom_radius > 0.0, |slot| {
+                slot.child(
+                    gpui::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            paint_body_band_corners(
+                                bounds,
+                                body_top_radius,
+                                body_bottom_radius,
+                                band_bg,
+                                window,
+                            )
+                        },
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+            })
+            .child(body);
+        // Single outer card: one border, plate and shadow enclose the top
+        // band, the input body and the bottom band. The card clips the bands
+        // to its corners, which is what fuses them into the border.
         // The file dropzone lives in the shell (the whole conversation column,
         // not just the pill — shell.rs `chat-dropzone`); drops land back here
         // via `add_paths`.
-        // Frosted: the pill backdrop-blurs the transcript scrolling under it
-        // (the popover glass treatment; radius matches the pill's rounding).
+        // Frosted: the card backdrop-blurs the transcript scrolling under it
+        // (the popover glass treatment; radius matches the card's rounding).
         // The shell keeps this entity under one parent on both routes. The
         // surface itself never fades, and frost follows the same morph radius.
+        let card = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .rounded(px(surface_radius))
+            .border(px(PILL_BORDER_WIDTH))
+            .border_color(pill_border)
+            .bg(theme.composer_plate_bg(crate::settings::current(cx).composer_opacity))
+            .when(!theme.is_frost(), |el| el.shadow_lg())
+            .children(top_band)
+            .child(body)
+            .children(bottom_band);
         let pill_surface = div()
             .relative()
             .id("composer-surface")
-            .child(crate::frost::frosted(surface_radius, 16.0, body))
+            .child(crate::frost::frosted(surface_radius, 16.0, card))
             .child({
                 let measured = self.surface_bounds.clone();
                 // All prepaint completes before any paint. The background
@@ -9495,104 +9931,26 @@ impl Render for Composer {
             // Both completion popups span the full pill width above it —
             // the file-mention and slash tokens are mutually exclusive.
             .children(self.render_file_mention_popup(&theme, cx))
-            .children(self.render_slash_popup(&theme, cx));
-        // Restore the original chip-only selector treatment: destination at
-        // the top-right, no surrounding surface. Cancel the column gap as the
-        // row collapses so the pill never jumps at the route boundary.
-        let container = if self.dock_frame.is_some() {
-            // Floating selectors share the surface's origin and never change its height.
-            container.relative().child(
-                div()
-                    .id("dock-target-selectors")
-                    .absolute()
-                    .top(px(-28.0))
-                    .left(px(Theme::SPACE_LG + 10.0))
-                    .right(px(Theme::SPACE_LG + 10.0))
-                    .h(px(NEW_THREAD_SELECTOR_ROW_HEIGHT))
-                    .flex()
-                    .items_start()
-                    .justify_end()
-                    .opacity(new_thread_chrome_opacity)
-                    .children(new_thread_target_selectors),
-            )
-        } else if new_thread_chrome > 0.0 {
-            container.child(
-                div()
-                    .w_full()
-                    .h(px(NEW_THREAD_SELECTOR_ROW_HEIGHT * new_thread_chrome))
-                    .mb(px(-Theme::SPACE_SM * (1.0 - new_thread_chrome)))
-                    .px(px(10.0))
-                    .flex()
-                    .items_start()
-                    .justify_end()
-                    .opacity(new_thread_chrome_opacity)
-                    .children(new_thread_target_selectors),
-            )
-        } else {
-            container
-        };
-        let container = container.child(pill_surface);
-
-        // The lower slot keeps a stable footprint for Git projects while its
-        // old floating checkout/ref controls dissolve into the session footer.
-        // Non-Git sessions grow the slot continuously from zero.
-        let session_chrome = 1.0 - new_thread_chrome;
-        let bottom_slot = if has_new_thread_git_selectors || self.dock_frame.is_some() {
-            1.0
-        } else {
-            session_chrome
-        };
-        let container = if bottom_slot > 0.0 {
-            let footer = (session_chrome_opacity > 0.0).then(|| {
-                self.pickers
-                    .update(cx, |pickers, cx| pickers.render_footer(cx))
+            .children(self.render_slash_popup(&theme, cx))
+            .child(self.render_mascot())
+            // Hover target for the folded git band: the strip under the card
+            // plus the band's current footprint. Hover-only (no occlusion),
+            // so the band's pickers underneath still take clicks.
+            .when(git_band_on_hover && new_thread_chrome > 0.0, |el| {
+                el.child(
+                    div()
+                        .id("composer-git-band-hover")
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom(px(-GIT_BAND_HOVER_ZONE))
+                        .h(px(GIT_BAND_HOVER_ZONE
+                            + bottom_band_height
+                            + GIT_BAND_HOVER_EDGE))
+                        .on_hover(motion::hover_listener(GIT_BAND_HOVER_KEY)),
+                )
             });
-            let usage = self.state.read(cx).context_usage;
-            container.child(
-                div()
-                    .w_full()
-                    .h(px(SESSION_FOOTER_HEIGHT * bottom_slot))
-                    .mt(px(-Theme::SPACE_SM * (1.0 - bottom_slot)))
-                    .mb(px(-Theme::SPACE_SM * bottom_slot))
-                    .relative()
-                    .when(new_thread_chrome_opacity > 0.0, |slot| {
-                        slot.child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .px(px(10.0))
-                                .flex()
-                                .items_center()
-                                .opacity(new_thread_chrome_opacity)
-                                .children(new_thread_git_selectors),
-                        )
-                    })
-                    .when(session_chrome_opacity > 0.0, |slot| {
-                        slot.child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .w_full()
-                                .h(px(SESSION_FOOTER_HEIGHT))
-                                .flex()
-                                .items_center()
-                                .opacity(session_chrome_opacity)
-                                .child(div().flex_1().min_w_0().children(footer.flatten()))
-                                .children(crate::context_usage::has_window(usage).then(|| {
-                                    div().flex_none().pr(px(10.0)).child(
-                                        crate::context_usage::render(
-                                            usage,
-                                            self.state.clone(),
-                                            &theme,
-                                        ),
-                                    )
-                                })),
-                        )
-                    }),
-            )
-        } else {
-            container
-        };
+        let container = container.child(pill_surface);
         // Full-size preview of a staged thumbnail (AttachmentPreviewDialog).
         if let Some(preview) = self.preview.clone() {
             if std::mem::take(&mut self.preview_focus_pending) {
@@ -9704,13 +10062,31 @@ mod tests {
                     assert_eq!(composer.input, input);
                     let surface = composer.surface_bounds.get().unwrap();
                     let origin = input.read(cx).last_bounds.unwrap().origin;
-                    assert!((f32::from(origin.y - surface.top()) - (17.0 - 4.0 * amount)).abs() <= 1.0,
+                    // The surface now includes the attached top band on the
+                    // new-thread route (36px when its selectors are visible).
+                    let band_offset = if docked { 0.0 } else { TOP_BAND_HEIGHT };
+                    assert!((f32::from(origin.y - surface.top()) - (17.0 - 4.0 * amount + band_offset)).abs() <= 1.0,
                         "editor jumped: docked={docked}, amount={amount}, origin={origin:?}, surface={surface:?}");
                     let model = composer.model_bounds.get().unwrap();
+                    // The access chip joins the expanded (new-chat) actions
+                    // row between attach and model: the in-flow anchor moves
+                    // right by its slot while the handoff travel shrinks by
+                    // the same amount, keeping the composed position
+                    // continuous. Compact rows are unchanged. Mirrors the
+                    // `access_shift` in `render`.
+                    let access_slot = if docked {
+                        0.0
+                    } else {
+                        composer
+                            .access_bounds
+                            .get()
+                            .map_or(0.0, |bounds| f32::from(bounds.size.width))
+                            + ACTION_UTILITY_GAP
+                    };
                     let inset = motion::lerp(12.0, 8.0, amount);
-                    let left = surface.left() + px(1.0 + inset + 28.0 + ACTION_UTILITY_GAP);
+                    let left = surface.left() + px(1.0 + inset + 28.0 + ACTION_UTILITY_GAP + access_slot);
                     let travel = surface.size.width - px(2.0 + inset + 28.0 + ACTION_UTILITY_GAP
-                        + ACTION_PRIMARY_GAP + 28.0 + inset) - model.size.width;
+                        + ACTION_PRIMARY_GAP + 28.0 + inset + access_slot) - model.size.width;
                     let (side, _, drift) = model_handoff(amount);
                     let expected_x = left + travel * side + px(drift);
                     assert!((f32::from(model.left() - expected_x)).abs() <= 1.0,
@@ -9935,7 +10311,7 @@ mod tests {
                     input_hint: Some("model id".into()),
                 },
                 SlashCommand {
-                    name: "zeron:model".into(),
+                    name: "clyra:model".into(),
                     description: "Plugin command".into(),
                     input_hint: None,
                 },
@@ -9947,9 +10323,9 @@ mod tests {
         assert!(rows[0].workspace_command.is_none());
         assert_eq!(rows[0].input_hint.as_deref(), Some("model id"));
         assert_eq!(workspace_command_for_text("/model", &rows), None);
-        assert_eq!(workspace_command_for_text("/zeron:model", &rows), None);
+        assert_eq!(workspace_command_for_text("/clyra:model", &rows), None);
         assert_eq!(
-            workspace_command_for_text("/zeron:zeron:model", &rows),
+            workspace_command_for_text("/clyra:clyra:model", &rows),
             Some(WorkspaceCommand::Model)
         );
         assert_eq!(with_workspace_commands(rows, true).len(), 11);
@@ -10049,13 +10425,13 @@ mod tests {
                         assert_eq!(input.text(), draft, "action removal is undoable");
                     });
                 }
-                let skill = zeron_proto::invocation::Invocation::Skill {
+                let skill = clyra_proto::invocation::Invocation::Skill {
                     name: "review".into(),
                     path: "/repo/SKILL.md".into(),
                     command: None,
                 };
                 for invocation in [
-                    zeron_proto::invocation::Invocation::Command {
+                    clyra_proto::invocation::Invocation::Command {
                         name: "review".into(),
                     },
                     skill,
@@ -10082,7 +10458,7 @@ mod tests {
                         format!(
                             "café {} after",
                             match &invocation {
-                                zeron_proto::invocation::Invocation::Command { .. } =>
+                                clyra_proto::invocation::Invocation::Command { .. } =>
                                     "/review".to_string(),
                                 _ => invocation.link(),
                             }
@@ -10129,7 +10505,7 @@ mod tests {
             .build()
             .unwrap();
         let _guard = runtime.enter();
-        let skill = zeron_proto::invocation::Invocation::Skill {
+        let skill = clyra_proto::invocation::Invocation::Skill {
             name: "review".into(),
             path: "/skills/review/SKILL.md".into(),
             command: None,
@@ -10149,7 +10525,7 @@ mod tests {
                 let state = cx.new(|_| AppState::new());
                 state.update(cx, |state, _| {
                     state.set_test_engine(crate::state::EngineHandle::from_test_client(
-                        zeron_rpc::RpcClient::new(out, inbound),
+                        clyra_rpc::RpcClient::new(out, inbound),
                     ));
                     state.selected_chat = Some("literal-draft".into());
                 });
@@ -10170,7 +10546,7 @@ mod tests {
                 let mut submitted = None;
                 let mut discarded = false;
                 while let Ok(frame) = requests.try_recv() {
-                    let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                    let frame: clyra_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
                     if frame.method.as_deref() == Some(methods::FINISH_QUEUED_MESSAGE_EDIT) {
                         discarded = frame.params["action"] == "discard";
                         submitted = frame.params["text"].as_str().map(str::to_owned);
@@ -10190,8 +10566,8 @@ mod tests {
                 } else {
                     let submitted = submitted.expect("submission must reach the engine RPC");
                     assert_eq!(submitted, raw);
-                    assert!(zeron_proto::invocation::leading_command(&submitted).is_none());
-                    assert!(zeron_proto::invocation::invocation_links(&submitted).is_empty());
+                    assert!(clyra_proto::invocation::leading_command(&submitted).is_none());
+                    assert!(clyra_proto::invocation::invocation_links(&submitted).is_empty());
                 }
             }
         }
@@ -10213,7 +10589,7 @@ mod tests {
         let state = cx.new(|_| AppState::new());
         state.update(cx, |state, _| {
             state.set_test_engine(crate::state::EngineHandle::from_test_client(
-                zeron_rpc::RpcClient::new(out, inbound),
+                clyra_rpc::RpcClient::new(out, inbound),
             ));
             state.selected_chat = Some("c".into());
             // A send in flight reads as Working — the double-Enter window.
@@ -10238,13 +10614,13 @@ mod tests {
         let raw = format!(
             "{} {} {}",
             local_file_link("src/main.rs", false),
-            zeron_proto::invocation::Invocation::Skill {
+            clyra_proto::invocation::Invocation::Skill {
                 command: None,
                 name: "review".into(),
                 path: "/repo/SKILL.md".into(),
             }
             .link(),
-            zeron_proto::invocation::Invocation::Command {
+            clyra_proto::invocation::Invocation::Command {
                 name: "help".into()
             }
             .link(),
@@ -10289,7 +10665,7 @@ mod tests {
         let (_dir, handle) = composer_focus_window(cx);
         handle.update(cx, |composer, window, cx| {
             let file = local_file_link("src/composer.rs", false);
-            let skill = zeron_proto::invocation::Invocation::Skill { name: "review-changes".into(), path: "/repo/SKILL.md".into(), command: None }.link();
+            let skill = clyra_proto::invocation::Invocation::Skill { name: "review-changes".into(), path: "/repo/SKILL.md".into(), command: None }.link();
             let raw = format!("Review {file} with {skill} and enough trailing prose to need more than one additional row of wrapping.");
             composer.input.update(cx, |input, cx| {
                 input.set_text(&raw, cx);
@@ -10629,7 +11005,7 @@ mod tests {
                     .unwrap(),
                 ];
                 state.set_test_engine(crate::state::EngineHandle::from_test_client(
-                    zeron_rpc::RpcClient::new(out, inbound),
+                    clyra_rpc::RpcClient::new(out, inbound),
                 ));
             });
             let composer = cx.new(|cx| Composer::new(state.clone(), cx));
@@ -10648,7 +11024,7 @@ mod tests {
             }
             let mut methods = Vec::new();
             while let Ok(frame) = requests.try_recv() {
-                let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                let frame: clyra_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
                 assert_eq!(frame.params["targetDeviceId"], "peer");
                 assert!(frame.params.get("cwd").is_none());
                 let value = match frame.method.as_deref() {
@@ -10663,7 +11039,7 @@ mod tests {
                 methods.push(frame.method.unwrap());
                 replies
                     .try_send(
-                        serde_json::to_string(&zeron_rpc::ServerFrame {
+                        serde_json::to_string(&clyra_rpc::ServerFrame {
                             id: frame.id,
                             ok: Some(value),
                             ..Default::default()
@@ -10683,7 +11059,7 @@ mod tests {
                 if change_target {
                     assert_eq!(text, raw);
                 } else {
-                    assert_eq!(zeron_proto::invocation::invocation_links(text).len(), 2);
+                    assert_eq!(clyra_proto::invocation::invocation_links(text).len(), 2);
                     assert!(text.ends_with(" @README.md"));
                 }
             });
@@ -10730,12 +11106,12 @@ mod tests {
     }
 
     #[gpui::test]
-    fn clipboard_is_readable_outside_zeron_and_lossless_inside(cx: &mut gpui::TestAppContext) {
+    fn clipboard_is_readable_outside_clyra_and_lossless_inside(cx: &mut gpui::TestAppContext) {
         with_composer_input(cx, |input, window, cx| {
             let raw = format!(
                 "**Check** {} with {}",
                 local_file_link("src/café.rs", false),
-                zeron_proto::invocation::Invocation::Skill {
+                clyra_proto::invocation::Invocation::Skill {
                     name: "review".into(),
                     path: "/repo/SKILL.md".into(),
                     command: None
@@ -10876,7 +11252,7 @@ mod tests {
                 assert_eq!(input.text(), raw);
                 let source = raw.replace("@src", "$review");
                 input.set_text(&source, cx);
-                let skill = zeron_proto::invocation::Invocation::Skill {
+                let skill = clyra_proto::invocation::Invocation::Skill {
                     name: "review".into(),
                     path: "/repo/SKILL.md".into(),
                     command: None,
@@ -11002,7 +11378,7 @@ mod tests {
 
     #[test]
     fn rich_projection_keeps_unicode_offsets_and_atomic_invocations() {
-        let invocation = zeron_proto::invocation::Invocation::Skill {
+        let invocation = clyra_proto::invocation::Invocation::Skill {
             command: None,
             name: "bla-bla:bla-bla".into(),
             path: "/repo/SKILL.md".into(),
@@ -11316,7 +11692,7 @@ mod tests {
         let state = cx.new(|_| AppState::new());
         state.update(cx, |state, _| {
             state.set_test_engine(crate::state::EngineHandle::from_test_client(
-                zeron_rpc::RpcClient::new(out, inbound),
+                clyra_rpc::RpcClient::new(out, inbound),
             ));
             state.chats = crate::settings::SKILL_COMPLETION_HARNESSES
                 .iter()
@@ -11350,7 +11726,7 @@ mod tests {
             cx.run_until_parked();
             let mut batch = Vec::new();
             while let Ok(frame) = requests.try_recv() {
-                let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                let frame: clyra_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
                 if matches!(
                     frame.method.as_deref(),
                     Some(methods::LIST_COMMANDS | methods::LIST_SKILLS)
@@ -11386,7 +11762,7 @@ mod tests {
         cx.run_until_parked();
         let mut current = Vec::new();
         while let Ok(frame) = requests.try_recv() {
-            let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+            let frame: clyra_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
             if matches!(
                 frame.method.as_deref(),
                 Some(methods::LIST_COMMANDS | methods::LIST_SKILLS)
@@ -11396,7 +11772,7 @@ mod tests {
             }
         }
         assert_eq!(current.len(), 2);
-        let respond = |frames: Vec<zeron_rpc::ClientFrame>, name: &str| {
+        let respond = |frames: Vec<clyra_rpc::ClientFrame>, name: &str| {
             for frame in frames {
                 let value = if frame.method.as_deref() == Some(methods::LIST_COMMANDS) {
                     serde_json::json!([{ "name": name, "description": "Provider command" }])
@@ -11405,7 +11781,7 @@ mod tests {
                 };
                 replies
                     .try_send(
-                        serde_json::to_string(&zeron_rpc::ServerFrame {
+                        serde_json::to_string(&clyra_rpc::ServerFrame {
                             id: frame.id,
                             ok: Some(value),
                             ..Default::default()
@@ -11452,7 +11828,7 @@ mod tests {
         cx.run_until_parked();
         let mut skill_requests = Vec::new();
         while let Ok(frame) = requests.try_recv() {
-            let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+            let frame: clyra_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
             if matches!(
                 frame.method.as_deref(),
                 Some(methods::LIST_COMMANDS | methods::LIST_SKILLS)
@@ -11482,7 +11858,7 @@ mod tests {
             cx.run_until_parked();
             let mut refresh = Vec::new();
             while let Ok(frame) = requests.try_recv() {
-                let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                let frame: clyra_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
                 if matches!(
                     frame.method.as_deref(),
                     Some(methods::LIST_COMMANDS | methods::LIST_SKILLS)
@@ -11545,7 +11921,7 @@ mod tests {
                 let (_incoming, inbound) = tokio::sync::mpsc::channel(4);
                 composer.state.update(cx, |state, _| {
                     state.set_test_engine(crate::state::EngineHandle::from_test_client(
-                        zeron_rpc::RpcClient::new(out, inbound),
+                        clyra_rpc::RpcClient::new(out, inbound),
                     ))
                 });
                 assert_ne!(composer.completion_connection_context(cx), context);
@@ -11606,7 +11982,7 @@ mod tests {
             input.enable_mentions();
             for reference in [
                 local_file_link("src/a.rs", false),
-                zeron_proto::invocation::Invocation::Command {
+                clyra_proto::invocation::Invocation::Command {
                     name: "review".into(),
                 }
                 .link(),
@@ -11734,7 +12110,7 @@ mod tests {
             let after_link = format!("[label](url) ({prefix}review");
             assert!(token(&after_link, after_link.len()).is_some());
         }
-        let canonical = zeron_proto::invocation::Invocation::Command {
+        let canonical = clyra_proto::invocation::Invocation::Command {
             name: "review".into(),
         }
         .link();
@@ -11848,7 +12224,7 @@ mod tests {
 
     #[test]
     fn legacy_host_commands_remain_literal_and_saved_references_need_an_update() {
-        use zeron_proto::invocation::Invocation;
+        use clyra_proto::invocation::Invocation;
         let command = Invocation::Command {
             name: "compact".into(),
         };
@@ -11882,7 +12258,7 @@ mod tests {
         let (_dir, handle) = composer_focus_window(cx);
         handle
             .update(cx, |composer, _, cx| {
-                let draft = zeron_proto::invocation::Invocation::Command {
+                let draft = clyra_proto::invocation::Invocation::Command {
                     name: "compact".into(),
                 }
                 .link();
@@ -11935,7 +12311,7 @@ mod tests {
             description: String::new(),
             input_hint: None,
         };
-        let skill = zeron_proto::invocation::Skill {
+        let skill = clyra_proto::invocation::Skill {
             command: None,
             name: "review".into(),
             path: "/repo/SKILL.md".into(),
@@ -12030,7 +12406,7 @@ mod tests {
 
     #[test]
     fn every_harness_catalog_only_offers_round_trippable_references() {
-        use zeron_proto::invocation::{Skill, SkillCommand, invocation_links};
+        use clyra_proto::invocation::{Skill, SkillCommand, invocation_links};
         for (harness, _) in crate::settings::SKILL_COMPLETION_HARNESSES {
             let commands = ["review", "bad\ncommand", "two words"]
                 .into_iter()
@@ -12075,7 +12451,7 @@ mod tests {
 
     #[test]
     fn separated_native_skills_are_not_left_in_the_command_catalog() {
-        use zeron_proto::invocation::{Skill, SkillCommand};
+        use clyra_proto::invocation::{Skill, SkillCommand};
         for (harness, _) in crate::settings::SKILL_COMPLETION_HARNESSES {
             let commands = vec![
                 SlashCommand {
@@ -12114,7 +12490,7 @@ mod tests {
 
     #[test]
     fn combined_invocations_preserve_skill_identity_and_command_collisions() {
-        use zeron_proto::invocation::{Invocation, Skill};
+        use clyra_proto::invocation::{Invocation, Skill};
         let commands = vec![SlashCommand {
             name: "review".into(),
             description: "Command".into(),
@@ -12203,7 +12579,7 @@ mod tests {
         let raw = local_file_link("src/a file#[x].rs", false);
         assert_eq!(
             raw,
-            "[a file#\\[x\\].rs](zeron-file:src/a%20file%23%5Bx%5D.rs)"
+            "[a file#\\[x\\].rs](clyra-file:src/a%20file%23%5Bx%5D.rs)"
         );
         let links = file_mention_links(&raw);
         assert_eq!(links.len(), 1);
@@ -12212,7 +12588,7 @@ mod tests {
         assert!(!links[0].is_dir);
 
         let folder = local_file_link("src/components", true);
-        assert_eq!(folder, "[components](zeron-file:src/components/)");
+        assert_eq!(folder, "[components](clyra-file:src/components/)");
         let links = file_mention_links(&folder);
         assert_eq!(links[0].path, "src/components");
         assert!(links[0].is_dir);
@@ -12222,12 +12598,12 @@ mod tests {
     fn dropped_mentions_are_separated_from_surrounding_text() {
         let (inserted, cursor_advance) =
             dropped_file_mention("fixnow", 3..3, "src/lib.rs", false).expect("valid drop");
-        assert_eq!(inserted, " [lib.rs](zeron-file:src/lib.rs) ");
+        assert_eq!(inserted, " [lib.rs](clyra-file:src/lib.rs) ");
         assert_eq!(cursor_advance, inserted.len());
 
         let (inserted, cursor_advance) =
             dropped_file_mention("fix now", 3..3, "src/components", true).expect("valid drop");
-        assert_eq!(inserted, " [components](zeron-file:src/components/)");
+        assert_eq!(inserted, " [components](clyra-file:src/components/)");
         assert_eq!(cursor_advance, inserted.len() + 1);
     }
 
@@ -12337,12 +12713,12 @@ mod tests {
     fn sent_mention_display_leaves_plain_prompts_untouched() {
         assert_eq!(sent_mention_display("fix the composer"), None);
         assert_eq!(
-            sent_mention_display("what is a zeron-file: link?"),
+            sent_mention_display("what is a clyra-file: link?"),
             None,
             "scheme substring without a valid mention link"
         );
         assert_eq!(
-            sent_mention_display("[a.rs](zeron-file:../a.rs)"),
+            sent_mention_display("[a.rs](clyra-file:../a.rs)"),
             None,
             "a hostile path never becomes a chip in the transcript either"
         );
@@ -12423,13 +12799,13 @@ mod tests {
 
     #[test]
     fn auto_grow_math() {
-        // The source heights (zeron composer.tsx line 235 clamp, composer-
-        // actions.tsx row, 1px hairlines): 76+46+2 empty … 260+46+2 capped.
-        assert_eq!(COMPOSER_MIN_HEIGHT, 120.0);
-        assert_eq!(COMPOSER_MAX_HEIGHT, 304.0);
+        // The source heights (clyra composer.tsx line 235 clamp, composer-
+        // actions.tsx row, 3px borders): 76+42+6 empty … 260+42+6 capped.
+        assert_eq!(COMPOSER_MIN_HEIGHT, 124.0);
+        assert_eq!(COMPOSER_MAX_HEIGHT, 308.0);
         // One line sits at the floor: the textarea BOX (content + `pt-4 pb-1`)
         // clamps UP to 76 exactly like `Math.max(scrollHeight, 76)` — this is
-        // what makes the always-expanded new-chat composer 120px tall.
+        // what makes the always-expanded new-chat composer 124px tall.
         assert_eq!(
             composer_total_height(input_content_height(1)),
             COMPOSER_MIN_HEIGHT
@@ -12440,7 +12816,7 @@ mod tests {
             h4,
             4.0 * INPUT_LINE_HEIGHT + TEXTAREA_PAD_V + ACTIONS_ROW_HEIGHT + PILL_BORDER_V
         );
-        // Caps at a 260px textarea box (zeron max-h-[260px] / the JS clamp).
+        // Caps at a 260px textarea box (clyra max-h-[260px] / the JS clamp).
         assert_eq!(
             composer_total_height(input_content_height(100)),
             COMPOSER_MAX_HEIGHT
@@ -12976,9 +13352,11 @@ mod tests {
     }
 
     #[test]
-    fn new_thread_selectors_restore_the_compact_floating_row() {
+    fn new_thread_selector_bands_share_one_attached_height() {
         assert_eq!(NEW_THREAD_SELECTOR_ROW_HEIGHT, 20.0);
         assert_eq!(SESSION_FOOTER_HEIGHT, 24.0);
+        assert_eq!(TOP_BAND_HEIGHT, 36.0);
+        assert_eq!(BOTTOM_BAND_HEIGHT, 36.0);
     }
 
     #[test]
@@ -13227,7 +13605,7 @@ mod tests {
 
     #[test]
     fn pending_input_detection() {
-        use zeron_doc::MessageStatus;
+        use clyra_doc::MessageStatus;
         let input_part = MessagePart::Input {
             id: "in-r1".into(),
             request_id: "r1".into(),

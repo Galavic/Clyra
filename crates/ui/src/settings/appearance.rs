@@ -6,15 +6,15 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use clyra_theme::vscode::{ImportReport, SourceCompilation};
+use clyra_theme::{
+    AccentPreset, AccentSelection, CustomThemeEntry, CustomThemeStatus, InstallMode,
+    SurfacePreference, SurfaceTreatment, ThemeRegistry, ThemeSelection,
+};
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, IntoElement,
     KeyDownEvent, ObjectFit, Render, SharedString, StyledImage as _, Subscription, Window, div,
     img, prelude::*, px,
-};
-use zeron_theme::vscode::{ImportReport, SourceCompilation};
-use zeron_theme::{
-    AccentPreset, AccentSelection, CustomThemeEntry, CustomThemeStatus, InstallMode,
-    SurfacePreference, SurfaceTreatment, ThemeRegistry, ThemeSelection,
 };
 
 use crate::appearance::{self, AppearanceMode};
@@ -184,6 +184,114 @@ impl Render for TranscriptWidthDrag {
     }
 }
 
+/// Which chrome opacity a slider drives: the sidebar + titlebar strip, or
+/// the chat column and its panels.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpacitySlot {
+    Sidebar,
+    Chat,
+    Composer,
+}
+
+impl OpacitySlot {
+    const ALL: [Self; 3] = [Self::Sidebar, Self::Chat, Self::Composer];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sidebar => "Sidebar chrome opacity",
+            Self::Chat => "Chat panel opacity",
+            Self::Composer => "Composer opacity",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Sidebar => "Sidebar and titlebar transparency.",
+            Self::Chat => "Conversation and side-panel transparency.",
+            Self::Composer => "Composer pill transparency.",
+        }
+    }
+
+    fn tile(self) -> &'static str {
+        match self {
+            Self::Sidebar => icons::SIDEBAR_MINIMALISTIC,
+            Self::Chat => icons::CHAT_ROUND_LINE,
+            Self::Composer => icons::PEN,
+        }
+    }
+
+    fn slider_id(self) -> &'static str {
+        match self {
+            Self::Sidebar => "sidebar-opacity-slider",
+            Self::Chat => "chat-opacity-slider",
+            Self::Composer => "composer-opacity-slider",
+        }
+    }
+
+    fn value(self, cx: &gpui::App) -> f32 {
+        match self {
+            Self::Sidebar => crate::settings::sidebar_opacity(cx),
+            Self::Chat => crate::settings::chat_opacity(cx),
+            Self::Composer => crate::settings::composer_opacity(cx),
+        }
+    }
+
+    fn default_value(self) -> f32 {
+        match self {
+            Self::Sidebar => crate::settings::SIDEBAR_OPACITY_DEFAULT,
+            Self::Chat => crate::settings::CHAT_OPACITY_DEFAULT,
+            Self::Composer => crate::settings::COMPOSER_OPACITY_DEFAULT,
+        }
+    }
+
+    fn normalize(self, value: f32) -> f32 {
+        match self {
+            Self::Sidebar => crate::settings::normalize_sidebar_opacity(value),
+            Self::Chat => crate::settings::normalize_chat_opacity(value),
+            Self::Composer => crate::settings::normalize_composer_opacity(value),
+        }
+    }
+
+    fn commit(self, value: f32, cx: &mut gpui::App) {
+        match self {
+            Self::Sidebar => crate::settings::set_sidebar_opacity(value, cx),
+            Self::Chat => crate::settings::set_chat_opacity(value, cx),
+            Self::Composer => crate::settings::set_composer_opacity(value, cx),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct OpacitySliderDrag;
+
+impl Render for OpacitySliderDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// Drag state for one chrome-opacity slider. Click jumps, arrows step,
+/// and pointer drags scrub continuously (one coalesced commit per frame).
+struct OpacitySliderState {
+    focus: FocusHandle,
+    bounds: Rc<Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    pending: Option<f32>,
+    frame_pending: bool,
+    dragging: bool,
+}
+
+impl OpacitySliderState {
+    fn new(cx: &mut Context<AppearancePage>) -> Self {
+        Self {
+            focus: cx.focus_handle(),
+            bounds: Rc::default(),
+            pending: None,
+            frame_pending: false,
+            dragging: false,
+        }
+    }
+}
+
 pub struct AppearancePage {
     width_focus: FocusHandle,
     width_hovered: bool,
@@ -192,6 +300,9 @@ pub struct AppearancePage {
     width_bounds: Rc<Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     pending_width: Option<f32>,
     width_frame_pending: bool,
+    sidebar_opacity: OpacitySliderState,
+    chat_opacity: OpacitySliderState,
+    composer_opacity: OpacitySliderState,
     scroll: crate::settings::widgets::PageScroll,
     selected_font: UiFontFamily,
     selected_terminal_font: UiFontFamily,
@@ -267,6 +378,254 @@ impl AppearancePage {
             crate::settings::set_transcript_width(width, cx);
             cx.notify();
         }
+    }
+
+    fn opacity_state(&self, slot: OpacitySlot) -> &OpacitySliderState {
+        match slot {
+            OpacitySlot::Sidebar => &self.sidebar_opacity,
+            OpacitySlot::Chat => &self.chat_opacity,
+            OpacitySlot::Composer => &self.composer_opacity,
+        }
+    }
+
+    fn opacity_state_mut(&mut self, slot: OpacitySlot) -> &mut OpacitySliderState {
+        match slot {
+            OpacitySlot::Sidebar => &mut self.sidebar_opacity,
+            OpacitySlot::Chat => &mut self.chat_opacity,
+            OpacitySlot::Composer => &mut self.composer_opacity,
+        }
+    }
+
+    fn queue_opacity(
+        &mut self,
+        slot: OpacitySlot,
+        value: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let value = slot.normalize(value);
+        if self
+            .opacity_state(slot)
+            .pending
+            .unwrap_or_else(|| slot.value(cx))
+            == value
+        {
+            return;
+        }
+        self.opacity_state_mut(slot).pending = Some(value);
+        // Coalesce pointer events into one settings update per frame.
+        if !self.opacity_state(slot).frame_pending {
+            self.opacity_state_mut(slot).frame_pending = true;
+            let page = cx.weak_entity();
+            window.on_next_frame(move |_, cx| {
+                let _ = page.update(cx, |this, cx| {
+                    this.opacity_state_mut(slot).frame_pending = false;
+                    this.apply_pending_opacity(slot, cx);
+                });
+            });
+        }
+        cx.notify();
+    }
+
+    fn apply_pending_opacity(&mut self, slot: OpacitySlot, cx: &mut Context<Self>) {
+        if let Some(value) = self.opacity_state_mut(slot).pending.take() {
+            slot.commit(value, cx);
+            cx.notify();
+        }
+    }
+
+    fn drag_opacity(
+        &mut self,
+        slot: OpacitySlot,
+        x: gpui::Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::settings::{CHROME_OPACITY_MAX, CHROME_OPACITY_MIN};
+        let Some(bounds) = self.opacity_state(slot).bounds.get() else {
+            return;
+        };
+        let fraction =
+            (f32::from(x - bounds.left()) - 7.0) / (f32::from(bounds.size.width) - 14.0).max(1.0);
+        self.queue_opacity(
+            slot,
+            CHROME_OPACITY_MIN
+                + fraction.clamp(0.0, 1.0) * (CHROME_OPACITY_MAX - CHROME_OPACITY_MIN),
+            window,
+            cx,
+        );
+    }
+
+    fn render_opacity_row(
+        &self,
+        slot: OpacitySlot,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::settings::{CHROME_OPACITY_MAX, CHROME_OPACITY_MIN, CHROME_OPACITY_STEP};
+        let state = self.opacity_state(slot);
+        let value = state.pending.unwrap_or_else(|| slot.value(cx));
+        let fraction = (value - CHROME_OPACITY_MIN) / (CHROME_OPACITY_MAX - CHROME_OPACITY_MIN);
+        // Opaque glass leaves nothing to blend: the sliders lock (values are
+        // kept and apply again once glass returns).
+        let locked = theme.surface_treatment == SurfaceTreatment::Opaque;
+        let bounds = state.bounds.clone();
+        let slider = div()
+            .id(slot.slider_id())
+            .track_focus(&state.focus)
+            .relative()
+            .w(px(200.0))
+            .h(px(28.0))
+            .cursor_pointer()
+            .when(locked, |el| el.opacity(0.4))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    if locked {
+                        return;
+                    }
+                    window.focus(&this.opacity_state(slot).focus, cx);
+                    this.opacity_state_mut(slot).dragging = true;
+                    cx.notify();
+                    cx.stop_propagation();
+                    this.drag_opacity(slot, event.position.x, window, cx);
+                }),
+            )
+            .on_drag(OpacitySliderDrag, |drag, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| drag.clone())
+            })
+            // Continuous scrub while the pointer moves with the button held.
+            // Typed to our own drag payload so unrelated drags (files, tabs)
+            // passing over the slider never move it; the per-slot `dragging`
+            // flag keeps the sibling slider from following along.
+            .on_drag_move::<OpacitySliderDrag>(cx.listener(
+                move |this, event: &gpui::DragMoveEvent<OpacitySliderDrag>, window, cx| {
+                    if this.opacity_state(slot).dragging {
+                        this.drag_opacity(slot, event.event.position.x, window, cx);
+                    }
+                },
+            ))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, _, _cx| {
+                    this.opacity_state_mut(slot).dragging = false;
+                }),
+            )
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, _, _cx| {
+                    this.opacity_state_mut(slot).dragging = false;
+                }),
+            )
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if locked {
+                    return;
+                }
+                let current = this
+                    .opacity_state(slot)
+                    .pending
+                    .unwrap_or_else(|| slot.value(cx));
+                let next = match event.keystroke.key.as_str() {
+                    "left" | "down" => current - CHROME_OPACITY_STEP,
+                    "right" | "up" => current + CHROME_OPACITY_STEP,
+                    "home" => CHROME_OPACITY_MIN,
+                    "end" => CHROME_OPACITY_MAX,
+                    _ => return,
+                };
+                cx.notify();
+                cx.stop_propagation();
+                window.prevent_default();
+                this.queue_opacity(slot, next, window, cx);
+            }))
+            .child(
+                gpui::canvas(move |rect, _, _| bounds.set(Some(rect)), |_, _, _, _| {})
+                    .absolute()
+                    .size_full(),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(7.0))
+                    .right(px(7.0))
+                    .top(px(12.0))
+                    .h(px(4.0))
+                    .rounded_full()
+                    .bg(theme.border)
+                    .child(
+                        div()
+                            .h_full()
+                            .w(gpui::relative(fraction))
+                            .rounded_full()
+                            .bg(theme.accent),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(gpui::relative(fraction))
+                            .ml(px(-7.0))
+                            .top(px(-5.0))
+                            .size(px(14.0))
+                            .rounded_full()
+                            .bg(theme.accent),
+                    ),
+            );
+        widgets::card_row(theme, false)
+            .child(widgets::row_tile(theme, slot.tile()))
+            .child({
+                let mut meta = vec![
+                    div()
+                        .child(SharedString::from(slot.description()))
+                        .into_any_element(),
+                ];
+                if locked {
+                    meta.push(
+                        div()
+                            .child(SharedString::from("Locked while Glass is Opaque."))
+                            .into_any_element(),
+                    );
+                }
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(widgets::row_title(theme, slot.label()))
+                    .child(widgets::meta_line(theme, meta))
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .ml(px(10.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .when(locked, |el| el.opacity(0.45))
+                    .child(
+                        div()
+                            .w(px(200.0))
+                            .flex()
+                            .justify_between()
+                            .text_size(typography::ui_rems(12.0))
+                            .line_height(px(16.0))
+                            .child(format!("{:.0}%", value * 100.0))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("{}-reset", slot.slider_id())))
+                                    .text_color(theme.text_muted)
+                                    .when(!locked, |el| {
+                                        el.cursor_pointer()
+                                            .hover(|style| style.text_color(theme.text))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.opacity_state_mut(slot).pending = None;
+                                                slot.commit(slot.default_value(), cx);
+                                                cx.notify();
+                                            }))
+                                    })
+                                    .child("Reset"),
+                            ),
+                    )
+                    .child(slider),
+            )
+            .into_any_element()
     }
 
     fn drag_width(&mut self, x: gpui::Pixels, window: &mut Window, cx: &mut Context<Self>) {
@@ -509,6 +868,9 @@ impl AppearancePage {
             review_entry: None,
             library_error: None,
             background_error: None,
+            sidebar_opacity: OpacitySliderState::new(cx),
+            chat_opacity: OpacitySliderState::new(cx),
+            composer_opacity: OpacitySliderState::new(cx),
         }
     }
 
@@ -1435,10 +1797,10 @@ fn preview(
     }
 }
 
-fn model_appearance(appearance: Appearance) -> zeron_theme::Appearance {
+fn model_appearance(appearance: Appearance) -> clyra_theme::Appearance {
     match appearance {
-        Appearance::Dark => zeron_theme::Appearance::Dark,
-        Appearance::Light => zeron_theme::Appearance::Light,
+        Appearance::Dark => clyra_theme::Appearance::Dark,
+        Appearance::Light => clyra_theme::Appearance::Light,
     }
 }
 
@@ -1477,7 +1839,7 @@ fn compact_action(
         .text_size(crate::typography::ui_rems(11.5))
 }
 
-fn import_scene_preview(variant: &zeron_theme::ThemeVariant) -> AnyElement {
+fn import_scene_preview(variant: &clyra_theme::ThemeVariant) -> AnyElement {
     let theme = Theme::from_variant(
         variant,
         AccentSelection::ThemeDefault,
@@ -1607,7 +1969,7 @@ fn report_panel(theme: &Theme, report: &ImportReport) -> gpui::Stateful<gpui::Di
         .children(report.adjustments.iter().map(|adjustment| {
             div().mt(px(4.0)).child(SharedString::from(format!(
                 "Adjusted · {} {} → {} · {}",
-                adjustment.zeron_role, adjustment.original, adjustment.resolved, adjustment.reason
+                adjustment.clyra_role, adjustment.original, adjustment.resolved, adjustment.reason
             )))
         }))
         .children(report.fallbacks.iter().map(|message| {
@@ -1634,80 +1996,48 @@ fn report_panel(theme: &Theme, report: &ImportReport) -> gpui::Stateful<gpui::Di
         .children(report.mappings.iter().map(|mapping| {
             div().mt(px(4.0)).child(SharedString::from(format!(
                 "{} ← {}",
-                mapping.zeron_role, mapping.vscode_key
+                mapping.clyra_role, mapping.vscode_key
             )))
         }))
 }
 
+/// One accent choice as a dot in a row of dots: the preset's accent color,
+/// or a light dot (the text tone) for "Theme default". The selected dot
+/// grows and wears a ring of its own color.
 fn accent_swatch(
     page_theme: &Theme,
     selection: AccentSelection,
     selected: bool,
 ) -> gpui::Stateful<gpui::Div> {
-    let swatch_theme = Theme::for_selection(
-        page_theme.appearance,
-        page_theme.variant_id.as_ref(),
-        selection,
-        page_theme.surface_preference,
-    );
-    let sample = match selection {
-        AccentSelection::ThemeDefault => div()
-            .size_full()
-            .rounded(px(6.0))
-            .bg(swatch_theme.accent_wash)
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap(px(2.0))
-            .child(
-                div()
-                    .w(px(4.0))
-                    .h(px(13.0))
-                    .rounded(px(2.0))
-                    .bg(swatch_theme.glyph.light),
+    let color = match selection {
+        AccentSelection::ThemeDefault => page_theme.text,
+        AccentSelection::Preset(_) => {
+            Theme::for_selection(
+                page_theme.appearance,
+                page_theme.variant_id.as_ref(),
+                selection,
+                page_theme.surface_preference,
             )
-            .child(
-                div()
-                    .w(px(4.0))
-                    .h(px(16.0))
-                    .rounded(px(2.0))
-                    .bg(swatch_theme.glyph.mid),
-            )
-            .child(
-                div()
-                    .w(px(4.0))
-                    .h(px(11.0))
-                    .rounded(px(2.0))
-                    .bg(swatch_theme.glyph.deep),
-            ),
-        AccentSelection::Preset(_) => div().size_full().rounded(px(6.0)).bg(swatch_theme.accent),
+            .accent
+        }
     };
     div()
         .id(SharedString::from(format!("accent-{}", selection.label())))
         .flex_none()
-        .w(px(30.0))
-        .h(px(34.0))
-        .pb(px(4.0))
-        .border_b_2()
-        .border_color(if selected {
-            swatch_theme.accent
-        } else {
-            gpui::transparent_black()
-        })
+        .size(px(22.0))
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
         .cursor_pointer()
+        .when(selected, |el| {
+            el.border_2().border_color(color.opacity(0.45))
+        })
         .child(
             div()
-                .size(px(30.0))
-                .p(px(2.0))
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(if selected {
-                    page_theme.border_strong
-                } else {
-                    page_theme.border
-                })
-                .bg(page_theme.surface_raised.opacity(0.42))
-                .child(sample),
+                .size(px(if selected { 14.0 } else { 12.0 }))
+                .rounded_full()
+                .bg(color),
         )
 }
 
@@ -2521,7 +2851,7 @@ impl AppearancePage {
                             .mt(px(1.0))
                             .flex_none(),
                     )
-                    .child("Zeron finds light and dark variants automatically."),
+                    .child("Clyra finds light and dark variants automatically."),
             );
         }
 
@@ -3042,6 +3372,7 @@ impl Render for AppearancePage {
                 ))
             })
             .collect::<Vec<_>>();
+        let mut settings_rows = theme_rows;
         let surface_controls = SurfacePreference::ALL
             .into_iter()
             .map(|surface| {
@@ -3053,7 +3384,6 @@ impl Render for AppearancePage {
                 ))
             })
             .collect::<Vec<_>>();
-        let mut settings_rows = theme_rows;
         settings_rows.push(
             widgets::card_row(&theme, false)
                 .child(widgets::row_tile(&theme, icons::TUNING))
@@ -3077,7 +3407,7 @@ impl Render for AppearancePage {
                         .ml(px(10.0))
                         .flex()
                         .items_center()
-                        .gap(px(6.0))
+                        .gap(px(4.0))
                         .children(accent_controls),
                 )
                 .into_any_element(),
@@ -3113,6 +3443,11 @@ impl Render for AppearancePage {
                 )
                 .into_any_element(),
         );
+        // Chrome opacity sliders tune how much of the desktop and the panels
+        // show through the shell.
+        for slot in OpacitySlot::ALL {
+            settings_rows.push(self.render_opacity_row(slot, &theme, cx));
+        }
         let background_available = current_background
             .as_ref()
             .is_some_and(|background| Path::new(&background.path).is_file());
@@ -3420,11 +3755,16 @@ impl Render for AppearancePage {
                     .track_scroll(&self.scroll.scroll)
                     .child(
                         widgets::page_column()
-                            .child(widgets::page_header(&theme, "Appearance", None))
+                            .child(widgets::page_header(
+                                &theme,
+                                crate::shell::SettingsSection::Appearance.icon(),
+                                "Appearance",
+                                None,
+                            ))
                             .child(
                                 widgets::page_subtitle(
                                     &theme,
-                                    "Choose how Zeron looks. These settings stay on this device.",
+                                    "Choose how Clyra looks. These settings stay on this device.",
                                 )
                                 .max_w(px(512.0))
                                 .line_height(px(20.0)),
@@ -3473,12 +3813,12 @@ mod tests {
         let registry = ThemeRegistry::builtin();
         assert_eq!(
             registry
-                .variants_for(zeron_theme::Appearance::Light)
+                .variants_for(clyra_theme::Appearance::Light)
                 .count(),
             10
         );
         assert_eq!(
-            registry.variants_for(zeron_theme::Appearance::Dark).count(),
+            registry.variants_for(clyra_theme::Appearance::Dark).count(),
             20
         );
     }

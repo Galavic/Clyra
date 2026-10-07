@@ -1,18 +1,18 @@
 # Project Actions
 
-Project Actions are named shell commands attached to a project. They can be run from the selected chat's title bar, and one saved Action can optionally run when Zeron creates a new worktree.
+Project Actions are named shell commands attached to a project. They can be run from the selected chat's title bar, and one saved Action can optionally run when Clyra creates a new worktree.
 
 ## Trust and storage
 
-Actions are private configuration on the device that owns the project. Zeron stores them in the active engine profile's `project-actions.json`; they are not written to the workspace registry, session documents, or the edge service.
+Actions are private configuration on the device that owns the project. Clyra stores them in the active engine profile's `project-actions.json`; they are not written to the workspace registry, session documents, or the edge service.
 
-Opening a repository never authorizes a command. A repository may offer Actions through `zeron.json`, but each candidate must be explicitly imported before it can be run or selected as setup.
+Opening a repository never authorizes a command. A repository may offer Actions through `clyra.json`, but each candidate must be explicitly imported before it can be run or selected as setup.
 
 For a remote project, list, edit, delete, and run requests are sent to the owning device through `targetDeviceId`. The viewing device never resolves the remote path or falls back to running the command locally when the owner is offline.
 
-## `zeron.json`
+## `clyra.json`
 
-Place `zeron.json` at the exact project root to offer version-controlled imports:
+Place `clyra.json` at the exact project root to offer version-controlled imports:
 
 ```json
 {
@@ -37,7 +37,7 @@ The owning engine generates a stable slug id of at most 96 bytes and adds a dete
 
 ## Execution
 
-Every invocation opens a fresh managed terminal. On Unix, Zeron stores the exact saved command in a private temporary script on the owning device and sends a short instruction to source it in the user's interactive login shell. This preserves long lines and multiline commands across shell initialization without passing them through the terminal's limited input-line buffer. The script is removed when the shell exits or the terminal is closed. Windows retains direct command submission to its native terminal, which does not use the Unix canonical line buffer. Zeron does not wrap the command in `sh -c` or reuse a terminal whose foreground state is unknown.
+Every invocation opens a fresh managed terminal. On Unix, Clyra stores the exact saved command in a private temporary script on the owning device and sends a short instruction to source it in the user's interactive login shell. This preserves long lines and multiline commands across shell initialization without passing them through the terminal's limited input-line buffer. The script is removed when the shell exits or the terminal is closed. Windows retains direct command submission to its native terminal, which does not use the Unix canonical line buffer. Clyra does not wrap the command in `sh -c` or reuse a terminal whose foreground state is unknown.
 
 The owning engine validates that the Space, Chat, and checkout belong to the same local project before opening the PTY. A manual run uses the chat checkout as its working directory and injects:
 
@@ -48,7 +48,7 @@ ZERON_WORKTREE_PATH=<canonical chat worktree, only outside the main checkout>
 
 The terminal output is replayable, so output produced before the desktop subscribes is still displayed. Subscribe, resize, write, and close requests retain the terminal's owning `targetDeviceId`.
 
-The main title-bar segment remembers the last successfully started Action for that project in viewport-local UI settings. If it no longer exists, Zeron chooses the first non-setup Action and then the first Action as a final fallback.
+The main title-bar segment remembers the last successfully started Action for that project in viewport-local UI settings. If it no longer exists, Clyra chooses the first non-setup Action and then the first Action as a final fallback.
 
 ## Worktree setup
 
@@ -68,4 +68,4 @@ A failure to open or initialize the setup terminal is returned as `setupError`. 
 
 ## Out of scope
 
-Project Actions do not define global keybindings. Preview URLs and automatic browser opening are also intentionally absent until Zeron has a remote-capable browser and tunneling design.
+Project Actions do not define global keybindings. Preview URLs and automatic browser opening are also intentionally absent until Clyra has a remote-capable browser and tunneling design.

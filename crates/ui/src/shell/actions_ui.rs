@@ -1,6 +1,6 @@
 use super::*;
 
-use zeron_proto::{
+use clyra_proto::{
     ProjectAction, ProjectActionDraft, ProjectActionIcon, ProjectActionRun, ProjectActionsSnapshot,
 };
 
@@ -748,7 +748,7 @@ impl Shell {
         if !snapshot.importable_actions.is_empty() {
             card = card
                 .child(popover::menu_separator())
-                .child(popover::menu_heading(&theme, "Import from zeron.json"));
+                .child(popover::menu_heading(&theme, "Import from clyra.json"));
             for draft in snapshot.importable_actions.clone() {
                 let import = draft.clone();
                 let row_id = SharedString::from(format!("import-project-action-{}", draft.name));
@@ -1099,7 +1099,7 @@ mod project_actions_scroll_tests {
             }
             menu = menu
                 .child(popover::menu_separator())
-                .child(popover::menu_heading(theme, "Import from zeron.json"))
+                .child(popover::menu_heading(theme, "Import from clyra.json"))
                 .child(
                     popover::menu_row(theme, false, "import")
                         .id("import")

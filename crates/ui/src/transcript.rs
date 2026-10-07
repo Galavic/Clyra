@@ -39,8 +39,8 @@ use gpui::{
     TextAlign, TextRun, Window, canvas, div, img, list, point, prelude::*, px, quad, size,
 };
 
-use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
-use zeron_proto::ToolCall;
+use clyra_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
+use clyra_proto::ToolCall;
 
 use crate::markdown::parser::{
     Block, BlockTree, IncrementalParser, InlineRun, InlineStyle, parse_full,
@@ -52,7 +52,7 @@ use crate::notice::{NoticeChipIcon::Tile, notice_chip};
 use crate::state::AppState;
 use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
-use zeron_syntax::LanguageId as Lang;
+use clyra_syntax::LanguageId as Lang;
 
 // ---------------------------------------------------------------------------
 // Constants (mugen ports)
@@ -113,12 +113,39 @@ const TOOL_GROUP_HEADER_HEIGHT: f32 = 26.0;
 /// Compact rows retain the analytic heights used by row and group folds.
 const TOOL_TREE_ROW_HEIGHT: f32 = 32.0;
 const TOOL_FOLD: motion::MotionSpec = motion::MotionSpec::new(140, motion::EASE_OUT);
-/// BoardUI task-list cadence: a slow light sweep keeps the active summary
-/// legible, while each newly appended row reveals quickly enough to read as a
-/// continuous log rather than a stack of discrete pop-ins.
-const TOOL_GROUP_SHIMMER_DURATION: Duration = Duration::from_millis(3_400);
-const TOOL_GROUP_SHIMMER_HALF_WIDTH: f32 = 0.36;
-const TOOL_GROUP_SHIMMER_STRIP_WIDTH: f32 = 2.0;
+/// `ShineText` (smoothui `shine-text`), ported: a 2.5s linear sweep followed by
+/// a 0.6s rest, so the highlight arrives, crosses and waits instead of sitting
+/// there as a tint the eye adapts to. While the group is working and motion is
+/// allowed, the summary's title carries the sweep; each newly appended row still
+/// reveals quickly enough to read as a continuous log rather than stacked
+/// pop-ins.
+const TOOL_GROUP_SHIMMER_DURATION: Duration = Duration::from_millis(3_100);
+/// Share of the cycle the highlight spends parked off the text: 0.6s of 3.1s.
+const TOOL_GROUP_SHIMMER_HOLD: f32 = 0.6 / 3.1;
+/// `linear-gradient(110deg, base 40%, shine 50%, base 60%)` over
+/// `background-size: 250% 100%`: the 40→60% window is a fifth of a 2.5-title
+/// gradient, so the lit band is half a title wide, centred on the shine stop.
+const TOOL_GROUP_SHIMMER_BAND: f32 = 0.25;
+/// Where the shine stop sits, in title widths, at the two ends of the sweep.
+/// `background-position-x: 150% → -150%` of a 250% gradient leaves 150% of
+/// free space to slide through, so the stop travels 4.5 titles and starts a
+/// full title before the text.
+const TOOL_GROUP_SHIMMER_START: f32 = -1.0;
+const TOOL_GROUP_SHIMMER_TRAVEL: f32 = 4.5;
+/// The gradient runs at 110deg — 20° off horizontal, so the band is slanted and
+/// not a vertical bar. `tan(20°)`: the band's centre shifts by this much per
+/// unit of height.
+const TOOL_GROUP_SHIMMER_SLANT: f32 = 0.363_970_2;
+/// Vertical slices each strip is painted in. The slant has to be resolved in y
+/// for the band to read as tilted; three is where the step between slices stops
+/// being visible.
+const TOOL_GROUP_SHIMMER_SLICES: usize = 3;
+/// Width of one painted clip in x. Wider than a glyph hairline, narrow enough
+/// that the box-filtered colour steps stay under the eye's threshold.
+const TOOL_GROUP_SHIMMER_STRIP_WIDTH: f32 = 3.0;
+/// Distinct colours the highlight is quantised to. Enough that consecutive
+/// strips read as a gradient, few enough that shaping stays cheap.
+const TOOL_GROUP_SHIMMER_LEVELS: usize = 24;
 const TOOL_ROW_REVEAL: motion::MotionSpec = motion::MotionSpec::new(360, motion::EASE_OUT_EXPO);
 /// The connector draws briskly, then eases into the branch tip so its arrival
 /// remains visible without feeling mechanically linear.
@@ -408,6 +435,32 @@ fn is_spawn_link(item: &ToolItem) -> bool {
 /// render as their own always-open row.
 fn tool_group_collapses(tools: &[ToolItem]) -> bool {
     tools.iter().any(|t| !is_agent_tool(t))
+}
+
+/// Site avatar colors: deterministic hue per domain, readable on both
+/// appearances. Shared by fetch rail icons (digest rows were removed —
+/// site identity lives on the rows themselves, user request).
+fn web_avatar_colors(theme: &Theme, domain: &str) -> (gpui::Hsla, gpui::Hsla) {
+    let hue = clyra_proto::view::web_avatar_hue(domain);
+    match theme.appearance {
+        crate::theme::Appearance::Dark => (
+            gpui::hsla(hue, 0.45, 0.45, 1.0),
+            gpui::hsla(0.0, 0.0, 1.0, 0.92),
+        ),
+        crate::theme::Appearance::Light => (
+            gpui::hsla(hue, 0.45, 0.60, 1.0),
+            gpui::hsla(0.0, 0.0, 0.15, 1.0),
+        ),
+    }
+}
+
+/// First alphanumeric domain character, uppercased — the avatar glyph.
+fn web_avatar_letter(domain: &str) -> String {
+    domain
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_ascii_uppercase().to_string())
+        .unwrap_or_else(|| "?".to_string())
 }
 
 /// Column budget for soft-wrapping thought text into detail lines. The
@@ -774,7 +827,7 @@ pub enum ToolDetail {
     /// (chat2-sync A1). The full diff upgrades this to [`ToolDetail::Diff`]
     /// via the sidecar fetch.
     Stats {
-        stats: Arc<Vec<zeron_doc::ToolDiffStat>>,
+        stats: Arc<Vec<clyra_doc::ToolDiffStat>>,
     },
 }
 
@@ -801,8 +854,8 @@ const DETAIL_SEPARATOR: f32 = 1.0;
 /// STATS instead of inline diff text, which win the same way.
 pub fn tool_detail(
     output: Option<&str>,
-    diff: Option<&zeron_proto::ToolDiff>,
-    diff_stats: Option<&[zeron_doc::ToolDiffStat]>,
+    diff: Option<&clyra_proto::ToolDiff>,
+    diff_stats: Option<&[clyra_doc::ToolDiffStat]>,
 ) -> Option<ToolDetail> {
     if let Some(diff) = diff {
         let mut file = diff_to_file(diff);
@@ -929,10 +982,10 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
     })
 }
 
-/// Reduce an inline [`zeron_proto::ToolDiff`] to the changes pane's
+/// Reduce an inline [`clyra_proto::ToolDiff`] to the changes pane's
 /// [`crate::changes::FileDiff`]: hunks grouped with 3 context lines, dual
 /// 1-based line numbers, unified-diff hunk headers, and add/del counts.
-pub fn diff_to_file(diff: &zeron_proto::ToolDiff) -> crate::changes::FileDiff {
+pub fn diff_to_file(diff: &clyra_proto::ToolDiff) -> crate::changes::FileDiff {
     use crate::changes::{DiffLine, FileDiff, FileStatus, Hunk, LineKind};
     let old = diff.old_text.as_deref().unwrap_or("");
     let text_diff = similar::TextDiff::from_lines(old, &diff.new_text);
@@ -1056,6 +1109,90 @@ pub enum RowKind {
     ErrorChip {
         message: SharedString,
     },
+    /// Settled turn's edited-files card: "Edited N files +X −Y" with Undo /
+    /// Review and one line per file. Built from the doc's edit tool calls;
+    /// the latest turn overlays the engine's git turn diff at render time.
+    EditedFiles {
+        files: Arc<Vec<EditedFile>>,
+    },
+}
+
+/// One file on a turn's edited-files card.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct EditedFile {
+    pub path: SharedString,
+    /// `(additions, deletions)` when known. `None` when any edit of the file
+    /// carried no diff (only ACP harnesses report per-edit stats), or the
+    /// file is binary.
+    pub stats: Option<(u32, u32)>,
+}
+
+/// The files an assistant entry edited, in first-touch order, with line
+/// counts summed across edits. `None` when the entry made no successful edit
+/// tool call; `Some(empty)` when it did but named no file (a multi-file
+/// patch without stats).
+pub fn edited_files(entry: &SessionMessageEntry) -> Option<Vec<EditedFile>> {
+    let mut edited = false;
+    let mut files: Vec<EditedFile> = Vec::new();
+    for part in &entry.parts {
+        let MessagePart::Tool {
+            call,
+            is_error,
+            diff,
+            diff_stats,
+            ..
+        } = part
+        else {
+            continue;
+        };
+        let call_path = match call {
+            ToolCall::WriteFile { path, .. } | ToolCall::EditFile { path, .. } => {
+                Some(path.as_str())
+            }
+            ToolCall::ApplyPatch { path } => path.as_deref(),
+            _ => continue,
+        };
+        if *is_error {
+            continue;
+        }
+        edited = true;
+        let touched: Vec<(String, Option<(u32, u32)>)> =
+            if let Some(stats) = diff_stats.as_ref().filter(|stats| !stats.is_empty()) {
+                stats
+                    .iter()
+                    .map(|stat| {
+                        (
+                            stat.path.clone(),
+                            Some((stat.additions as u32, stat.deletions as u32)),
+                        )
+                    })
+                    .collect()
+            } else if let Some(diff) = diff {
+                let stat = clyra_doc::diff_stat(diff);
+                vec![(
+                    stat.path,
+                    Some((stat.additions as u32, stat.deletions as u32)),
+                )]
+            } else if let Some(path) = call_path {
+                vec![(path.to_string(), None)]
+            } else {
+                Vec::new()
+            };
+        for (path, stats) in touched {
+            if let Some(file) = files.iter_mut().find(|file| file.path.as_ref() == path) {
+                file.stats = match (file.stats, stats) {
+                    (Some((a, d)), Some((a2, d2))) => Some((a + a2, d + d2)),
+                    _ => None,
+                };
+            } else {
+                files.push(EditedFile {
+                    path: path.into(),
+                    stats,
+                });
+            }
+        }
+    }
+    edited.then_some(files)
 }
 
 fn generated_image_devices(owner: &str, fallback: &[String]) -> Vec<String> {
@@ -1077,7 +1214,7 @@ pub struct Row {
     pub turn_start: bool,
     pub kind: RowKind,
     /// The owning message entry — hover anywhere on the entry's rows reveals
-    /// its timestamp strip (zeron chat-view.tsx `group`/`group-hover`).
+    /// its timestamp strip (clyra chat-view.tsx `group`/`group-hover`).
     pub entry_id: SharedString,
     /// Epoch-ms for the 16px hover-timestamp strip UNDER this row: set on the
     /// LAST row of a completed entry (user rows always; assistant rows only
@@ -1302,7 +1439,8 @@ pub fn rows_for_entry(
             .join("\n\n");
         // Attachment refs ride the plain text (the `withAttachments`
         // transport); split them back out for the thumbnail strip.
-        let parsed = crate::attachments::parse_user_message_images(&raw);
+        let display = crate::teams::conversation_message(&raw);
+        let parsed = crate::attachments::parse_user_message_images(display);
         // File mentions render as chips here too, not just in the composer.
         // The projection is pure over the text, so the raw-length row version
         // below stays a valid cache/diff key.
@@ -1649,6 +1787,9 @@ pub fn rows_for_entry(
                 };
                 rows_for_entry(&work_entry, pending, false, parse)
             };
+            // The turn's edited-files card closes the whole entry below, not
+            // the fold (its id would collide with the outer card's).
+            inner.retain(|row| !matches!(row.kind, RowKind::EditedFiles { .. }));
             for row in &mut inner {
                 row.turn_start = false;
                 row.timestamp = None;
@@ -1693,6 +1834,28 @@ pub fn rows_for_entry(
         );
     }
 
+    // The edited-files card closes a settled assistant turn, so the hover
+    // strip (timestamp + copy) lands under it.
+    if entry.role == MessageRole::Assistant
+        && !streaming
+        && let Some(files) = edited_files(entry)
+    {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        files.hash(&mut hasher);
+        rows.push(Row {
+            id: format!("{}#edits", entry.id).into(),
+            version: hasher.finish(),
+            turn_start: false,
+            kind: RowKind::EditedFiles {
+                files: Arc::new(files),
+            },
+            entry_id: entry_id.clone(),
+            timestamp: None,
+            copy_text: None,
+            compact_fold: None,
+        });
+    }
     if let Some(first) = rows.first_mut() {
         first.turn_start = true;
     }
@@ -1878,8 +2041,10 @@ pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
     });
     if same_part_markdown {
         render::MD_BLOCK_GAP
-    } else if matches!(row.kind, RowKind::ToolGroup { .. })
-        || prev.is_some_and(|row| matches!(row.kind, RowKind::ToolGroup { .. }))
+    } else if matches!(
+        row.kind,
+        RowKind::ToolGroup { .. } | RowKind::EditedFiles { .. }
+    ) || prev.is_some_and(|row| matches!(row.kind, RowKind::ToolGroup { .. }))
     {
         Theme::SPACE_MD
     } else {
@@ -1913,7 +2078,7 @@ pub fn diff_rows(old: &[Row], new: &[Row]) -> Option<(Range<usize>, usize)> {
 
 /// The ToolGroup summary line — "Ran 3 commands · edited 2 files".
 ///
-/// The rule lives in `zeron_proto::view` so the terminal viewport reports the
+/// The rule lives in `clyra_proto::view` so the terminal viewport reports the
 /// same summary; this only adapts the row model's [`ToolItem`] to it.
 pub fn tool_group_summary(tools: &[ToolItem]) -> String {
     #[cfg(test)]
@@ -1937,7 +2102,7 @@ pub fn tool_group_summary(tools: &[ToolItem]) -> String {
     let base = if pairs.is_empty() {
         String::new()
     } else {
-        zeron_proto::view::tool_group_summary(&pairs)
+        clyra_proto::view::tool_group_summary(&pairs)
     };
     // Thought and note chips ride the group (they are UI-synthesized, so the
     // shared view summary never sees them): name them on the collapsed line.
@@ -1977,8 +2142,25 @@ fn tool_group_title(text: SharedString, shimmer_phase: Option<f32>, theme: &Them
     // CSS `background-clip: text` without duplicating accessible text.
     let overlay_text = text.clone();
     let overlay_font = gpui::font(theme.font_sans_fixed.clone());
-    let base = theme.text_muted;
-    let peak = theme.text;
+    // The component's defaults are `muted-foreground → foreground`, which at
+    // 12px is barely a step: the band reads as a smudge rather than as light
+    // crossing the letterforms. So the base tone drops toward the page and the
+    // shine climbs past the theme's own text colour - in a light theme the
+    // ceiling IS the text colour, so the range is bought at the bottom instead.
+    let base = motion::mix(
+        theme.text_muted,
+        theme.surface,
+        if theme.appearance.is_dark() {
+            0.22
+        } else {
+            0.30
+        },
+    );
+    let peak = if theme.appearance.is_dark() {
+        motion::mix(theme.text, gpui::hsla(0.0, 0.0, 1.0, 1.0), 0.35)
+    } else {
+        theme.text
+    };
     let overlay = canvas(
         move |bounds, window, _| {
             let probe = window.text_system().shape_line(
@@ -1995,43 +2177,72 @@ fn tool_group_title(text: SharedString, shimmer_phase: Option<f32>, theme: &Them
                 None,
             );
             let text_width = f32::from(probe.width()).min(f32::from(bounds.size.width));
+            let line_height = f32::from(bounds.size.height);
             let strip_count = (text_width / TOOL_GROUP_SHIMMER_STRIP_WIDTH).ceil() as usize;
-            let mut strips = Vec::with_capacity(strip_count);
+            let slice_height = line_height / TOOL_GROUP_SHIMMER_SLICES as f32;
+            // Shaped lazily per colour level: a long title is a hundred strips
+            // wide, and shaping the whole line once per cell is what made the
+            // sweep stutter.
+            let mut levels: Vec<Option<_>> = vec![None; TOOL_GROUP_SHIMMER_LEVELS];
+            let mut cells = Vec::with_capacity(strip_count * TOOL_GROUP_SHIMMER_SLICES);
             for ix in 0..strip_count {
                 let left = ix as f32 * TOOL_GROUP_SHIMMER_STRIP_WIDTH;
                 let right = ((ix + 1) as f32 * TOOL_GROUP_SHIMMER_STRIP_WIDTH).min(text_width);
-                let x = (left + right) * 0.5 / text_width.max(1.0);
-                let amount = tool_title_shimmer_amount(x, shimmer_phase);
-                if amount <= 0.001 {
-                    continue;
+                for slice in 0..TOOL_GROUP_SHIMMER_SLICES {
+                    let top = slice as f32 * slice_height;
+                    // The band is tilted, so the same x belongs to a different
+                    // part of the gradient at a different height.
+                    let slant = tool_title_shimmer_slant_at(
+                        top + slice_height * 0.5,
+                        line_height,
+                        text_width,
+                    );
+                    let amount = tool_title_shimmer_strip(
+                        left / text_width.max(1.0) + slant,
+                        right / text_width.max(1.0) + slant,
+                        shimmer_phase,
+                    );
+                    if amount <= 0.001 {
+                        continue;
+                    }
+                    let level = tool_title_shimmer_level(amount);
+                    if levels[level].is_none() {
+                        levels[level] = Some(window.text_system().shape_line(
+                            overlay_text.clone(),
+                            px(TOOL_LABEL_SIZE),
+                            &[TextRun {
+                                len: overlay_text.len(),
+                                font: overlay_font.clone(),
+                                color: motion::mix(
+                                    base,
+                                    peak,
+                                    level as f32 / (TOOL_GROUP_SHIMMER_LEVELS - 1) as f32,
+                                ),
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            }],
+                            None,
+                        ));
+                    }
+                    cells.push((left, top, right, top + slice_height, level));
                 }
-                let line = window.text_system().shape_line(
-                    overlay_text.clone(),
-                    px(TOOL_LABEL_SIZE),
-                    &[TextRun {
-                        len: overlay_text.len(),
-                        font: overlay_font.clone(),
-                        color: motion::mix(base, peak, amount),
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    }],
-                    None,
-                );
-                strips.push((left, right, line));
             }
-            strips
+            (levels, cells)
         },
-        move |bounds, strips, window, cx| {
-            for (left, right, line) in strips {
+        move |bounds, (levels, cells), window, cx| {
+            let line_height = px(TOOL_LABEL_LINE_HEIGHT);
+            for (left, top, right, bottom, level) in cells {
+                let Some(line) = levels[level].as_ref() else {
+                    continue;
+                };
                 let mask = ContentMask {
                     bounds: Bounds {
-                        origin: point(bounds.origin.x + px(left), bounds.origin.y),
-                        size: size(px(right - left), bounds.size.height),
+                        origin: point(bounds.origin.x + px(left), bounds.origin.y + px(top)),
+                        size: size(px(right - left), px(bottom - top)),
                     },
                 };
                 window.with_content_mask(Some(mask), |window| {
-                    let line_height = px(TOOL_LABEL_LINE_HEIGHT);
                     let _ = line.paint(
                         bounds.origin,
                         line_height,
@@ -2058,11 +2269,11 @@ fn tool_group_title(text: SharedString, shimmer_phase: Option<f32>, theme: &Them
 }
 
 // `single_line` and the per-kind chip label/detail are shared with the terminal
-// viewport (`zeron_proto::view`): a tool must be named identically on every
+// viewport (`clyra_proto::view`): a tool must be named identically on every
 // surface, and the one-line collapse is needed for the same reason in both (a
 // literal newline breaks gpui's ellipsis logic and would be a cursor move in a
 // cell grid).
-pub use zeron_proto::view::{single_line, tool_chip_content};
+pub use clyra_proto::view::{single_line, tool_chip_content};
 
 /// Analytic expanded-chips height — no measurement needed for the fold tween.
 pub fn chips_height(count: usize) -> f32 {
@@ -2120,7 +2331,7 @@ const FULL_OUTPUT_MAX_LINES: usize = 400;
 /// blobs render (near-)uncapped — fetching past the summary was the point.
 fn blob_detail(text: &str, is_diff: bool) -> Option<ToolDetail> {
     if is_diff {
-        let diff: zeron_proto::ToolDiff = serde_json::from_str(text).ok()?;
+        let diff: clyra_proto::ToolDiff = serde_json::from_str(text).ok()?;
         return tool_detail(None, Some(&diff), None);
     }
     let mut lines: Vec<SharedString> = text
@@ -2156,7 +2367,7 @@ fn format_kb(bytes: u64) -> String {
 
 /// Rotating flavour vocabulary (21 words / 7s, seeded per chat).
 pub const FLAVOUR_WORDS: [&str; 21] = [
-    "Zeroning",
+    "Clyraing",
     "Thinking",
     "Pondering",
     "Scheming",
@@ -2277,7 +2488,7 @@ fn compact_work_title(
 
 struct HighlightEntry {
     key: DocumentHighlightKey,
-    document: Option<Weak<zeron_syntax::HighlightedDocument>>,
+    document: Option<Weak<clyra_syntax::HighlightedDocument>>,
     _task: Option<Task<()>>,
 }
 
@@ -2299,7 +2510,7 @@ impl HighlightStore {
         lang: Lang,
         code: &str,
         cx: &mut Context<Transcript>,
-    ) -> Option<Arc<zeron_syntax::HighlightedDocument>> {
+    ) -> Option<Arc<clyra_syntax::HighlightedDocument>> {
         let slot_key = (row_id.clone(), block_ix);
         let document_key = DocumentHighlightKey::new(lang, code);
         if let Some(entry) = self.entries.get(&slot_key)
@@ -2328,7 +2539,7 @@ impl HighlightStore {
             let document = cx
                 .background_executor()
                 .spawn(async move {
-                    zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+                    clyra_syntax::highlight(clyra_syntax::HighlightRequest {
                         source: &code,
                         path: None,
                         fence_tag: Some(match lang {
@@ -2413,29 +2624,29 @@ pub(crate) struct TranscriptPreparation {
     cache: HashMap<String, Arc<Vec<Row>>>,
     live_parsers: HashMap<String, IncrementalParser>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
-    baseline: Option<zeron_doc::TranscriptBaseline>,
+    baseline: Option<clyra_doc::TranscriptBaseline>,
 }
 
 pub(crate) struct PreparedTranscript {
     pub(crate) rows: HashMap<String, Arc<Vec<Row>>>,
     pub(crate) historical: HashMap<String, Vec<Row>>,
     fully_historical: HashSet<String>,
-    pub(crate) navigation_baseline: Arc<zeron_doc::TranscriptBaseline>,
+    pub(crate) navigation_baseline: Arc<clyra_doc::TranscriptBaseline>,
     pub(crate) bytes: usize,
 }
 
 impl TranscriptPreparation {
     pub(crate) fn prepare(
         &mut self,
-        update: &zeron_doc::TranscriptUpdate,
-    ) -> Result<Arc<PreparedTranscript>, zeron_doc::TranscriptDesync> {
+        update: &clyra_doc::TranscriptUpdate,
+    ) -> Result<Arc<PreparedTranscript>, clyra_doc::TranscriptDesync> {
         match &update.frame {
-            zeron_doc::TranscriptFrame::Reset { .. } => {
+            clyra_doc::TranscriptFrame::Reset { .. } => {
                 self.cache.clear();
                 self.tree_cache.clear();
                 self.live_parsers.clear();
             }
-            zeron_doc::TranscriptFrame::Delta {
+            clyra_doc::TranscriptFrame::Delta {
                 upsert,
                 append,
                 remove,
@@ -2454,7 +2665,7 @@ impl TranscriptPreparation {
                 }
             }
         }
-        zeron_doc::apply_transcript_frame(&mut self.entries, update.frame.clone())?;
+        clyra_doc::apply_transcript_frame(&mut self.entries, update.frame.clone())?;
         if let Some(baseline) = &update.replay_baseline {
             self.baseline = Some(baseline.clone());
         }
@@ -2509,7 +2720,7 @@ impl TranscriptPreparation {
             historical,
             fully_historical,
             bytes,
-            navigation_baseline: Arc::new(zeron_doc::TranscriptBaseline::capture(&self.entries)),
+            navigation_baseline: Arc::new(clyra_doc::TranscriptBaseline::capture(&self.entries)),
         }))
     }
 }
@@ -2712,16 +2923,62 @@ fn compact_fold_geometry(
     (prefix, own, total)
 }
 
-/// BoardUI's measured recipe: a 300%-wide repeating gradient moves from 200%
-/// to -100%. Its 38→50→62% highlight maps to a 36%-of-title shoulder around
-/// each peak; adjacent copies sit three title-widths apart. Sampling this by
-/// x-coordinate lets the paint clips reproduce the continuous pattern.
+/// How far through the sweep a phase is. The hold is the reference's
+/// `repeatDelay`: the sweep is squeezed into the rest of the cycle and the
+/// shine stop parks off the text for the remainder.
+fn tool_title_shimmer_sweep(phase: f32) -> f32 {
+    (phase.clamp(0.0, 1.0) / (1.0 - TOOL_GROUP_SHIMMER_HOLD)).clamp(0.0, 1.0)
+}
+
+/// Where the shine stop sits along the title, 0 = left edge and 1 = right.
+fn tool_title_shimmer_center(phase: f32) -> f32 {
+    TOOL_GROUP_SHIMMER_START + TOOL_GROUP_SHIMMER_TRAVEL * tool_title_shimmer_sweep(phase)
+}
+
+/// The highlight at a point on the title, 0 (base colour) to 1 (shine colour).
+/// Linear between the gradient's stops, so the band is a clean ramp rather than
+/// a bell: the reference's creases are part of the look, and the pass is quick
+/// enough that they never read as a seam.
 fn tool_title_shimmer_amount(x: f32, phase: f32) -> f32 {
-    let primary_center = -2.5 + phase.clamp(0.0, 1.0) * 6.0;
-    (-2..=2)
-        .map(|copy| primary_center + copy as f32 * 3.0)
-        .map(|center| (1.0 - (x - center).abs() / TOOL_GROUP_SHIMMER_HALF_WIDTH).clamp(0.0, 1.0))
-        .fold(0.0, f32::max)
+    (1.0 - (x - tool_title_shimmer_center(phase)).abs() / TOOL_GROUP_SHIMMER_BAND).clamp(0.0, 1.0)
+}
+
+/// The band is tilted 110deg, so its centre depends on the height being
+/// painted: a point `dy` below the middle of the line belongs to a band centred
+/// `tan(20deg) * dy / width` further left. The result is in title widths, the
+/// unit the profile works in.
+fn tool_title_shimmer_slant_at(y: f32, height: f32, width: f32) -> f32 {
+    TOOL_GROUP_SHIMMER_SLANT * (y - height * 0.5) / width.max(1.0)
+}
+
+/// The profile integrated across one painted cell. Each cell takes a single flat
+/// colour, so sampling only its centre would leave a staircase along the ramp;
+/// averaging a few sub-samples is the box filter that removes it.
+fn tool_title_shimmer_strip(x0: f32, x1: f32, phase: f32) -> f32 {
+    const SUB_SAMPLES: usize = 4;
+    let mut total = 0.0;
+    for ix in 0..SUB_SAMPLES {
+        let t = (ix as f32 + 0.5) / SUB_SAMPLES as f32;
+        total += tool_title_shimmer_amount(x0 + (x1 - x0) * t, phase);
+    }
+    total / SUB_SAMPLES as f32
+}
+
+/// The title's highlight level for an amount. Every cell inside a bucket paints
+/// the same colour, so one shaped line per bucket serves all of them instead of
+/// one per cell.
+fn tool_title_shimmer_level(amount: f32) -> usize {
+    let scaled = (amount * (TOOL_GROUP_SHIMMER_LEVELS - 1) as f32).round();
+    scaled.clamp(0.0, (TOOL_GROUP_SHIMMER_LEVELS - 1) as f32) as usize
+}
+
+/// The phase at which the shine stop sits at `x` on the title. The hold shifts
+/// every phase, so tests that mean "the band is at the middle" ask in sweep
+/// terms.
+#[cfg(test)]
+fn tool_title_shimmer_phase_at(x: f32) -> f32 {
+    let sweep = (x - TOOL_GROUP_SHIMMER_START) / TOOL_GROUP_SHIMMER_TRAVEL;
+    sweep * (1.0 - TOOL_GROUP_SHIMMER_HOLD)
 }
 
 fn tool_title_shimmer_phase(start: Instant, now: Instant) -> f32 {
@@ -3033,6 +3290,8 @@ pub struct Transcript {
     /// attachment protection (that set is shared with the primary transcript
     /// and overwritten wholesale).
     doc_override: Option<String>,
+    dot_mode: bool,
+    dot_color: u32,
     /// Whether an override instance watches a LIVE doc (`for_doc(follow)`):
     /// only then may the working trailer render — a frozen snapshot must
     /// never spin, whatever its entries claim.
@@ -3068,7 +3327,7 @@ pub struct Transcript {
     /// Entrance state follows stable groups through completion so fast calls
     /// finish revealing. Replay rows have no entrance timestamps.
     tool_group_reveals: HashMap<SharedString, ToolGroupReveal>,
-    last_replay_baseline: Option<Arc<zeron_doc::TranscriptBaseline>>,
+    last_replay_baseline: Option<Arc<clyra_doc::TranscriptBaseline>>,
     /// Parsed historical prefixes, used to seed text before a coalesced live
     /// suffix is painted. The wire watermark contains lengths, not text.
     historical_markdown: HashMap<SharedString, Row>,
@@ -3191,7 +3450,7 @@ pub struct Transcript {
     /// Hovered rail tick (grows + shows the preview card).
     rail_hover: Option<usize>,
     /// `(row id, entry id)` under the pointer — reveals the entry's timestamp
-    /// strip (zeron chat-view.tsx `group-hover`; the rows report hover
+    /// strip (clyra chat-view.tsx `group-hover`; the rows report hover
     /// themselves). Keyed by ROW so a row→row move within one entry can't
     /// clear the reveal when the old row's leave event arrives after the new
     /// row's enter (enter/leave order across rows is not guaranteed).
@@ -3224,6 +3483,8 @@ pub struct Transcript {
     /// Deliberately NOT cleared on chat switch: refs are chat-qualified and a
     /// fetched blob stays valid.
     blob_details: HashMap<SharedString, BlobFetch>,
+    /// Git-backed stats and Undo state for the latest turn's card.
+    turn_changes: Option<TurnChanges>,
     /// Monotonic fetch order per blob ref: when a tool has BOTH a diff and
     /// an output blob fetched, the chip shows the one requested most
     /// recently (click "Show full output" after a diff → see the output).
@@ -3254,6 +3515,36 @@ pub enum TranscriptEvent {
         title: String,
         frozen: bool,
     },
+    /// An edited-files card's Review button: open a diff tab — on the
+    /// "Latest turn" scope when the card is the latest turn and the engine
+    /// holds its snapshot, the working tree otherwise.
+    ReviewChanges { latest_turn: bool },
+}
+
+/// The latest turn's edited-files card, backed by the engine's git turn diff
+/// (accurate per-file counts for every harness) and its Undo state. Only the
+/// latest turn has a snapshot on the engine, so older cards stay doc-only.
+struct TurnChanges {
+    /// `{chat_id}|{entry_id}` — a new latest turn replaces this state.
+    key: String,
+    entry_id: SharedString,
+    chat_id: String,
+    /// Files from the git turn diff; `None` until it lands, or when the
+    /// engine has no snapshot (restart) or the turn changed nothing in git.
+    files: Option<Arc<Vec<EditedFile>>>,
+    /// Paths Undo may restore: every current and pre-rename path on the card,
+    /// so files touched after the capture are never reverted.
+    undo_paths: Vec<String>,
+    undo: TurnUndo,
+    task: Option<Task<()>>,
+}
+
+#[derive(Clone, PartialEq)]
+enum TurnUndo {
+    Idle,
+    Running,
+    Done,
+    Failed(SharedString),
 }
 
 impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
@@ -3289,6 +3580,19 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> Self {
         Self::build(state, Some(doc_id), follow, cx)
+    }
+
+    pub fn for_dot(
+        state: Entity<AppState>,
+        doc_id: String,
+        color: u32,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut transcript = Self::build(state, Some(doc_id), true, cx);
+        transcript.dot_mode = true;
+        transcript.dot_color = color;
+        transcript.sync(cx);
+        transcript
     }
 
     fn build(
@@ -3358,6 +3662,8 @@ impl Transcript {
             land_end_pending: doc_override.is_some() && !follow,
             doc_live: doc_override.is_some() && follow,
             doc_override,
+            dot_mode: false,
+            dot_color: 0xEE7433,
             saved_viewports: SavedViewportCache::default(),
             pending_viewport: None,
             viewport_generation: 0,
@@ -3425,6 +3731,7 @@ impl Transcript {
             attachment_loads: HashMap::new(),
             attachment_retries: HashMap::new(),
             blob_details: HashMap::new(),
+            turn_changes: None,
             blob_fetch_order: HashMap::new(),
             blob_fetch_counter: 0,
             _observe: observe,
@@ -4564,6 +4871,10 @@ impl Transcript {
                 .as_ref()
                 .and_then(|id| state.prepared_transcripts.get(id));
             for entry in entries {
+                if self.dot_mode && entry.role == MessageRole::User && entry.parts.iter().any(|p|
+                    matches!(p, MessagePart::Text { text, .. } if text.starts_with("<!-- clyra-dot-result -->"))) {
+                    continue;
+                }
                 if !self.compact_mode
                     && let Some(rows) = prepared.and_then(|p| p.rows.get(&entry.id))
                 {
@@ -4611,6 +4922,10 @@ impl Transcript {
                 .and_then(|id| state.prepared_transcripts.get(id));
             let mut historical_rows = Vec::new();
             for entry in entries {
+                if self.dot_mode && entry.role == MessageRole::User && entry.parts.iter().any(|p|
+                    matches!(p, MessagePart::Text { text, .. } if text.starts_with("<!-- clyra-dot-result -->"))) {
+                    continue;
+                }
                 let covered = prepared.map_or_else(
                     || baseline.covers(entry),
                     |p| {
@@ -4857,6 +5172,7 @@ impl Transcript {
                     cx.notify();
                 }
                 self.promote_materialized_queued_turn(attached, cx);
+                self.refresh_turn_changes(cx);
                 return;
             }
             Some((old_range, count)) => {
@@ -4904,6 +5220,7 @@ impl Transcript {
         self.reconcile_own_turn_prompt();
         self.restore_pending_viewport(replay);
         self.promote_materialized_queued_turn(attached, cx);
+        self.refresh_turn_changes(cx);
         if self.land_end_pending && !self.rows.is_empty() {
             // First content for an unpinned override tab: land at the end.
             // `scroll_to_end` is ITEM-anchored (past-the-end offset that the
@@ -5024,6 +5341,206 @@ impl Transcript {
         rows
     }
 
+    /// Checkout of this transcript's chat: `(cwd, targetDeviceId)`, the
+    /// target `None` when the chat runs on this device.
+    fn chat_checkout(&self, chat_id: &str, cx: &gpui::App) -> Option<(String, Option<String>)> {
+        let state = self.state.read(cx);
+        let chat = state.chats.iter().find(|chat| chat.id == chat_id)?;
+        let cwd = chat.cwd.clone()?;
+        let target = (state.local_device_id.as_deref() != Some(chat.device_id.as_str()))
+            .then(|| chat.device_id.clone());
+        Some((cwd, target))
+    }
+
+    /// Track the latest turn's card: when the transcript's LAST row is an
+    /// edited-files card (the settled final turn), capture its git turn diff
+    /// once per turn. Anything else (a new prompt, a live run, a subagent
+    /// tab) drops the state — only the latest turn has an engine snapshot.
+    fn refresh_turn_changes(&mut self, cx: &mut Context<Self>) {
+        let latest = self
+            .rows
+            .last()
+            .filter(|row| matches!(row.kind, RowKind::EditedFiles { .. }))
+            .map(|row| row.entry_id.clone());
+        let (Some(entry_id), Some(chat_id), None) =
+            (latest, self.chat_id.clone(), self.doc_override.as_ref())
+        else {
+            self.turn_changes = None;
+            return;
+        };
+        let key = format!("{chat_id}|{entry_id}");
+        if self
+            .turn_changes
+            .as_ref()
+            .is_some_and(|turn| turn.key == key)
+        {
+            return;
+        }
+        self.turn_changes = Some(TurnChanges {
+            key,
+            entry_id,
+            chat_id,
+            files: None,
+            undo_paths: Vec::new(),
+            undo: TurnUndo::Idle,
+            task: None,
+        });
+        self.fetch_turn_changes(cx);
+    }
+
+    fn fetch_turn_changes(&mut self, cx: &mut Context<Self>) {
+        let Some(turn) = self.turn_changes.as_ref() else {
+            return;
+        };
+        let (key, chat_id) = (turn.key.clone(), turn.chat_id.clone());
+        let Some((cwd, target)) = self.chat_checkout(&chat_id, cx) else {
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let mut params = serde_json::json!({ "cwd": cwd, "mode": "turn", "chatId": chat_id });
+        if let Some(target) = target {
+            params["targetDeviceId"] = serde_json::Value::String(target);
+        }
+        let task = cx.spawn(async move |this, cx| {
+            let reply = crate::attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                clyra_rpc::methods::GET_CHECKOUT_DIFF,
+                params,
+                Duration::from_secs(30),
+            )
+            .await;
+            let diff = reply
+                .ok()
+                .and_then(|value| serde_json::from_value::<clyra_proto::CheckoutDiff>(value).ok())
+                .filter(|diff| !diff.files.is_empty());
+            this.update(cx, |this, cx| {
+                let Some(turn) = this.turn_changes.as_mut().filter(|turn| turn.key == key) else {
+                    return;
+                };
+                turn.task = None;
+                let Some(diff) = diff else {
+                    return;
+                };
+                turn.undo_paths = diff
+                    .files
+                    .iter()
+                    .flat_map(|file| {
+                        std::iter::once(file.path.clone()).chain(file.old_path.clone())
+                    })
+                    .collect();
+                // Git reports checkout-root-relative paths; anchor them at the
+                // root so the card relativizes (and opens) them against the
+                // chat's workspace like the doc's absolute tool paths.
+                let root = diff.cwd.trim_end_matches(['/', '\\']).to_string();
+                turn.files = Some(Arc::new(
+                    diff.files
+                        .into_iter()
+                        .map(|file| EditedFile {
+                            path: format!("{root}/{}", file.path).into(),
+                            stats: (!file.binary).then_some((file.additions, file.deletions)),
+                        })
+                        .collect(),
+                ));
+                // The git file list may differ from the doc's: the card is
+                // the last row, so re-measure it.
+                this.remeasure_last_row();
+                cx.notify();
+            })
+            .ok();
+        });
+        if let Some(turn) = self.turn_changes.as_mut() {
+            turn.task = Some(task);
+        }
+    }
+
+    /// The card's Undo: restore the latest turn's files from the engine's
+    /// turn-start snapshot, limited to the paths the card shows.
+    fn undo_turn_changes(&mut self, cx: &mut Context<Self>) {
+        let Some(turn) = self.turn_changes.as_ref() else {
+            return;
+        };
+        if matches!(turn.undo, TurnUndo::Running | TurnUndo::Done) || turn.undo_paths.is_empty() {
+            return;
+        }
+        let (key, chat_id, paths) = (
+            turn.key.clone(),
+            turn.chat_id.clone(),
+            turn.undo_paths.clone(),
+        );
+        let Some((cwd, target)) = self.chat_checkout(&chat_id, cx) else {
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let mut params = serde_json::json!({ "cwd": cwd, "chatId": chat_id, "paths": paths });
+        if let Some(target) = target {
+            params["targetDeviceId"] = serde_json::Value::String(target);
+        }
+        let task = cx.spawn(async move |this, cx| {
+            let reply = crate::attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                clyra_rpc::methods::REVERT_TURN_CHANGES,
+                params,
+                Duration::from_secs(60),
+            )
+            .await;
+            this.update(cx, |this, cx| {
+                let Some(turn) = this.turn_changes.as_mut().filter(|turn| turn.key == key) else {
+                    return;
+                };
+                turn.task = None;
+                turn.undo = match reply {
+                    Ok(_) => TurnUndo::Done,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "undo turn changes failed");
+                        TurnUndo::Failed(err.into())
+                    }
+                };
+                cx.notify();
+            })
+            .ok();
+        });
+        if let Some(turn) = self.turn_changes.as_mut() {
+            turn.undo = TurnUndo::Running;
+            turn.task = Some(task);
+        }
+        cx.notify();
+    }
+
+    fn render_edited_files(
+        &self,
+        entry_id: &SharedString,
+        doc_files: &Arc<Vec<EditedFile>>,
+        workspace_root: Option<&str>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let turn = self
+            .turn_changes
+            .as_ref()
+            .filter(|turn| &turn.entry_id == entry_id);
+        let git_files = turn.and_then(|turn| turn.files.clone());
+        let latest_turn = git_files.is_some();
+        let files = git_files.unwrap_or_else(|| doc_files.clone());
+        let undo = turn.map_or(TurnUndo::Idle, |turn| turn.undo.clone());
+        render_edited_files_card(
+            entry_id,
+            &files,
+            workspace_root,
+            latest_turn,
+            &undo,
+            self.doc_override.is_none(),
+            self.link_ui(),
+            theme,
+            cx,
+        )
+    }
+
     /// Fetch a sidecar blob (full tool output or diff) and build its upgraded
     /// [`ToolDetail`] once, off the render path. Re-entry while Loading/Ready
     /// is a no-op; Failed re-arms as a retry (the affordance label says so).
@@ -5052,7 +5569,7 @@ impl Transcript {
             let reply = crate::attachments::call_with_timeout(
                 &engine,
                 cx.background_executor(),
-                zeron_rpc::methods::FETCH_TOOL_BLOB,
+                clyra_rpc::methods::FETCH_TOOL_BLOB,
                 serde_json::json!({ "blobRef": ref_key.as_ref() }),
                 Duration::from_secs(20),
             )
@@ -5341,7 +5858,7 @@ impl Transcript {
     }
 
     /// Devices that may own a user message's attachment files: the chat's host
-    /// device (uploads targeted it) plus this device (zeron's
+    /// device (uploads targeted it) plus this device (clyra's
     /// `uniqueIds([attachmentDeviceId, m.device_id])`).
     fn attachment_device_ids(&self, cx: &Context<Self>) -> Vec<String> {
         // `selected_chat_row` belongs to the PRIMARY transcript's chat — an
@@ -6105,7 +6622,7 @@ impl Transcript {
                 let params = serde_json::json!({ "chatId": chat_id });
                 if let Err(err) = engine
                     .client()
-                    .call(zeron_rpc::methods::RETRY_DELIVERY, params)
+                    .call(clyra_rpc::methods::RETRY_DELIVERY, params)
                     .await
                 {
                     tracing::warn!(error = %err, "delivery retry RPC failed");
@@ -6220,7 +6737,7 @@ impl Transcript {
                 .gap(px(Theme::SPACE_SM))
                 .pt(px(Theme::SPACE_LG))
                 .text_size(crate::typography::ui_rems(11.0))
-                .child(crate::loaders::gradient_spinner(
+                .child(crate::loaders::dotm_helix(
                     "working-indicator",
                     &theme,
                     2.5,
@@ -6259,7 +6776,26 @@ impl Transcript {
             return gpui::Empty.into_any_element();
         };
         self.rendered_rows.insert(row.id.clone());
-        let theme = Theme::of(cx).clone();
+        let mut theme = Theme::of(cx).clone();
+        if self.dot_mode && matches!(row.kind, RowKind::User { .. }) {
+            let linear = |channel: u32| {
+                let value = channel as f32 / 255.0;
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            let luminance = 0.2126 * linear((self.dot_color >> 16) & 255)
+                + 0.7152 * linear((self.dot_color >> 8) & 255)
+                + 0.0722 * linear(self.dot_color & 255);
+            theme.text = gpui::rgb(if luminance > 0.179 {
+                0x141416
+            } else {
+                0xFFFFFF
+            })
+            .into();
+        }
         let workspace_root = {
             let state = self.state.read(cx);
             self.chat_id
@@ -6274,7 +6810,30 @@ impl Transcript {
         // rests below the chrome it fades under. The right pane already pads
         // for the titlebar — an override instance's first row keeps only the
         // ordinary turn gap, or the content sits double-chrome low.
-        let top_gap = if ix == 0 {
+        let dot_continuation = self.dot_mode
+            && ix > 0
+            && self.rows.get(ix - 1).is_some_and(|previous| {
+                previous.entry_id == row.entry_id
+                    && matches!(
+                        previous.kind,
+                        RowKind::Markdown { .. } | RowKind::LiveMarkdown { .. }
+                    )
+                    && matches!(
+                        row.kind,
+                        RowKind::Markdown { .. } | RowKind::LiveMarkdown { .. }
+                    )
+            });
+        let dot_next = self.dot_mode
+            && self.rows.get(ix + 1).is_some_and(|next| {
+                next.entry_id == row.entry_id
+                    && matches!(
+                        next.kind,
+                        RowKind::Markdown { .. } | RowKind::LiveMarkdown { .. }
+                    )
+            });
+        let top_gap = if dot_continuation {
+            0.0
+        } else if ix == 0 {
             if self.doc_override.is_some() {
                 Theme::SPACE_LG
             } else {
@@ -6356,8 +6915,16 @@ impl Transcript {
                             div()
                                 .min_w_0()
                                 .max_w(px(self.content_width * 0.8))
-                                .bg(crate::theme::user_bubble_bg())
-                                .rounded(px(Theme::BUBBLE_RADIUS))
+                                .bg(if self.dot_mode {
+                                    gpui::rgb(self.dot_color).into()
+                                } else {
+                                    crate::theme::user_bubble_bg()
+                                })
+                                .rounded(px(if self.dot_mode {
+                                    28.0
+                                } else {
+                                    Theme::BUBBLE_RADIUS
+                                }))
                                 .px(px(16.0))
                                 .py(px(10.0))
                                 .text_size(crate::typography::ui_rems(14.0))
@@ -6514,6 +7081,36 @@ impl Transcript {
                 mime_type,
             } => self.render_generated_image(&row.id, owner, path, name, mime_type, cx),
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::EditedFiles { files } => self.render_edited_files(
+                &row.entry_id,
+                files,
+                workspace_root.as_deref(),
+                &theme,
+                cx,
+            ),
+        };
+
+        let inner = if self.dot_mode
+            && matches!(
+                row.kind,
+                RowKind::Markdown { .. } | RowKind::LiveMarkdown { .. }
+            ) {
+            div()
+                .w_full()
+                .rounded(px(26.0))
+                .px(px(20.0))
+                .py(px(14.0))
+                .when(dot_continuation, |el| el.rounded_t(px(0.0)).pt(px(4.0)))
+                .when(dot_next, |el| el.rounded_b(px(0.0)).pb(px(4.0)))
+                .bg(if theme.appearance.is_dark() {
+                    gpui::rgb(0x242424).into()
+                } else {
+                    theme.glass_hover()
+                })
+                .child(inner)
+                .into_any_element()
+        } else {
+            inner
         };
 
         // Hover-revealed metadata strip: a RESERVED 32px lane under the
@@ -6809,7 +7406,7 @@ impl Transcript {
         tree: &Arc<BlockTree>,
         only: Option<usize>,
         cx: &mut Context<Self>,
-    ) -> HashMap<usize, Option<Arc<zeron_syntax::HighlightedDocument>>> {
+    ) -> HashMap<usize, Option<Arc<clyra_syntax::HighlightedDocument>>> {
         let mut out = HashMap::new();
         for (ix, top) in tree.blocks.iter().enumerate() {
             if only.is_some_and(|o| o != ix) {
@@ -6818,7 +7415,7 @@ impl Transcript {
             if let Block::CodeBlock { language, code } = &top.block
                 && let Some(lang) = language
                     .as_deref()
-                    .and_then(zeron_syntax::language_for_alias)
+                    .and_then(clyra_syntax::language_for_alias)
             {
                 out.insert(
                     ix,
@@ -6848,7 +7445,7 @@ impl Transcript {
         let old = match old_text {
             Some(source) => {
                 let path = file.old_path.as_deref().unwrap_or(&file.path);
-                let lang = zeron_syntax::language_for_path(path)?;
+                let lang = clyra_syntax::language_for_path(path)?;
                 Some(
                     self.highlights
                         .request(cache_row.clone(), 0, lang, source, cx)?,
@@ -6858,7 +7455,7 @@ impl Transcript {
         };
         let new = match new_text {
             Some(source) => {
-                let lang = zeron_syntax::language_for_path(&file.path)?;
+                let lang = clyra_syntax::language_for_path(&file.path)?;
                 Some(self.highlights.request(cache_row, 1, lang, source, cx)?)
             }
             None => None,
@@ -6896,6 +7493,31 @@ impl Transcript {
         // to show chips arriving mid-reveal. Collapsed-by-default is the mode.
         let effective_auto_open = auto_open || (arrival_pending && !self.compact_mode);
         let open = !collapses || fold.open.unwrap_or(effective_auto_open);
+        // Kick off favicon downloads for fetched sites (shared global cache:
+        // one flight per domain per process). Rows paint letter avatars until
+        // (or unless) the icon lands; completion notifies and repaints.
+        for tool in tools.iter() {
+            let ToolCall::WebFetch { url, .. } = &tool.call else {
+                continue;
+            };
+            let Some(domain) = clyra_proto::view::web_domain(url) else {
+                continue;
+            };
+            if crate::favicons::FaviconCache::claim(cx, &domain) {
+                let download =
+                    gpui_tokio::Tokio::spawn(cx, crate::favicons::download_favicon(domain.clone()));
+                cx.spawn(async move |this, cx| {
+                    if let Ok(image) = download.await {
+                        let _ = this.update(cx, |_, cx| {
+                            if crate::favicons::FaviconCache::finish(cx, &domain, image) {
+                                cx.notify();
+                            }
+                        });
+                    }
+                })
+                .detach();
+            }
+        }
         // Compact shells only change `open` through `toggle_fold`, which
         // already seeds `from` with the body's measured height — the
         // rendered-height reset below must not clobber it with the shell's
@@ -7466,6 +8088,7 @@ impl Transcript {
                             continuation_reveal,
                             base_row_height,
                             theme,
+                            cx,
                         ))
                     })
                     .child(card.when(collapses && content_reveal < 1.0, |card| {
@@ -7674,6 +8297,278 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
 /// ChatRoundLine, the medium "Question" label, then the truncating value —
 /// the first question's header once resolved, "Awaiting your answer…" while
 /// pending. Neutral tones throughout; resolution never recolors the chip.
+/// The path relative to the workspace root when it lives under it (forward
+/// slashes), `Err` with the normalized absolute path otherwise.
+fn edited_file_relative(path: &str, workspace_root: Option<&str>) -> Result<String, String> {
+    let normalized = path.replace('\\', "/");
+    let under_root = workspace_root
+        .map(|root| root.replace('\\', "/"))
+        .and_then(|root| {
+            let root = root.trim_end_matches('/');
+            // Drive-letter case differs between sources on Windows.
+            let head = normalized.get(..root.len())?;
+            head.eq_ignore_ascii_case(root)
+                .then(|| normalized[root.len()..].strip_prefix('/'))
+                .flatten()
+                .map(str::to_string)
+        });
+    match under_root {
+        Some(relative) => Ok(relative),
+        None if normalized.starts_with('/') || normalized.contains(':') => Err(normalized),
+        None => Ok(normalized),
+    }
+}
+
+/// `(dir/, name)` for a card line: the path relative to the workspace root
+/// when it lives under it, split so the directory can render dimmer.
+fn edited_file_label(path: &str, workspace_root: Option<&str>) -> (String, String) {
+    let relative = edited_file_relative(path, workspace_root).unwrap_or_else(|path| path);
+    match relative.rsplit_once('/') {
+        Some((dir, name)) => (format!("{dir}/"), name.to_string()),
+        None => (String::new(), relative),
+    }
+}
+
+fn edited_stats_label(additions: u32, deletions: u32, theme: &Theme) -> gpui::Div {
+    div()
+        .flex_none()
+        .flex()
+        .flex_row()
+        .gap(px(6.0))
+        .child(
+            div()
+                .text_color(theme.diff_add)
+                .child(SharedString::from(format!("+{additions}"))),
+        )
+        .child(
+            div()
+                .text_color(theme.diff_del)
+                .child(SharedString::from(format!("\u{2212}{deletions}"))),
+        )
+}
+
+/// Codex-style edited-files card: a header (diff tile, "Edited N files",
+/// summed `+X −Y`, Undo / Review) over one line per file.
+#[allow(clippy::too_many_arguments)]
+fn render_edited_files_card(
+    entry_id: &SharedString,
+    files: &[EditedFile],
+    workspace_root: Option<&str>,
+    latest_turn: bool,
+    undo: &TurnUndo,
+    actions: bool,
+    links: Option<render::LinkUi>,
+    theme: &Theme,
+    cx: &mut Context<Transcript>,
+) -> AnyElement {
+    let count = files.len();
+    let title: SharedString = match (undo, count) {
+        (TurnUndo::Done, _) => "Changes undone".into(),
+        (_, 0) => "Edited files".into(),
+        (_, 1) => "Edited 1 file".into(),
+        (_, n) => format!("Edited {n} files").into(),
+    };
+    let totals = files.iter().try_fold((0u32, 0u32), |(a, d), file| {
+        file.stats.map(|(a2, d2)| (a + a2, d + d2))
+    });
+    let subtitle = match undo {
+        TurnUndo::Failed(message) => Some(
+            div()
+                .truncate()
+                .text_color(theme.danger)
+                .child(SharedString::from(format!("Undo failed: {message}")))
+                .into_any_element(),
+        ),
+        _ => totals
+            .filter(|_| count > 0)
+            .map(|(a, d)| edited_stats_label(a, d, theme).into_any_element()),
+    };
+    let hover_key = |name: &str| format!("edited-{name}-{entry_id}");
+    let undo_button = (actions && latest_turn && *undo != TurnUndo::Done).then(|| {
+        let running = *undo == TurnUndo::Running;
+        let key = hover_key("undo");
+        div()
+            .id(SharedString::from(key.clone()))
+            .flex_none()
+            .h(px(30.0))
+            .px(px(10.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .rounded(px(8.0))
+            .text_color(theme.text)
+            .bg(motion::hover_blend(
+                &key,
+                gpui::transparent_black(),
+                crate::theme::ink(0.06),
+            ))
+            .on_hover(motion::hover_listener(key))
+            .when(running, |el| el.opacity(0.6))
+            .when(!running, |el| {
+                el.cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| this.undo_turn_changes(cx)))
+            })
+            .child(SharedString::from(if running {
+                "Undoing…"
+            } else {
+                "Undo"
+            }))
+            .child(
+                crate::icons::icon(crate::icons::UNDO)
+                    .size(px(14.0))
+                    .text_color(theme.text_muted),
+            )
+    });
+    let review_button = actions.then(|| {
+        let key = hover_key("review");
+        div()
+            .id(SharedString::from(key.clone()))
+            .flex_none()
+            .h(px(30.0))
+            .px(px(12.0))
+            .flex()
+            .items_center()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(crate::theme::hairline(0.10))
+            .text_color(theme.text)
+            .cursor_pointer()
+            .bg(motion::hover_blend(
+                &key,
+                crate::theme::ink(0.02),
+                crate::theme::ink(0.07),
+            ))
+            .on_hover(motion::hover_listener(key))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(TranscriptEvent::ReviewChanges { latest_turn })
+            }))
+            .child(SharedString::from("Review"))
+    });
+    let header = div()
+        .w_full()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(12.0))
+        .px(px(14.0))
+        .py(px(12.0))
+        .child(
+            div()
+                .flex_none()
+                .size(px(34.0))
+                .rounded(px(8.0))
+                .bg(crate::theme::ink(0.07))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    crate::icons::icon(crate::icons::DIFF)
+                        .size(px(16.0))
+                        .text_color(theme.text_muted),
+                ),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .truncate()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.text)
+                        .child(title),
+                )
+                .children(subtitle.map(|subtitle| {
+                    div()
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .child(subtitle)
+                })),
+        )
+        .children(undo_button)
+        .children(review_button);
+    let lines = files.iter().enumerate().map(|(ix, file)| {
+        let (dir, name) = edited_file_label(&file.path, workspace_root);
+        // Workspace files open in the app's editor through the same route as
+        // transcript file links; paths outside the workspace stay inert.
+        let open = edited_file_relative(&file.path, workspace_root)
+            .ok()
+            .zip(links.clone())
+            .filter(|_| actions);
+        let key = hover_key(&format!("file-{ix}"));
+        div()
+            .id(SharedString::from(key.clone()))
+            .when_some(open, |el, (relative, links)| {
+                let label = name.clone();
+                el.cursor_pointer()
+                    .bg(motion::hover_blend(
+                        &key,
+                        gpui::transparent_black(),
+                        crate::theme::ink(0.04),
+                    ))
+                    .on_hover(motion::hover_listener(key.clone()))
+                    .on_click(move |_, window, cx| {
+                        render::activate_link(
+                            render::LinkTarget::new(&label, &relative),
+                            render::LinkAction::Primary,
+                            Some(&links),
+                            window,
+                            cx,
+                        )
+                    })
+            })
+            .w_full()
+            .h(px(36.0))
+            .px(px(14.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(12.0))
+            .border_t_1()
+            .border_color(crate::theme::hairline(0.06))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_row()
+                    .overflow_hidden()
+                    .when(!dir.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(dir)),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.text)
+                            .child(SharedString::from(name)),
+                    ),
+            )
+            .children(file.stats.map(|(a, d)| edited_stats_label(a, d, theme)))
+    });
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .rounded(px(12.0))
+        .border_1()
+        .border_color(crate::theme::hairline(0.08))
+        .bg(crate::theme::ink(0.03))
+        .text_size(crate::typography::ui_rems(13.0))
+        .child(header)
+        .children(lines)
+        .into_any_element()
+}
+
 fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement {
     let value: SharedString = if resolved {
         header
@@ -7977,6 +8872,18 @@ fn chip_header_row(
         ToolItemKind::Thought => ("Thought process", String::new()),
         ToolItemKind::Note => ("Wrote", note_chip_detail(tool)),
         ToolItemKind::Call => tool_chip_content(&tool.call),
+    };
+    // Fetch rows read as site identity (Perplexity-style): the domain IS the
+    // row — the full URL stays one click away in the expanded invocation.
+    let fetch_domain: Option<String> = match &tool.call {
+        ToolCall::WebFetch { url, .. } => clyra_proto::view::web_domain(url),
+        _ => None,
+    };
+    let label: &str = fetch_domain.as_deref().unwrap_or(label);
+    let detail = if fetch_domain.is_some() {
+        String::new()
+    } else {
+        detail
     };
     let activity = !is_agent_tool(tool);
     let file_path = match &tool.call {
@@ -8330,6 +9237,7 @@ fn activity_rail(
     continuation_reveal: f32,
     row_height: f32,
     theme: &Theme,
+    cx: &gpui::App,
 ) -> gpui::Div {
     let color = theme.hairline(0.12);
     let tint = if tool.is_error {
@@ -8384,19 +9292,80 @@ fn activity_rail(
             .absolute()
             .inset_0(),
         )
-        .child(
-            crate::icons::icon(match tool.kind {
-                ToolItemKind::Thought => crate::icons::CHAT_ROUND_LINE,
-                ToolItemKind::Note => crate::icons::PEN,
-                ToolItemKind::Call => tool_icon_path(&tool.call),
-            })
-            .absolute()
-            .left(px(ACTIVITY_ICON_LEFT))
-            .top(px(row_height / 2.0 - ACTIVITY_ICON_SIZE / 2.0))
+        .child(web_rail_icon(
+            tool,
+            row_height,
+            branch_reveal,
+            tint,
+            theme,
+            cx,
+        ))
+}
+
+/// Rail-branch icon: fetches show the fetched site's favicon (letter avatar
+/// until the download lands) instead of the generic globe (user request —
+/// Perplexity-style site identity); everything else keeps its kind glyph.
+/// Falls back to the globe when the URL has no usable domain.
+fn web_rail_icon(
+    tool: &ToolItem,
+    row_height: f32,
+    branch_reveal: f32,
+    tint: gpui::Hsla,
+    theme: &Theme,
+    cx: &gpui::App,
+) -> AnyElement {
+    let domain = match &tool.call {
+        ToolCall::WebFetch { url, .. } => clyra_proto::view::web_domain(url),
+        _ => None,
+    };
+    let Some(domain) = domain else {
+        return crate::icons::icon(match tool.kind {
+            ToolItemKind::Thought => crate::icons::CHAT_ROUND_LINE,
+            ToolItemKind::Note => crate::icons::PEN,
+            ToolItemKind::Call => tool_icon_path(&tool.call),
+        })
+        .absolute()
+        .left(px(ACTIVITY_ICON_LEFT))
+        .top(px(row_height / 2.0 - ACTIVITY_ICON_SIZE / 2.0))
+        .size(px(ACTIVITY_ICON_SIZE))
+        .opacity(branch_reveal)
+        .text_color(tint)
+        .into_any_element();
+    };
+    let icon = match crate::favicons::FaviconCache::get(cx, &domain) {
+        Some(image) => gpui::img(image)
             .size(px(ACTIVITY_ICON_SIZE))
-            .opacity(branch_reveal)
-            .text_color(tint),
-        )
+            .rounded(px(4.0))
+            .into_any_element(),
+        None => {
+            let (avatar_bg, avatar_fg) = web_avatar_colors(theme, &domain);
+            div()
+                .size(px(ACTIVITY_ICON_SIZE))
+                .flex_none()
+                .rounded_full()
+                .bg(avatar_bg)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(9.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(avatar_fg)
+                .child(SharedString::from(web_avatar_letter(&domain)))
+                .into_any_element()
+        }
+    };
+    div()
+        .absolute()
+        .left(px(ACTIVITY_ICON_LEFT))
+        .top(px(row_height / 2.0 - ACTIVITY_ICON_SIZE / 2.0))
+        .size(px(ACTIVITY_ICON_SIZE))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .opacity(branch_reveal)
+        .child(icon)
+        .into_any_element()
 }
 
 /// A clockwise ribbon contour. Nonzero fill unions intersecting contours,
@@ -8454,6 +9423,7 @@ fn tool_chip(
                 continuation_reveal,
                 row_height,
                 theme,
+                cx,
             ))
         })
         .child(
@@ -8646,7 +9616,11 @@ impl Render for Transcript {
                 self.own_turn_kick = true;
             }
         }
-        let content_width = crate::settings::transcript_width(cx);
+        let content_width = if self.dot_mode {
+            864.0
+        } else {
+            crate::settings::transcript_width(cx)
+        };
         if self.content_width != content_width {
             self.content_width = content_width;
             // The outer list viewport may not resize when only max-width
@@ -8877,7 +9851,7 @@ mod tests {
             });
         });
     }
-    use zeron_doc::MessagePart;
+    use clyra_doc::MessagePart;
 
     fn with_tool_group_navigation(
         cx: &mut gpui::TestAppContext,
@@ -9005,14 +9979,14 @@ mod tests {
     fn tool_group_revisit_skips_batched_history_but_animates_live_arrivals(
         cx: &mut gpui::TestAppContext,
     ) {
-        use zeron_doc::transcript_delta::{TranscriptFrame, diff_transcript};
+        use clyra_doc::transcript_delta::{TranscriptFrame, diff_transcript};
 
         with_tool_group_navigation(cx, |state, transcript, cx| {
             let apply_frame = |frame, replay_baseline, cx: &mut gpui::App| {
                 state.update(cx, |state, cx| {
                     state
                         .receive_transcript_update(
-                            zeron_doc::TranscriptUpdate {
+                            clyra_doc::TranscriptUpdate {
                                 frame,
                                 replay_baseline,
                                 context_usage: None,
@@ -9030,7 +10004,7 @@ mod tests {
             )];
             apply_frame(
                 TranscriptFrame::reset(&cached),
-                Some(zeron_doc::TranscriptBaseline::capture(&cached)),
+                Some(clyra_doc::TranscriptBaseline::capture(&cached)),
                 cx,
             );
             state.update(cx, |state, cx| state.select_chat(Some("chat-b".into()), cx));
@@ -9059,7 +10033,7 @@ mod tests {
             );
             apply_frame(
                 TranscriptFrame::reset(&cached),
-                Some(zeron_doc::TranscriptBaseline::capture(&cached)),
+                Some(clyra_doc::TranscriptBaseline::capture(&cached)),
                 cx,
             );
             let row_id: SharedString = "tools#g0".into();
@@ -9080,7 +10054,7 @@ mod tests {
                 assert!(matches!(&frame, TranscriptFrame::Delta { .. }));
                 apply_frame(
                     frame,
-                    Some(zeron_doc::TranscriptBaseline::capture(next)),
+                    Some(clyra_doc::TranscriptBaseline::capture(next)),
                     cx,
                 );
                 let reveal = &transcript.read(cx).tool_group_reveals[&row_id];
@@ -9125,10 +10099,10 @@ mod tests {
             assistant("b", MessageStatus::Complete, vec![tool_part("t", "pwd")]),
         ];
         let first = worker
-            .prepare(&zeron_doc::TranscriptUpdate {
-                frame: zeron_doc::TranscriptFrame::reset(&original),
+            .prepare(&clyra_doc::TranscriptUpdate {
+                frame: clyra_doc::TranscriptFrame::reset(&original),
                 context_usage: None,
-                replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&original)),
+                replay_baseline: Some(clyra_doc::TranscriptBaseline::capture(&original)),
             })
             .unwrap();
         let mut changed = original.clone();
@@ -9137,8 +10111,8 @@ mod tests {
             text: "omega".into(),
         }];
         let next = worker
-            .prepare(&zeron_doc::TranscriptUpdate {
-                frame: zeron_doc::diff_transcript(&original, &changed),
+            .prepare(&clyra_doc::TranscriptUpdate {
+                frame: clyra_doc::diff_transcript(&original, &changed),
                 context_usage: None,
                 replay_baseline: None,
             })
@@ -9152,17 +10126,17 @@ mod tests {
     fn prepared_whale_open_and_revisit_do_not_build_rows_on_ui(cx: &mut gpui::TestAppContext) {
         let (update, prepared, preparation_ms) = std::thread::spawn(|| {
             let entries = if let Ok(path) = std::env::var("ZERON_WHALE_SNAPSHOT") {
-                let doc = zeron_doc::SessionDoc::init("fixture").unwrap();
+                let doc = clyra_doc::SessionDoc::init("fixture").unwrap();
                 doc.doc().import(&std::fs::read(path).unwrap()).unwrap();
-                zeron_doc::join_continuation_entries(doc.read_entries().unwrap())
+                clyra_doc::join_continuation_entries(doc.read_entries().unwrap())
             } else {
                 vec![assistant("whale-turn", MessageStatus::Complete, (0..5000).map(|i| {
                     MessagePart::Text { id: format!("part-{i}"), text: format!("## Result {i}\n\n**Markdown** with `code` and [links](https://example.com).\n") }
                 }).collect())]
             };
-            let update = zeron_doc::TranscriptUpdate {
-                replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&entries)),
-                frame: zeron_doc::TranscriptFrame::Reset { reset: entries },
+            let update = clyra_doc::TranscriptUpdate {
+                replay_baseline: Some(clyra_doc::TranscriptBaseline::capture(&entries)),
+                frame: clyra_doc::TranscriptFrame::Reset { reset: entries },
                 context_usage: None,
             };
             let start = Instant::now();
@@ -9244,9 +10218,9 @@ mod tests {
                 state.update(cx, |state, cx| {
                     state
                         .receive_opening_transcript_update(
-                            zeron_doc::TranscriptUpdate {
-                                frame: zeron_doc::TranscriptFrame::reset(entries),
-                                replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(
+                            clyra_doc::TranscriptUpdate {
+                                frame: clyra_doc::TranscriptFrame::reset(entries),
+                                replay_baseline: Some(clyra_doc::TranscriptBaseline::capture(
                                     entries,
                                 )),
                                 context_usage: None,
@@ -9300,8 +10274,8 @@ mod tests {
             state.update(cx, |state, cx| {
                 state
                     .receive_transcript_update(
-                        zeron_doc::TranscriptUpdate {
-                            frame: zeron_doc::diff_transcript(&full, &live),
+                        clyra_doc::TranscriptUpdate {
+                            frame: clyra_doc::diff_transcript(&full, &live),
                             replay_baseline: None,
                             context_usage: None,
                         },
@@ -9337,13 +10311,13 @@ mod tests {
                 vec![tool_part("new", "git status")],
             ));
             state.update(cx, |state, cx| {
-                let frame = zeron_doc::diff_transcript(&state.transcript, &history);
+                let frame = clyra_doc::diff_transcript(&state.transcript, &history);
                 state
                     .receive_transcript_update(
-                        zeron_doc::TranscriptUpdate {
+                        clyra_doc::TranscriptUpdate {
                             frame,
                             context_usage: None,
-                            replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&history)),
+                            replay_baseline: Some(clyra_doc::TranscriptBaseline::capture(&history)),
                         },
                         cx,
                     )
@@ -9351,8 +10325,8 @@ mod tests {
                 // Both updates land before the transcript observes/render them.
                 state
                     .receive_transcript_update(
-                        zeron_doc::TranscriptUpdate {
-                            frame: zeron_doc::diff_transcript(&history, &live),
+                        clyra_doc::TranscriptUpdate {
+                            frame: clyra_doc::diff_transcript(&history, &live),
                             context_usage: None,
                             replay_baseline: None,
                         },
@@ -9383,10 +10357,10 @@ mod tests {
         with_tool_group_navigation(cx, |state, transcript, cx| {
             let apply = |entries: &[SessionMessageEntry], baseline, cx: &mut gpui::App| {
                 state.update(cx, |state, cx| {
-                    let frame = zeron_doc::diff_transcript(&state.transcript, entries);
+                    let frame = clyra_doc::diff_transcript(&state.transcript, entries);
                     state
                         .receive_transcript_update(
-                            zeron_doc::TranscriptUpdate {
+                            clyra_doc::TranscriptUpdate {
                                 frame,
                                 replay_baseline: baseline,
                                 context_usage: None,
@@ -9415,7 +10389,7 @@ mod tests {
             historical[0].parts.retain(|p| p.id().starts_with("old"));
             apply(
                 &entries,
-                Some(zeron_doc::TranscriptBaseline::capture(&historical)),
+                Some(clyra_doc::TranscriptBaseline::capture(&historical)),
                 cx,
             );
             let reveal = &transcript.read(cx).tool_group_reveals[&row];
@@ -9427,7 +10401,7 @@ mod tests {
             entries[0].parts.push(tool_part("live-c", "pwd"));
             apply(
                 &entries,
-                Some(zeron_doc::TranscriptBaseline::capture(&historical)),
+                Some(clyra_doc::TranscriptBaseline::capture(&historical)),
                 cx,
             );
             let reveal = &transcript.read(cx).tool_group_reveals[&row];
@@ -9443,8 +10417,8 @@ mod tests {
                 state.select_chat(Some("new-chat".into()), cx);
                 state
                     .receive_transcript_update(
-                        zeron_doc::TranscriptUpdate {
-                            frame: zeron_doc::TranscriptFrame::reset(&[]),
+                        clyra_doc::TranscriptUpdate {
+                            frame: clyra_doc::TranscriptFrame::reset(&[]),
                             context_usage: None,
                             replay_baseline: Some(Default::default()),
                         },
@@ -9461,8 +10435,8 @@ mod tests {
             state.update(cx, |state, cx| {
                 state
                     .receive_transcript_update(
-                        zeron_doc::TranscriptUpdate {
-                            frame: zeron_doc::diff_transcript(&[], &live),
+                        clyra_doc::TranscriptUpdate {
+                            frame: clyra_doc::diff_transcript(&[], &live),
                             context_usage: None,
                             replay_baseline: None,
                         },
@@ -9491,11 +10465,11 @@ mod tests {
                 ));
             }
             state.update(cx, |state, cx| {
-                let frame = zeron_doc::diff_transcript(&state.transcript, &live);
-                assert!(matches!(&frame, zeron_doc::TranscriptFrame::Reset { .. }));
+                let frame = clyra_doc::diff_transcript(&state.transcript, &live);
+                assert!(matches!(&frame, clyra_doc::TranscriptFrame::Reset { .. }));
                 state
                     .receive_transcript_update(
-                        zeron_doc::TranscriptUpdate {
+                        clyra_doc::TranscriptUpdate {
                             frame,
                             context_usage: None,
                             replay_baseline: None,
@@ -9651,7 +10625,7 @@ mod tests {
             (Theme::dark(), crate::theme::grey(48)),
             (Theme::light(), crate::theme::grey(230)),
         ] {
-            theme.surface_treatment = zeron_theme::SurfaceTreatment::Opaque;
+            theme.surface_treatment = clyra_theme::SurfaceTreatment::Opaque;
             let badge = crate::theme::flatten(theme.ink(0.06), base);
             let icon_well = crate::theme::flatten(crate::file_icons::well_bg(&theme), badge);
             let contrast = crate::theme::contrast_ratio(icon_well, badge);
@@ -9672,9 +10646,9 @@ mod tests {
     #[test]
     fn file_badge_icon_well_uses_more_coverage_on_frost() {
         for mut theme in [Theme::dark(), Theme::light()] {
-            theme.surface_treatment = zeron_theme::SurfaceTreatment::Opaque;
+            theme.surface_treatment = clyra_theme::SurfaceTreatment::Opaque;
             let opaque_alpha = crate::file_icons::well_bg(&theme).a;
-            theme.surface_treatment = zeron_theme::SurfaceTreatment::Frosted;
+            theme.surface_treatment = clyra_theme::SurfaceTreatment::Frosted;
             let frosted = crate::file_icons::well_bg(&theme);
             let badge = crate::theme::flatten(theme.ink(0.06), theme.bg);
             let icon_well = crate::theme::flatten(frosted, badge);
@@ -11620,10 +12594,10 @@ mod tests {
                         state.select_chat(Some("chat".into()), cx);
                         state
                             .receive_transcript_update(
-                                zeron_doc::TranscriptUpdate {
-                                    frame: zeron_doc::TranscriptFrame::reset(&history),
+                                clyra_doc::TranscriptUpdate {
+                                    frame: clyra_doc::TranscriptFrame::reset(&history),
                                     context_usage: None,
-                                    replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(
+                                    replay_baseline: Some(clyra_doc::TranscriptBaseline::capture(
                                         &history,
                                     )),
                                 },
@@ -11648,12 +12622,12 @@ mod tests {
                     this.state.update(cx, |state, cx| {
                         state
                             .receive_transcript_update(
-                                zeron_doc::TranscriptUpdate {
-                                    frame: zeron_doc::diff_transcript(&history, &next),
+                                clyra_doc::TranscriptUpdate {
+                                    frame: clyra_doc::diff_transcript(&history, &next),
                                     context_usage: None,
                                     // The RPC must retain its opening cutoff when
                                     // publishing subsequent changed-part history.
-                                    replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(
+                                    replay_baseline: Some(clyra_doc::TranscriptBaseline::capture(
                                         &cutoff,
                                     )),
                                 },
@@ -11703,10 +12677,10 @@ mod tests {
                         state.select_chat(Some("chat".into()), cx);
                         state
                             .receive_transcript_update(
-                                zeron_doc::TranscriptUpdate {
-                                    frame: zeron_doc::TranscriptFrame::reset(&history),
+                                clyra_doc::TranscriptUpdate {
+                                    frame: clyra_doc::TranscriptFrame::reset(&history),
                                     context_usage: None,
-                                    replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(
+                                    replay_baseline: Some(clyra_doc::TranscriptBaseline::capture(
                                         &history,
                                     )),
                                 },
@@ -11715,8 +12689,8 @@ mod tests {
                             .unwrap();
                         state
                             .receive_transcript_update(
-                                zeron_doc::TranscriptUpdate {
-                                    frame: zeron_doc::diff_transcript(&history, &live),
+                                clyra_doc::TranscriptUpdate {
+                                    frame: clyra_doc::diff_transcript(&history, &live),
                                     context_usage: None,
                                     replay_baseline: None,
                                 },
@@ -11765,10 +12739,10 @@ mod tests {
                     this.state.update(cx, |state, cx| {
                         state
                             .receive_transcript_update(
-                                zeron_doc::TranscriptUpdate {
-                                    frame: zeron_doc::diff_transcript(&live, &next),
+                                clyra_doc::TranscriptUpdate {
+                                    frame: clyra_doc::diff_transcript(&live, &next),
                                     context_usage: None,
-                                    replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(
+                                    replay_baseline: Some(clyra_doc::TranscriptBaseline::capture(
                                         &next_history,
                                     )),
                                 },
@@ -11802,14 +12776,14 @@ mod tests {
                         this.spring_kick = true;
                         updated.push(prompt(&format!("history-{}", updated.len())));
                         this.state.update(cx, |state, cx| {
-                            let frame = zeron_doc::diff_transcript(&state.transcript, &updated);
+                            let frame = clyra_doc::diff_transcript(&state.transcript, &updated);
                             state
                                 .receive_transcript_update(
-                                    zeron_doc::TranscriptUpdate {
+                                    clyra_doc::TranscriptUpdate {
                                         frame,
                                         context_usage: None,
                                         replay_baseline: Some(
-                                            zeron_doc::TranscriptBaseline::capture(&updated),
+                                            clyra_doc::TranscriptBaseline::capture(&updated),
                                         ),
                                     },
                                     cx,
@@ -12046,11 +13020,11 @@ mod tests {
                     feed(this, vec![prompt("prompt")], cx);
                     this.rail_enabled = false;
                     this.state.update(cx, |state, _| {
-                        state.sessions.push(zeron_proto::Session {
+                        state.sessions.push(clyra_proto::Session {
                             last_completed_turn: None,
                             chat_id: "chat".into(),
                             device_id: "test".into(),
-                            status: zeron_proto::SessionStatus::Working,
+                            status: clyra_proto::SessionStatus::Working,
                             started_at: Some(chrono::Utc::now()),
                             updated_at: chrono::Utc::now(),
                         })
@@ -13274,7 +14248,7 @@ mod tests {
         let old = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>();
         let mut new = old.clone();
         new[9] = "LINE 10".into();
-        let diff = zeron_proto::ToolDiff {
+        let diff = clyra_proto::ToolDiff {
             path: "/w/a.rs".into(),
             old_text: Some(old.join("\n") + "\n"),
             new_text: new.join("\n") + "\n",
@@ -13311,7 +14285,7 @@ mod tests {
         assert_eq!(old_text.as_deref(), diff.old_text.as_deref());
         assert_eq!(new_text.as_deref(), Some(diff.new_text.as_str()));
         // New files carry Added status (and no old numbers).
-        let created = zeron_proto::ToolDiff {
+        let created = clyra_proto::ToolDiff {
             path: "/w/new.txt".into(),
             old_text: None,
             new_text: "only\n".into(),
@@ -13535,11 +14509,11 @@ mod tests {
         );
         let todo = ToolCall::Todo {
             items: vec![
-                zeron_proto::TodoItem {
+                clyra_proto::TodoItem {
                     text: "a".into(),
                     done: true,
                 },
-                zeron_proto::TodoItem {
+                clyra_proto::TodoItem {
                     text: "b".into(),
                     done: false,
                 },
@@ -13622,11 +14596,11 @@ mod tests {
         // Todos list one item per line with checkbox state.
         let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::Todo {
             items: vec![
-                zeron_proto::TodoItem {
+                clyra_proto::TodoItem {
                     text: "a".into(),
                     done: true,
                 },
-                zeron_proto::TodoItem {
+                clyra_proto::TodoItem {
                     text: "b".into(),
                     done: false,
                 },
@@ -13816,20 +14790,187 @@ mod tests {
     }
 
     #[test]
-    fn tool_title_shimmer_crosses_the_title_without_a_loop_seam() {
-        assert_eq!(tool_title_shimmer_amount(0.5, 0.5), 1.0);
-        assert_eq!(tool_title_shimmer_amount(0.0, 0.5), 0.0);
-        assert_eq!(tool_title_shimmer_amount(1.0, 0.5), 0.0);
-        assert!(tool_title_shimmer_amount(0.3, 0.5) > 0.4);
-        assert!(tool_title_shimmer_amount(0.7, 0.5) > 0.4);
+    fn tool_title_shimmer_matches_the_component_geometry() {
+        // `linear-gradient(110deg, base 40%, shine 50%, base 60%)` at
+        // `background-size: 250% 100%`: the lit window is a fifth of a
+        // 2.5-title gradient, so half a title wide, centred on the shine stop.
+        // The peak lands mid-title at the phase the sweep produces.
+        let centred = tool_title_shimmer_phase_at(0.5);
+        assert_eq!(tool_title_shimmer_amount(0.5, centred), 1.0);
+        // The ramp is linear between the gradient's stops: half way out from
+        // the stop is half intensity, and the band ends a quarter-title away.
+        let quarter = TOOL_GROUP_SHIMMER_BAND * 0.5;
+        assert!((tool_title_shimmer_amount(0.5 + quarter, centred) - 0.5).abs() < 1e-6);
+        assert!((tool_title_shimmer_amount(0.5 + quarter * 2.0, centred) - 0.0).abs() < 1e-6);
+        assert_eq!(tool_title_shimmer_amount(0.0, centred), 0.0);
+        assert_eq!(tool_title_shimmer_amount(1.0, centred), 0.0);
+        // The stop starts a full title before the text and ends 3.5 titles in,
+        // so the first and last frames of the sweep are both off-glyph: the band
+        // has to be fully gone by the time the stop is a quarter-title past the
+        // right edge.
+        assert_eq!(tool_title_shimmer_center(0.0), -1.0);
+        assert_eq!(
+            tool_title_shimmer_center(1.0),
+            -1.0 + TOOL_GROUP_SHIMMER_TRAVEL
+        );
+        let leaving = tool_title_shimmer_phase_at(1.0 + TOOL_GROUP_SHIMMER_BAND);
+        for x in [0.0, 0.5, 1.0] {
+            assert_eq!(
+                tool_title_shimmer_amount(x, leaving),
+                0.0,
+                "x={x} still lit once the band has left"
+            );
+        }
         for x in [0.0, 0.25, 0.5, 0.75, 1.0] {
             assert_eq!(
                 tool_title_shimmer_amount(x, 0.0),
                 tool_title_shimmer_amount(x, 1.0),
-                "the repeating background must meet itself at x={x}"
+                "the sweep must meet itself at x={x}"
             );
         }
+    }
 
+    #[test]
+    fn tool_title_shimmer_is_monotonic_around_the_travelling_stop() {
+        // A linear ramp has a crease where it meets the flat base at each band
+        // edge. That is the component's look, but the ramp must still be
+        // single-peaked: rising into the stop, falling out of it, never
+        // reversing - and the stop may be off the text for most of the cycle.
+        for phase in [0.0, 0.1, 0.25, 0.4, 0.55, 0.7, 0.9, 1.0] {
+            let center = tool_title_shimmer_center(phase);
+            let steps = 120;
+            let from = -1.2;
+            let to = 1.2 + TOOL_GROUP_SHIMMER_BAND;
+            let mut previous = tool_title_shimmer_amount(from, phase);
+            for ix in 1..=steps {
+                let x = from + (to - from) * (ix as f32 / steps as f32);
+                let current = tool_title_shimmer_amount(x, phase);
+                if x <= center {
+                    assert!(
+                        current >= previous - f32::EPSILON,
+                        "rising ramp reversed at x={x} phase={phase}"
+                    );
+                } else {
+                    assert!(
+                        current <= previous + f32::EPSILON,
+                        "falling ramp reversed at x={x} phase={phase}"
+                    );
+                }
+                previous = current;
+            }
+        }
+    }
+    #[test]
+    fn tool_title_shimmer_slants_the_band_across_the_line() {
+        // 110deg: the band's centre moves left as y grows, by tan(20deg) per
+        // pixel of height. A horizontal band would be a different component.
+        let height = 18.0;
+        let width = 500.0;
+        let top = tool_title_shimmer_slant_at(0.0, height, width);
+        let middle = tool_title_shimmer_slant_at(height * 0.5, height, width);
+        let bottom = tool_title_shimmer_slant_at(height, height, width);
+        assert_eq!(middle, 0.0);
+        assert!(
+            top < 0.0,
+            "the top of the line belongs to a band further right"
+        );
+        assert!(
+            bottom > 0.0,
+            "the bottom of the line belongs to a band further left"
+        );
+        // Symmetric about the middle, and the whole shift is one line's worth of
+        // tan(20deg) - a couple of pixels, which is the point: the band is
+        // tilted, not turned into a vertical bar.
+        assert!((top + bottom).abs() < 1e-6);
+        let span_in_pixels = (top - bottom).abs() * width;
+        assert!((span_in_pixels - TOOL_GROUP_SHIMMER_SLANT * height).abs() < 1e-3);
+        // The shift stays a fraction of the band, so a slice boundary can never
+        // throw a cell across the whole band.
+        assert!((top - bottom).abs() < TOOL_GROUP_SHIMMER_BAND);
+    }
+
+    #[test]
+    fn tool_title_shimmer_parks_between_passes() {
+        // The hold is the reference's `repeatDelay`, and it is what makes the
+        // sweep read as light rather than as a tint: the profile must stand
+        // completely still through it and be dark the whole time.
+        let held_from = 1.0 - TOOL_GROUP_SHIMMER_HOLD;
+        for ix in 0..=10 {
+            let phase = held_from + TOOL_GROUP_SHIMMER_HOLD * (ix as f32 / 10.0);
+            for step in 0..=20 {
+                let x = step as f32 / 20.0;
+                assert_eq!(
+                    tool_title_shimmer_amount(x, phase),
+                    0.0,
+                    "x={x} still lit during the hold at phase={phase}"
+                );
+            }
+        }
+        // The rest of the cycle is motion, and motion is linear in position -
+        // an eased sweep would read as a different component.
+        assert_eq!(tool_title_shimmer_sweep(held_from), 1.0);
+        assert_eq!(tool_title_shimmer_sweep(1.0), 1.0);
+        let midpoint = tool_title_shimmer_sweep(0.5 * (1.0 - TOOL_GROUP_SHIMMER_HOLD));
+        assert!(
+            (midpoint - 0.5).abs() < 1e-6,
+            "the sweep must be linear in time"
+        );
+    }
+
+    #[test]
+    fn tool_title_shimmer_strip_averages_rather_than_samples() {
+        // A cell is painted one flat colour. Its value must be the profile
+        // integrated across the cell, so one straddling the band's edge lands
+        // between its endpoints instead of snapping to either one.
+        let centred = tool_title_shimmer_phase_at(0.5);
+        let edge = 0.5 + TOOL_GROUP_SHIMMER_BAND * 0.5;
+        let straddling = tool_title_shimmer_strip(edge, edge + 0.05, centred);
+        let at_left_edge = tool_title_shimmer_amount(edge, centred);
+        let at_right_edge = tool_title_shimmer_amount(edge + 0.05, centred);
+        assert!(
+            straddling > at_left_edge.min(at_right_edge)
+                && straddling < at_left_edge.max(at_right_edge),
+            "cell {straddling} should sit between {at_left_edge} and {at_right_edge}"
+        );
+        // The component's band is a ramp, not a plateau, so a cell sitting on the
+        // stop averages less than full intensity - it still spans distances on
+        // both sides. What must hold is that it beats a cell half a band away
+        // and that the profile is symmetric about the stop.
+        let on_the_stop = tool_title_shimmer_strip(0.45, 0.55, centred);
+        let half_a_band = tool_title_shimmer_strip(0.70, 0.80, centred);
+        assert!(
+            on_the_stop > half_a_band,
+            "the stop must be the brightest cell"
+        );
+        assert!(on_the_stop < 1.0, "a ramp has no plateau to average up to");
+        assert!(
+            (tool_title_shimmer_strip(0.35, 0.45, centred)
+                - tool_title_shimmer_strip(0.55, 0.65, centred))
+            .abs()
+                < 1e-6,
+            "cells equidistant from the stop must match"
+        );
+    }
+
+    #[test]
+    fn tool_title_shimmer_levels_cover_the_whole_range() {
+        assert_eq!(tool_title_shimmer_level(0.0), 0);
+        assert_eq!(tool_title_shimmer_level(1.0), TOOL_GROUP_SHIMMER_LEVELS - 1);
+        // Quantisation must not clip: an out-of-range amount still lands inside.
+        assert_eq!(tool_title_shimmer_level(-1.0), 0);
+        assert_eq!(tool_title_shimmer_level(2.0), TOOL_GROUP_SHIMMER_LEVELS - 1);
+        // Neighbouring amounts land in the same or an adjacent bucket, so
+        // neighbouring cells never jump more than one colour step.
+        assert!(
+            tool_title_shimmer_level(0.5).abs_diff(tool_title_shimmer_level(0.60)) <= 3,
+            "quantisation is too coarse to read as a gradient"
+        );
+        assert!(tool_title_shimmer_level(0.5) > tool_title_shimmer_level(0.0));
+        assert!(tool_title_shimmer_level(1.0) > tool_title_shimmer_level(0.5));
+    }
+
+    #[test]
+    fn tool_title_shimmer_phase_cycles_over_the_components_timing() {
         let start = Instant::now();
         assert_eq!(tool_title_shimmer_phase(start, start), 0.0);
         let halfway = start + TOOL_GROUP_SHIMMER_DURATION / 2;

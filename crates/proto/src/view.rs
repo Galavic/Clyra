@@ -139,7 +139,7 @@ pub fn sort_chats(chats: &mut [Chat]) {
 // Boot gate
 // ---------------------------------------------------------------------------
 
-/// The app gate (zeron's App.tsx phases). Pure.
+/// The app gate (clyra's App.tsx phases). Pure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatePhase {
     /// Booting / probing — splash covers this.
@@ -320,7 +320,7 @@ pub fn group_chats<'a>(chats: impl IntoIterator<Item = &'a Chat>) -> Vec<ChatGro
 }
 
 /// Compact relative time ("now", "5m", "3h", "2d", "1w", …) — no "ago" suffix;
-/// port of zeron's `formatTimeAgo`.
+/// port of clyra's `formatTimeAgo`.
 pub fn format_time_ago(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let s = now.signed_duration_since(then).num_seconds().max(0);
     // Under a minute reads as "now" — otherwise 45–59s floors to a bare "0m".
@@ -350,7 +350,7 @@ pub fn format_time_ago(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
     format!("{}y", d / 365)
 }
 
-/// Session-row sub-line, "project · branch" (zeron `chatLocation`): the repo
+/// Session-row sub-line, "project · branch" (clyra `chatLocation`): the repo
 /// checkout identity. Either part may be missing; empty when both are.
 pub fn chat_location(chat: &Chat) -> Option<String> {
     let project = chat
@@ -395,7 +395,7 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     }
 }
 
-/// Per-kind chip label + one-line detail. Labels match zeron's `describeTool`
+/// Per-kind chip label + one-line detail. Labels match clyra's `describeTool`
 /// (tool-chip.tsx) exactly, so the two viewports name a tool identically.
 pub fn tool_chip_content(call: &crate::ToolCall) -> (&'static str, String) {
     let (label, detail) = tool_chip_content_raw(call);
@@ -508,7 +508,7 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
         segments.push(format!("{failed} failed"));
     }
     let mut summary = segments.join(" · ");
-    // Capitalize the first segment only (zeron's style).
+    // Capitalize the first segment only (clyra's style).
     if let Some(first) = summary.get(0..1) {
         let upper = first.to_uppercase();
         summary.replace_range(0..1, &upper);
@@ -520,7 +520,7 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
 ///
 /// Colors live here rather than in the viewport because the *meaning* of a
 /// dot is part of the protocol, not the presentation — a given status must
-/// read the same on every surface. `zeron-ui` has the oklch→sRGB math.
+/// read the same on every surface. `clyra-ui` has the oklch→sRGB math.
 pub mod dot {
     /// Running. Pink, not amber: the harsh yellow read as a warning, and running
     /// is routine (user request).
@@ -561,7 +561,7 @@ pub enum CheckoutPlan {
     CurrentCheckout { branch: Option<String> },
     /// Reuse the picked ref's existing worktree (a cwd override; no git).
     ReuseWorktree { path: String, branch: String },
-    /// `CreateWorktree` off `base` on send (the engine mints a `zeron/<name>`
+    /// `CreateWorktree` off `base` on send (the engine mints a `clyra/<name>`
     /// branch). `base: None` = refs never loaded — send falls back to the space
     /// folder rather than failing.
     NewWorktree { base: Option<String> },
@@ -593,6 +593,303 @@ pub fn checkout_label(kind: CheckoutKind, picked: Option<&crate::RepoRef>) -> &'
                 "Current checkout"
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Web research results (Perplexity-style sources card)
+// ---------------------------------------------------------------------------
+
+/// One link harvested from a WebSearch/WebFetch output: the URL plus a human
+/// label. Tool outputs are free-form harness text (titles + URLs in ad-hoc
+/// layouts), so harvesting is heuristic by design — see [`parse_web_results`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebResult {
+    pub url: String,
+    pub domain: String,
+    pub title: String,
+}
+
+/// Parse cap: enough for a full card with room to spare; viewports show a
+/// slice with a "+N more" expander.
+pub const WEB_RESULTS_MAX: usize = 24;
+/// Scan cap: fetched pages can be long, and sources live up front.
+const WEB_SCAN_LINES: usize = 200;
+/// Result titles render on one truncated line.
+const WEB_TITLE_CHARS: usize = 80;
+
+/// Harvest (title, url) pairs from tool output lines: `[title](url)`
+/// markdown links first (images skipped), then bare `http(s)` URLs whose
+/// label is the rest of their line, the previous text line, or the domain.
+/// Relative URLs are skipped — page furniture, not sources. First wins on
+/// duplicates. Deterministic over the input: same lines, same results.
+pub fn parse_web_results(lines: &[String]) -> Vec<WebResult> {
+    let mut out: Vec<WebResult> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut prev_text = String::new();
+    for line in lines.iter().take(WEB_SCAN_LINES) {
+        if out.len() >= WEB_RESULTS_MAX {
+            break;
+        }
+        for (title, url) in find_markdown_links(line) {
+            push_web_result(&mut out, &mut seen, title, url);
+            if out.len() >= WEB_RESULTS_MAX {
+                break;
+            }
+        }
+        if out.len() >= WEB_RESULTS_MAX {
+            break;
+        }
+        // Bare URLs, minus the ones already harvested above (dedupe by URL
+        // covers the overlap).
+        let urls = find_bare_urls(line);
+        if !urls.is_empty() {
+            let mut rest = line.clone();
+            for url in &urls {
+                rest = rest.replacen(url.as_str(), " ", 1);
+            }
+            let inline_title = clean_title(&rest);
+            for url in urls {
+                let title = if inline_title.is_empty() {
+                    if prev_text.is_empty() {
+                        String::new()
+                    } else {
+                        prev_text.clone()
+                    }
+                } else {
+                    inline_title.clone()
+                };
+                push_web_result(&mut out, &mut seen, title, url);
+                if out.len() >= WEB_RESULTS_MAX {
+                    break;
+                }
+            }
+        }
+        let cleaned = clean_title(line);
+        // URL lines never donate titles: their own inline text was already
+        // used above, and leftovers ("See … :") misattribute the next link.
+        if line.contains("http") {
+            prev_text.clear();
+        } else if !cleaned.is_empty() {
+            prev_text = cleaned.chars().take(120).collect();
+        }
+    }
+    out
+}
+
+fn push_web_result(
+    out: &mut Vec<WebResult>,
+    seen: &mut std::collections::HashSet<String>,
+    title: String,
+    url: String,
+) {
+    let Some(domain) = web_domain(&url) else {
+        return;
+    };
+    if !seen.insert(url.clone()) {
+        return;
+    }
+    let title = if title.is_empty() {
+        domain.clone()
+    } else {
+        title
+    };
+    out.push(WebResult { url, domain, title });
+}
+
+/// `[title](https://…)` spans in one line. Images (`![…]`) are skipped.
+fn find_markdown_links(line: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(close) = rest.find("](") {
+        let (before, after) = rest.split_at(close);
+        let after = &after[2..];
+        let end = after.find(')').unwrap_or(after.len());
+        let url = &after[..end];
+        if url.starts_with("http://") || url.starts_with("https://") {
+            if let Some(open) = before.rfind('[') {
+                if !(open > 0 && before.as_bytes()[open - 1] == b'!') {
+                    out.push((clean_title(&before[open + 1..]), url.to_string()));
+                }
+            }
+        }
+        rest = &after[end.min(after.len())..];
+        if end == after.len() {
+            break;
+        }
+        rest = &rest[1.min(rest.len())..];
+    }
+    out
+}
+
+/// Whitespace-separated `http(s)` tokens, with trailing punctuation
+/// (`).,;:!?'\"` and `]`) trimmed. One line can hold several.
+fn find_bare_urls(line: &str) -> Vec<String> {
+    line.split(|c: char| c.is_whitespace() || c == '<' || c == '>' || c == '"' || c == '\'')
+        .filter_map(|token| {
+            if !(token.starts_with("http://") || token.starts_with("https://")) {
+                return None;
+            }
+            let url = token
+                .trim_end_matches(|c: char| {
+                    matches!(c, ')' | ']' | '}' | '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"')
+                })
+                .to_string();
+            if url.len() > "https://".len() {
+                Some(url)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Display host for a URL: lowercased, no `www.`, no port. `None` when there
+/// is no usable host (relative links, bare schemes, whitespace).
+pub fn web_domain(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .split('@')
+        .next_back()
+        .unwrap_or("");
+    let host = host.split(':').next().unwrap_or("").to_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    if host.is_empty()
+        || !host.contains('.')
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return None;
+    }
+    Some(host.to_string())
+}
+
+/// Collapse whitespace, strip list markers, quotes, and emphasis, truncate to
+/// [`WEB_TITLE_CHARS`] chars (char-boundary safe).
+fn clean_title(text: &str) -> String {
+    let mut cleaned: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(stripped) = cleaned.strip_prefix(marker) {
+            cleaned = stripped.to_string();
+            break;
+        }
+    }
+    if let Some(dot) = cleaned.find(". ") {
+        let (head, _) = cleaned.split_at(dot);
+        if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) {
+            cleaned = cleaned[dot + 2..].to_string();
+        }
+    }
+    cleaned = cleaned
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | '*' | '_' | '~' | '`'))
+        .trim()
+        .trim_end_matches(" .")
+        .trim()
+        .to_string();
+    if cleaned.chars().count() > WEB_TITLE_CHARS {
+        cleaned = cleaned.chars().take(WEB_TITLE_CHARS - 1).collect::<String>() + "…";
+    }
+    cleaned
+}
+
+/// Deterministic avatar hue (0.0–1.0 turns) for a domain.
+pub fn web_avatar_hue(domain: &str) -> f32 {
+    let mut hash: u32 = 2166136261;
+    for byte in domain.bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    (hash % 360) as f32 / 360.0
+}
+
+#[cfg(test)]
+mod web_results_tests {
+    use super::*;
+
+    fn lines(text: &[&str]) -> Vec<String> {
+        text.iter().map(|line| line.to_string()).collect()
+    }
+
+    #[test]
+    fn markdown_links_beat_bare_urls_and_images_are_skipped() {
+        let results = parse_web_results(&lines(&[
+            "See [GTA 6 date](https://example.com/gta-6) and https://example.com/gta-6.",
+            "![cover](https://example.com/cover.png)",
+        ]));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "GTA 6 date");
+        assert_eq!(results[0].url, "https://example.com/gta-6");
+        assert_eq!(results[0].domain, "example.com");
+    }
+
+    #[test]
+    fn bare_url_takes_the_rest_of_its_line_as_title() {
+        let results = parse_web_results(&lines(&["- Rockstar announces GTA 6 https://example.com/news."]));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Rockstar announces GTA 6");
+        assert_eq!(results[0].url, "https://example.com/news");
+    }
+
+    #[test]
+    fn lone_url_falls_back_to_the_previous_text_line_then_domain() {
+        let results = parse_web_results(&lines(&[
+            "BBC coverage",
+            "https://www.bbc.com/news/gta",
+        ]));
+        assert_eq!(results[0].title, "BBC coverage");
+        assert_eq!(results[0].domain, "bbc.com");
+        let lonely = parse_web_results(&lines(&["https://example.com/only"]));
+        assert_eq!(lonely[0].title, "example.com");
+    }
+
+    #[test]
+    fn relative_and_non_http_urls_are_skipped() {
+        let results = parse_web_results(&lines(&[
+            "See /docs/guide and ftp://example.com/f and mailto:a@b.com",
+            "ok https://example.com/yes",
+        ]));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://example.com/yes");
+    }
+
+    #[test]
+    fn domains_normalize_and_dupes_collapse() {
+        assert_eq!(
+            web_domain("https://WWW.Example.COM:8080/a?b=1#frag"),
+            Some("example.com".to_string())
+        );
+        assert!(web_domain("/relative/path").is_none());
+        assert!(web_domain("https://").is_none());
+        let results = parse_web_results(&lines(&[
+            "https://example.com/a",
+            "[Same](https://example.com/a)",
+        ]));
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn titles_truncate_char_safe_and_hues_are_stable() {
+        let long = format!("Title {}", "é".repeat(100));
+        let results = parse_web_results(&lines(&[&format!("{long} https://example.com/x")]));
+        assert!(results[0].title.chars().count() <= 80);
+        let hue = web_avatar_hue("example.com");
+        assert_eq!(hue, web_avatar_hue("example.com"));
+        assert!((0.0..1.0).contains(&hue));
+        assert_ne!(hue, web_avatar_hue("other.org"));
+    }
+
+    #[test]
+    fn parse_cap_bounds_long_outputs() {
+        let many: Vec<String> = (0..100)
+            .map(|i| format!("Result {i} https://example.com/{i}"))
+            .collect();
+        assert_eq!(parse_web_results(&many).len(), WEB_RESULTS_MAX);
     }
 }
 

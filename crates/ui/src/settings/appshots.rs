@@ -305,7 +305,7 @@ impl ShortcutsPage {
                     })
                     .child(
                         widgets::page_column()
-                            .child(widgets::page_header(&theme, "Appshots", None))
+                            .child(widgets::page_header(&theme, crate::shell::SettingsSection::Appshots.icon(), "Appshots", None))
                             .child(
                                 widgets::page_subtitle(&theme, capabilities.setup_description())
                                     .line_height(px(20.0)),
@@ -332,7 +332,7 @@ impl ShortcutsPage {
                                             .text_size(px(12.0))
                                             .text_color(theme.text_muted)
                                             .child(
-                                                "Changed a permission? Check again after returning to Zeron.",
+                                                "Changed a permission? Check again after returning to Clyra.",
                                             ),
                                     )
                                     .child(refresh),

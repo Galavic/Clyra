@@ -1,4 +1,4 @@
-//! zeron-ui — the gpui viewport. Shell, sidebar, conversation, composer, terminal,
+//! clyra-ui — the gpui viewport. Shell, sidebar, conversation, composer, terminal,
 //! diff pane.
 //!
 //! Design: ARCHITECTURE.md §4; animation catalog docs/research/feature-inventory.md
@@ -6,16 +6,18 @@
 //!
 //! M3a foundation:
 //! - [`theme`] — always-dark monochrome theme (oklch-derived neutrals), a gpui Global;
-//! - [`motion`] — the zeron animation catalog over gpui `Animation` + cubic-bezier;
+//! - [`motion`] — the clyra animation catalog over gpui `Animation` + cubic-bezier;
 //! - [`state`] — `AppState` entity + `EngineHandle` (connect-or-embed engine);
 //! - [`settings`] — persisted pane widths/collapse flags;
 //! - [`shell`] — sidebar + main panel + right-pane scaffold + gate;
-//! - [`loaders`] — zeron pulse loader, gradient spinner, boot splash.
+//! - [`loaders`] — clyra pulse loader, gradient spinner, boot splash.
 
+mod account_usage;
 pub mod app_menus;
 pub mod appearance;
 pub mod appshots;
 pub mod attachments;
+pub mod automations;
 pub mod badges;
 pub mod browser;
 pub mod change_requests;
@@ -26,7 +28,9 @@ pub mod composer;
 mod composer_dock;
 mod composer_markdown;
 mod context_usage;
+mod dot_animation;
 pub mod edge_fade;
+pub mod favicons;
 pub mod file_icons;
 pub mod files;
 pub mod frost;
@@ -37,6 +41,7 @@ pub(crate) mod image_viewer;
 pub mod links;
 pub mod loaders;
 pub mod markdown;
+pub mod mascot;
 pub mod motion;
 mod new_thread_background_effects;
 mod new_thread_background_image;
@@ -54,6 +59,7 @@ pub mod sound;
 pub mod state;
 pub(crate) mod surface_chrome;
 pub mod syntax_cache;
+pub mod teams;
 pub mod terminal;
 pub mod theme;
 pub mod theme_library;
@@ -66,8 +72,8 @@ use std::path::PathBuf;
 use futures::{FutureExt as _, StreamExt as _};
 use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
+pub use clyra_proto::HarnessId;
 pub use state::EngineBootConfig;
-pub use zeron_proto::HarnessId;
 
 /// Whether a control whose primary action is click activation may also start
 /// a GPUI drag from the same hitbox. GPUI promotes pointer travel above 2 px
@@ -80,7 +86,7 @@ pub(crate) const fn click_activation_drag_enabled() -> bool {
 }
 
 /// Everything the headed binary passes in (config/env resolution lives in
-/// `apps/zeron`, not here).
+/// `apps/clyra`, not here).
 #[derive(Debug, Clone)]
 pub struct UiConfig {
     /// Data directory — engine stores + `ui-settings.json`.
@@ -193,7 +199,7 @@ pub fn run_app(config: UiConfig) {
         appshots::set_enabled(ui_settings.appshots_enabled);
         terminal::panel::init(cx);
         app_menus::init(cx);
-        cx.register_url_scheme("zeron").detach();
+        cx.register_url_scheme("clyra").detach();
 
         let state = cx.new(|_| state::AppState::new());
         let url_state = state.clone();
@@ -254,7 +260,7 @@ pub fn run_app(config: UiConfig) {
     });
 }
 
-/// A clicked banner: bring Zeron forward on that chat through the sidebar's
+/// A clicked banner: bring Clyra forward on that chat through the sidebar's
 /// own path (chat route + composer focus), reopening the main window first if
 /// ⌘W closed it.
 fn open_notified_chat(chat_id: String, state: &gpui::Entity<state::AppState>, cx: &mut App) {
@@ -361,7 +367,7 @@ fn open_main_window(
                 // Linux/Windows `appears_transparent` hides the system titlebar
                 // for our custom-drawn chrome; harmless where unsupported.
                 titlebar: Some(TitlebarOptions {
-                    title: cfg!(target_os = "windows").then(|| "Zeron".into()),
+                    title: cfg!(target_os = "windows").then(|| "Clyra".into()),
                     appears_transparent: true,
                     // Native lights are 14px tall: top 14 → center 21, matching
                     // the 38px titlebar row with 4px top-only content padding.
@@ -371,7 +377,7 @@ fn open_main_window(
                 // Drag + start_window_move) — mark the content view app-owned
                 // so AppKit neither dead-zones the strip nor delays clicks.
                 app_owns_titlebar_drag: true,
-                // Linux: request client-side decorations — zeron draws its own
+                // Linux: request client-side decorations — clyra draws its own
                 // unified titlebar and (under CSD) its own caption buttons
                 // (shell.rs `render_linux_caption_controls`). Leaving this unset
                 // requests SERVER decorations, which stacked a compositor
@@ -391,7 +397,7 @@ fn open_main_window(
                 // — if these two ever disagree, vibrancy dies on the first theme
                 // change and never comes back.
                 window_background: theme::Theme::of(cx).window_background_appearance(),
-                app_id: Some("zeron".into()),
+                app_id: Some("clyra".into()),
                 ..Default::default()
             },
             move |window, cx| {
@@ -440,7 +446,7 @@ fn start_appshot_service(activation_dir: std::path::PathBuf, cx: &mut App) {
             };
             let capture = capture.await;
             // Coalesce presses made while capture was in flight. Delivery
-            // focuses Zeron; replaying old activations would capture the wrong
+            // focuses Clyra; replaying old activations would capture the wrong
             // app or show a misleading self-capture error after success.
             while matches!(shortcuts.next().now_or_never(), Some(Some(()))) {}
             cx.update(|cx| deliver_appshot(capture, cx));
@@ -451,7 +457,7 @@ fn start_appshot_service(activation_dir: std::path::PathBuf, cx: &mut App) {
 
 /// Check viewer focus on the UI thread before any native capture or portal
 /// request. Portals do not identify the source window, so their backends cannot
-/// reject Zeron after the picker or capture has already started.
+/// reject Clyra after the picker or capture has already started.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn start_appshot_capture(
     cx: &mut App,
@@ -483,7 +489,7 @@ mod appshot_activation_tests {
 
     #[gpui::test]
     fn appshot_capture_skips_any_focused_viewer_window(cx: &mut gpui::TestAppContext) {
-        // The guard must cover every Zeron window, not only a Shell/chat root.
+        // The guard must cover every Clyra window, not only a Shell/chat root.
         for _ in 0..2 {
             let window = cx.add_window(|_, _| ViewerWindow);
             window
@@ -549,7 +555,7 @@ fn deliver_appshot(
             }
             tracing::warn!(
                 count,
-                "Appshot captured with no Zeron window; preserving it for the next delivery"
+                "Appshot captured with no Clyra window; preserving it for the next delivery"
             );
         }
         return;

@@ -1,10 +1,10 @@
 //! Context occupancy is read from the replicated chat snapshot, never local CLI state.
 use crate::theme::Theme;
+use clyra_proto::ContextUsage;
 use gpui::{
     Context, IntoElement, PathBuilder, Render, SharedString, Window, canvas, div, point,
     prelude::*, px,
 };
-use zeron_proto::ContextUsage;
 
 pub fn render(
     usage: Option<ContextUsage>,

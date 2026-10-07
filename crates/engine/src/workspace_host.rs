@@ -26,9 +26,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use chrono::Utc;
 use tokio::sync::watch;
 
-use zeron_doc::{DeletedSpace, REGISTRY_DOC_ID, RegistryDoc, WorkspaceDoc};
-use zeron_proto::{Chat, ChatConfig, Device, Session, SidebarPreferencesState, Space};
-use zeron_sync::{DocsStore, RegistryClient, RegistryTuning};
+use clyra_doc::{DeletedSpace, REGISTRY_DOC_ID, RegistryDoc, WorkspaceDoc};
+use clyra_proto::{Chat, ChatConfig, Device, Session, SidebarPreferencesState, Space};
+use clyra_sync::{DocsStore, RegistryClient, RegistryTuning};
 
 use crate::doc_host::EdgeConfig;
 use crate::http_error::describe_http_error;
@@ -90,9 +90,9 @@ pub(crate) async fn token_changed(changes: &mut Option<tokio::sync::watch::Recei
     }
 }
 
-async fn token_revoked(token: &Option<Arc<dyn zeron_rpc::TokenSource>>) -> bool {
+async fn token_revoked(token: &Option<Arc<dyn clyra_rpc::TokenSource>>) -> bool {
     match token {
-        Some(token) => matches!(token.token().await, Err(zeron_rpc::TokenError::SignedOut)),
+        Some(token) => matches!(token.token().await, Err(clyra_rpc::TokenError::SignedOut)),
         // Fixed test/dev URLs have no revocable credential source.
         None => false,
     }
@@ -271,8 +271,8 @@ impl WorkspaceHost {
             // Every boot restamps the running binary's version (fleet staleness
             // on the Devices page; workspace version — same for every crate).
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            cursor_sdk_version: Some(zeron_harness::CursorHarness::sdk_version().into()),
-            capabilities: zeron_proto::capabilities::current(),
+            cursor_sdk_version: Some(clyra_harness::CursorHarness::sdk_version().into()),
+            capabilities: clyra_proto::capabilities::current(),
         })?;
 
         let state = doc.read_all()?;
@@ -341,22 +341,22 @@ impl WorkspaceHost {
     /// server through this. Production always goes through [`Self::join_room`].
     #[doc(hidden)]
     pub fn connect_registry_url(&self, url: &str) {
-        self.spawn_join(Arc::new(zeron_sync::StaticUrl(url.to_string())), None, None);
+        self.spawn_join(Arc::new(clyra_sync::StaticUrl(url.to_string())), None, None);
     }
 
     fn spawn_join(
         &self,
-        url: Arc<dyn zeron_sync::UrlProvider>,
+        url: Arc<dyn clyra_sync::UrlProvider>,
         mut token_changes: Option<tokio::sync::watch::Receiver<u64>>,
-        token: Option<Arc<dyn zeron_rpc::TokenSource>>,
+        token: Option<Arc<dyn clyra_rpc::TokenSource>>,
     ) {
         let org_id = self.inner.config.org_id.clone();
         let reg = self.inner.reg.clone();
         let device_id = self.inner.config.device_id.clone();
         let weak = Arc::downgrade(&self.inner);
         tokio::spawn(async move {
-            let mut wake = zeron_sync::wake::subscribe();
-            let mut online = zeron_sync::wake::subscribe_online();
+            let mut wake = clyra_sync::wake::subscribe();
+            let mut online = clyra_sync::wake::subscribe_online();
             // `RegistryClient` only self-reconnects AFTER a first successful
             // join; an INITIAL failure (a 500 from an overloaded DO, a token
             // racing a refresh, an edge deploy) must not end this task and
@@ -413,7 +413,7 @@ impl WorkspaceHost {
                         loop {
                             tokio::select! {
                                 event = events.recv() => match event {
-                                    Ok(zeron_sync::RegistryEvent::Connected) => {
+                                    Ok(clyra_sync::RegistryEvent::Connected) => {
                                         let Some(inner) = weak.upgrade() else { return };
                                         // Re-join: restart the dial gate's
                                         // warm-up clock (presence map is empty
@@ -423,15 +423,15 @@ impl WorkspaceHost {
                                             .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
                                         inner.bump_changed();
                                     }
-                                    Ok(zeron_sync::RegistryEvent::Applied) => {
+                                    Ok(clyra_sync::RegistryEvent::Applied) => {
                                         let Some(inner) = weak.upgrade() else { return };
                                         inner.bump_changed();
                                     }
-                                    Ok(zeron_sync::RegistryEvent::Presence) => {
+                                    Ok(clyra_sync::RegistryEvent::Presence) => {
                                         let Some(inner) = weak.upgrade() else { return };
                                         inner.publish();
                                     }
-                                    Ok(zeron_sync::RegistryEvent::Disconnected) => {}
+                                    Ok(clyra_sync::RegistryEvent::Disconnected) => {}
                                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                 },
@@ -506,8 +506,8 @@ impl WorkspaceHost {
     /// down, relay fine: the 2026-08-18 03:45 incident shape) must never
     /// park the relay. Un-park is presence-driven: heartbeats resume → the
     /// verdict flips and the peer-alive hook clears any dial cooldown.
-    pub fn peer_liveness(&self, device_id: &str) -> zeron_rpc::PeerLiveness {
-        use zeron_rpc::PeerLiveness::{Dark, Live, Unknown};
+    pub fn peer_liveness(&self, device_id: &str) -> clyra_rpc::PeerLiveness {
+        use clyra_rpc::PeerLiveness::{Dark, Live, Unknown};
         if device_id == self.inner.config.device_id {
             return Live;
         }
@@ -594,15 +594,15 @@ impl WorkspaceHost {
         }
     }
 
-    /// Registry room introspection for SyncStatus / `zeron sync`.
+    /// Registry room introspection for SyncStatus / `clyra sync`.
     /// `None` = no room yet (edge-less, or the initial join is still retrying).
-    pub fn sync_status(&self) -> Option<zeron_sync::RoomStatsSnapshot> {
+    pub fn sync_status(&self) -> Option<clyra_sync::RoomStatsSnapshot> {
         lock(&self.inner.room).as_ref().map(|room| room.stats())
     }
 
     /// The registry room's reconnect posture (next-dial deadline + sticky
     /// last failure) for the connectivity stream. `None` = no room yet.
-    pub fn reconnect_state(&self) -> Option<zeron_sync::ReconnectState> {
+    pub fn reconnect_state(&self) -> Option<clyra_sync::ReconnectState> {
         lock(&self.inner.room)
             .as_ref()
             .map(|room| room.reconnect_state())
@@ -655,7 +655,7 @@ impl WorkspaceHost {
 
     pub fn change_sidebar_pin(
         &self,
-        change: &zeron_proto::SidebarPinChange,
+        change: &clyra_proto::SidebarPinChange,
     ) -> Result<(), EngineError> {
         let synced = self.sync_status().is_some_and(|status| status.synced);
         self.mutate(|doc| {
@@ -666,8 +666,8 @@ impl WorkspaceHost {
         })?;
         if matches!(
             change,
-            zeron_proto::SidebarPinChange::Section {
-                change: zeron_proto::SidebarSectionChange::Import { .. }
+            clyra_proto::SidebarPinChange::Section {
+                change: clyra_proto::SidebarSectionChange::Import { .. }
             }
         ) {
             // The UI removes its legacy copy only after this acknowledgement.
@@ -896,7 +896,7 @@ impl WorkspaceHost {
     }
 
     /// [`create_chat`](Self::create_chat) recording the creating chat
-    /// (`parentChatId`) — the Zeron MCP's orchestration link.
+    /// (`parentChatId`) — the Clyra MCP's orchestration link.
     pub fn create_chat_with_parent(
         &self,
         chat_id: &str,
@@ -1103,7 +1103,7 @@ impl WorkspaceHost {
         Ok(self.mutate(|doc| doc.set_chat_archived(chat_id, archived))?)
     }
 
-    /// LWW full-config replace on the chat row (zeron `SetChatConfig` — the
+    /// LWW full-config replace on the chat row (clyra `SetChatConfig` — the
     /// composer's mid-session model/reasoning/options changes). Returns false
     /// when the chat doesn't exist.
     pub fn set_chat_config(&self, chat_id: &str, config: &ChatConfig) -> Result<bool, EngineError> {
@@ -1130,7 +1130,7 @@ impl WorkspaceHost {
     pub fn set_chat_source_context(
         &self,
         chat_id: &str,
-        context: &zeron_proto::ConversationSourceContext,
+        context: &clyra_proto::ConversationSourceContext,
     ) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.set_chat_source_context(chat_id, context))?)
     }
@@ -1574,12 +1574,12 @@ fn device_name_on_boot(existing_name: Option<&str>, detected_name: &str) -> Stri
 /// auth path to maintain, and the `?beat=1` keeps presence alive for a
 /// device that can only reach the edge over HTTPS.
 struct WsDerivedRegistryTransport {
-    url: Arc<dyn zeron_sync::UrlProvider>,
+    url: Arc<dyn clyra_sync::UrlProvider>,
     client: reqwest::Client,
 }
 
 impl WsDerivedRegistryTransport {
-    fn new(url: Arc<dyn zeron_sync::UrlProvider>) -> Self {
+    fn new(url: Arc<dyn clyra_sync::UrlProvider>) -> Self {
         Self {
             url,
             client: reqwest::Client::new(),
@@ -1587,17 +1587,17 @@ impl WsDerivedRegistryTransport {
     }
 
     async fn leaf_url(
-        provider: &Arc<dyn zeron_sync::UrlProvider>,
+        provider: &Arc<dyn clyra_sync::UrlProvider>,
         leaf: &str,
-    ) -> Result<(reqwest::Url, Option<String>), zeron_sync::SyncError> {
+    ) -> Result<(reqwest::Url, Option<String>), clyra_sync::SyncError> {
         let ws = provider.url().await?;
         let mut u = reqwest::Url::parse(&ws)
-            .map_err(|e| zeron_sync::SyncError::Protocol(format!("bad ws url: {e}")))?;
+            .map_err(|e| clyra_sync::SyncError::Protocol(format!("bad ws url: {e}")))?;
         let scheme = if u.scheme() == "wss" { "https" } else { "http" };
         let _ = u.set_scheme(scheme);
         let path = u.path().to_string();
         let Some(base) = path.strip_suffix("/ws") else {
-            return Err(zeron_sync::SyncError::Protocol(
+            return Err(clyra_sync::SyncError::Protocol(
                 "ws url without /ws leaf".into(),
             ));
         };
@@ -1623,11 +1623,11 @@ impl WsDerivedRegistryTransport {
     }
 }
 
-impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
+impl clyra_sync::RegistryTransport for WsDerivedRegistryTransport {
     fn fetch(
         &self,
         since: u64,
-    ) -> futures::future::BoxFuture<'static, Result<String, zeron_sync::SyncError>> {
+    ) -> futures::future::BoxFuture<'static, Result<String, clyra_sync::SyncError>> {
         let provider = self.url.clone();
         let client = self.client.clone();
         Box::pin(async move {
@@ -1642,23 +1642,23 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
             let resp = req
                 .send()
                 .await
-                .map_err(|e| zeron_sync::SyncError::WebSocket(describe_http_error(e)))?;
+                .map_err(|e| clyra_sync::SyncError::WebSocket(describe_http_error(e)))?;
             if !resp.status().is_success() {
-                return Err(zeron_sync::SyncError::Protocol(format!(
+                return Err(clyra_sync::SyncError::Protocol(format!(
                     "registry pull http {}",
                     resp.status()
                 )));
             }
             resp.text()
                 .await
-                .map_err(|e| zeron_sync::SyncError::WebSocket(describe_http_error(e)))
+                .map_err(|e| clyra_sync::SyncError::WebSocket(describe_http_error(e)))
         })
     }
 
     fn push(
         &self,
         body: String,
-    ) -> futures::future::BoxFuture<'static, Result<String, zeron_sync::SyncError>> {
+    ) -> futures::future::BoxFuture<'static, Result<String, clyra_sync::SyncError>> {
         let provider = self.url.clone();
         let client = self.client.clone();
         Box::pin(async move {
@@ -1673,16 +1673,16 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
             let resp = req
                 .send()
                 .await
-                .map_err(|e| zeron_sync::SyncError::WebSocket(describe_http_error(e)))?;
+                .map_err(|e| clyra_sync::SyncError::WebSocket(describe_http_error(e)))?;
             if !resp.status().is_success() {
-                return Err(zeron_sync::SyncError::Protocol(format!(
+                return Err(clyra_sync::SyncError::Protocol(format!(
                     "registry push http {}",
                     resp.status()
                 )));
             }
             resp.text()
                 .await
-                .map_err(|e| zeron_sync::SyncError::WebSocket(describe_http_error(e)))
+                .map_err(|e| clyra_sync::SyncError::WebSocket(describe_http_error(e)))
         })
     }
 }
@@ -1695,11 +1695,11 @@ mod tests {
     async fn registry_http_sync_retains_dns_cause() {
         use super::*;
         use crate::http_error::test_support::FailingDns;
-        use zeron_sync::RegistryTransport;
+        use clyra_sync::RegistryTransport;
 
         let dns = Arc::new(FailingDns::default());
         let transport = WsDerivedRegistryTransport {
-            url: Arc::new(zeron_sync::StaticUrl(
+            url: Arc::new(clyra_sync::StaticUrl(
                 "wss://edge.invalid/registry/org/ws?token=token-secret".into(),
             )),
             client: dns.client(),
@@ -1789,7 +1789,7 @@ mod tests {
         let mut preferences = host.watch_sidebar_preferences();
         assert!(!preferences.borrow().initialized);
 
-        host.change_sidebar_pin(&zeron_proto::SidebarPinChange::Unpin {
+        host.change_sidebar_pin(&clyra_proto::SidebarPinChange::Unpin {
             session_id: "absent".into(),
         })
         .unwrap();
@@ -1809,7 +1809,7 @@ mod tests {
         );
         host.create_chat("cached", None, Some("test-device"), None, None)
             .unwrap();
-        host.change_sidebar_pin(&zeron_proto::SidebarPinChange::Pin {
+        host.change_sidebar_pin(&clyra_proto::SidebarPinChange::Pin {
             session_id: "cached".into(),
             after: None,
             before: None,
@@ -1818,8 +1818,8 @@ mod tests {
         let acknowledgement = host.sidebar_preferences_snapshot();
         assert!(acknowledgement.revision > first_revision);
         assert_eq!(*preferences.borrow(), acknowledgement);
-        host.change_sidebar_pin(&zeron_proto::SidebarPinChange::Section {
-            change: zeron_proto::SidebarSectionChange::Create {
+        host.change_sidebar_pin(&clyra_proto::SidebarPinChange::Section {
+            change: clyra_proto::SidebarSectionChange::Create {
                 id: "focus".into(),
                 name: "Focus".into(),
             },
@@ -1829,8 +1829,8 @@ mod tests {
         assert!(sections.revision > acknowledgement.revision);
         assert_eq!(sections.sections[0].name, "Focus");
         assert_eq!(*preferences.borrow(), sections);
-        host.change_sidebar_pin(&zeron_proto::SidebarPinChange::Section {
-            change: zeron_proto::SidebarSectionChange::Collapse {
+        host.change_sidebar_pin(&clyra_proto::SidebarPinChange::Section {
+            change: clyra_proto::SidebarSectionChange::Collapse {
                 id: "focus".into(),
                 collapsed: true,
             },

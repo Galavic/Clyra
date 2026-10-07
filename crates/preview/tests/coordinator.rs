@@ -1,13 +1,7 @@
 //! Full authenticated Worker → catalog → SDP/ICE → P2P → HTTP integration.
 //! Run against `wrangler dev --local --var AUTH_MODE:dev --port 27641`:
-//! ZERON_PREVIEW_TEST_EDGE=http://127.0.0.1:27641 cargo test -p zeron-preview --test coordinator -- --ignored
-use std::{sync::Arc, time::Duration};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-};
-use tokio_util::sync::CancellationToken;
-use zeron_preview::{
+//! ZERON_PREVIEW_TEST_EDGE=http://127.0.0.1:27641 cargo test -p clyra-preview --test coordinator -- --ignored
+use clyra_preview::{
     catalog::Catalog,
     discovery::Listener,
     mux::{self, BoxIo, Connector},
@@ -15,6 +9,12 @@ use zeron_preview::{
     proxy::{self, Router},
     signaling::{self, Config, TokenSource},
 };
+use std::{sync::Arc, time::Duration};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
+use tokio_util::sync::CancellationToken;
 struct Token(String);
 #[async_trait::async_trait]
 impl TokenSource for Token {
@@ -51,7 +51,7 @@ async fn authenticated_coordinator_pairs_devices_for_large_http_preview() {
             for _ in 0..512 { socket.write_all(&[42;8192]).await.unwrap(); }
             socket.shutdown().await.unwrap();
         });
-        host.replace_local(vec![("/work/project".into(),Listener { pid:std::process::id(),parent:1,cwd:"/work/project".into(),args:vec!["node".into(),"vite".into()],started_at:1,address,zeron_owned:true })]).unwrap();
+        host.replace_local(vec![("/work/project".into(),Listener { pid:std::process::id(),parent:1,cwd:"/work/project".into(),args:vec!["node".into(),"vite".into()],started_at:1,address,clyra_owned:true })]).unwrap();
         let host_backend = Arc::new(Backend(host.clone())); let viewer_backend = Arc::new(Backend(viewer.clone()));
         let (host_peers, host_output) = Peers::new("host".into(),host_backend,stop.child_token());
         let (viewer_peers, viewer_output) = Peers::new("viewer".into(),viewer_backend.clone(),stop.child_token());

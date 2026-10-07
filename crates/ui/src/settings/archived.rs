@@ -5,8 +5,8 @@ use gpui::{
     AnyElement, Context, Entity, SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 
-use zeron_proto::Chat;
-use zeron_rpc::methods;
+use clyra_proto::Chat;
+use clyra_rpc::methods;
 
 use crate::popover;
 use crate::settings::widgets;
@@ -113,7 +113,7 @@ impl Render for ArchivedPage {
                     .clone()
                     .unwrap_or_else(|| "Untitled session".into())
                     .into();
-                // Unknown device → no fragment at all (zeron renders the
+                // Unknown device → no fragment at all (clyra renders the
                 // device span only when the name resolves).
                 let device: Option<SharedString> =
                     device_names.get(&chat.device_id).cloned().map(Into::into);
@@ -127,7 +127,7 @@ impl Render for ArchivedPage {
                 let is_busy = busy.as_deref() == Some(chat.id.as_str());
                 let row_hovered = self.hovered == Some(ix);
                 let chat_id = chat.id.clone();
-                // zeron settings.archived.tsx row: archive tile, medium title
+                // clyra settings.archived.tsx row: archive tile, medium title
                 // + tabular time, quiet device · location meta, Unarchive.
                 div()
                     .id(("archived-row", ix))
@@ -194,7 +194,7 @@ impl Render for ArchivedPage {
                             )
                             .child({
                                 // device · location, separator at the line's
-                                // own tone (zeron: a plain span inheriting
+                                // own tone (clyra: a plain span inheriting
                                 // `text-muted-foreground/55`).
                                 let mut meta = div()
                                     .mt(px(2.0))
@@ -218,7 +218,7 @@ impl Render for ArchivedPage {
                             }),
                     )
                     .child(
-                        // Hidden until the row is hovered (zeron `opacity-0
+                        // Hidden until the row is hovered (clyra `opacity-0
                         // group-hover:opacity-100`); hover fill is the solid
                         // accent tone (`hover:bg-accent`).
                         div()
@@ -258,7 +258,7 @@ impl Render for ArchivedPage {
             .collect();
 
         let body: AnyElement = if items.is_empty() {
-            // Centered empty state (zeron settings.archived.tsx).
+            // Centered empty state (clyra settings.archived.tsx).
             div()
                 .mt(px(96.0))
                 .flex()
@@ -268,7 +268,7 @@ impl Render for ArchivedPage {
                 .text_color(theme.text_muted.opacity(0.5))
                 .child(
                     // `opacity-40` on top of the inherited muted/50 — an
-                    // effectively ~20% glyph (zeron settings.archived.tsx).
+                    // effectively ~20% glyph (clyra settings.archived.tsx).
                     crate::icons::icon(crate::icons::ARCHIVE_MINIMALISTIC)
                         .size(px(28.0))
                         .text_color(theme.text_muted.opacity(0.2)),
@@ -315,6 +315,7 @@ impl Render for ArchivedPage {
                         widgets::page_column()
                             .child(widgets::page_header(
                                 &theme,
+                                crate::shell::SettingsSection::Archived.icon(),
                                 "Archived sessions",
                                 (count > 0).then_some(count),
                             ))

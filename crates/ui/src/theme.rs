@@ -1,7 +1,7 @@
 //! The app theme — two concrete appearances, one token set.
 //!
 //! Colors are precomputed from an oklch-derived neutral scale (perceptually even
-//! lightness steps; the same scale zeron's Tailwind theme used) into gpui [`Hsla`].
+//! lightness steps; the same scale clyra's Tailwind theme used) into gpui [`Hsla`].
 //! **Numbers drive layout, colors are paint**: layout constants live here as plain
 //! numbers and never depend on which color is painted.
 //!
@@ -34,13 +34,13 @@
 
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
-use gpui::{App, Global, Hsla, SharedString, hsla};
-use serde::{Deserialize, Serialize};
-use zeron_syntax::HighlightKind;
-use zeron_theme::{
+use clyra_syntax::HighlightKind;
+use clyra_theme::{
     AccentPreset, AccentSelection, Color as ModelColor, SurfacePreference, SurfaceTreatment,
     ThemeRegistry, ThemeVariant,
 };
+use gpui::{App, Global, Hsla, SharedString, hsla};
+use serde::{Deserialize, Serialize};
 
 /// User-selectable accent family. A choice is one color identity, not a
 /// miniature multi-hue theme: every interactive accent role stays on the same
@@ -48,10 +48,16 @@ use zeron_theme::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AccentColor {
-    /// The exact upstream Zeron indigo.
+    /// Clyra brand purple (#a78bfa family).
     #[default]
-    #[serde(alias = "violet", alias = "indigo", alias = "red", alias = "purple")]
-    Zeron,
+    #[serde(
+        alias = "violet",
+        alias = "indigo",
+        alias = "red",
+        alias = "purple",
+        alias = "zeron"
+    )]
+    Clyra,
     Orange,
     Amber,
     Green,
@@ -63,7 +69,7 @@ pub enum AccentColor {
 
 impl AccentColor {
     pub const ALL: [Self; 7] = [
-        Self::Zeron,
+        Self::Clyra,
         Self::Orange,
         Self::Amber,
         Self::Green,
@@ -74,7 +80,7 @@ impl AccentColor {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Zeron => "Zeron",
+            Self::Clyra => "Clyra",
             Self::Orange => "Orange",
             Self::Amber => "Amber",
             Self::Green => "Green",
@@ -89,11 +95,12 @@ impl AccentColor {
         // used to gamut-clip OKLCH into sRGB and then mutate HSL lightness,
         // producing different chroma and apparent hues across light/dark.
         let (primary, strong) = match (self, appearance) {
-            (Self::Zeron, Appearance::Dark) => {
-                (oklch(0.673, 0.182, 276.935), oklch(0.585, 0.233, 277.117))
+            // Clyra brand purple: #a78bfa on dark, #7c3aed fills + light.
+            (Self::Clyra, Appearance::Dark) => {
+                (oklch(0.709, 0.159, 293.541), oklch(0.541, 0.247, 293.009))
             }
-            (Self::Zeron, Appearance::Light) => {
-                (oklch(0.511, 0.262, 276.966), oklch(0.511, 0.262, 276.966))
+            (Self::Clyra, Appearance::Light) => {
+                (oklch(0.541, 0.247, 293.009), oklch(0.541, 0.247, 293.009))
             }
             (Self::Orange, Appearance::Dark) => (oklch(0.75, 0.18, 55.0), oklch(0.54, 0.19, 55.0)),
             (Self::Orange, Appearance::Light) => (oklch(0.50, 0.19, 55.0), oklch(0.50, 0.19, 55.0)),
@@ -133,7 +140,7 @@ impl AccentColor {
 impl From<AccentColor> for AccentPreset {
     fn from(value: AccentColor) -> Self {
         match value {
-            AccentColor::Zeron => Self::Zeron,
+            AccentColor::Clyra => Self::Clyra,
             AccentColor::Orange => Self::Orange,
             AccentColor::Amber => Self::Amber,
             AccentColor::Green => Self::Green,
@@ -147,7 +154,7 @@ impl From<AccentColor> for AccentPreset {
 impl From<AccentPreset> for AccentColor {
     fn from(value: AccentPreset) -> Self {
         match value {
-            AccentPreset::Zeron => Self::Zeron,
+            AccentPreset::Clyra => Self::Clyra,
             AccentPreset::Orange => Self::Orange,
             AccentPreset::Amber => Self::Amber,
             AccentPreset::Green => Self::Green,
@@ -273,10 +280,10 @@ pub(crate) fn bump_style_generation() {
     STYLE_GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
-fn model_appearance(appearance: zeron_theme::Appearance) -> Appearance {
+fn model_appearance(appearance: clyra_theme::Appearance) -> Appearance {
     match appearance {
-        zeron_theme::Appearance::Dark => Appearance::Dark,
-        zeron_theme::Appearance::Light => Appearance::Light,
+        clyra_theme::Appearance::Dark => Appearance::Dark,
+        clyra_theme::Appearance::Light => Appearance::Light,
     }
 }
 
@@ -366,6 +373,11 @@ pub fn set_current_appearance(appearance: Appearance) {
 /// only the *tone* flipping. Any per-state correction belongs in that state's
 /// token, not in a blanket multiplier.
 pub const INK_FILL_SCALE: f32 = 1.0;
+
+/// Sidebar-tone wash alpha: the translucent tint the sidebar column, the
+/// corner filler, and the titlebar band read as. Single source so those
+/// three never seam against each other.
+pub const SIDEBAR_TONE_WASH: f32 = 0.05;
 
 /// Light-mode alpha multiplier for **hairlines** (borders, dividers, rings).
 /// Opposite of fills: a 1px edge has to hold its own against a bright surround,
@@ -606,7 +618,7 @@ pub struct Theme {
     pub accent_color: AccentColor,
 
     // ---- paint: neutral surfaces ----
-    /// Main content panel. Dark: the deepest plane (#060606). Light: pure white —
+    /// Main content panel. Dark: the deepest plane (#080808). Light: pure white —
     /// long-form content reads best on an unbroken white field.
     pub bg: Hsla,
     /// Shell / sidebar surface. Dark: one step *up* from `bg`. Light: one step
@@ -770,13 +782,13 @@ impl TerminalColors {
         }
     }
 
-    fn zeron(appearance: Appearance) -> Self {
+    fn clyra(appearance: Appearance) -> Self {
         let id = match appearance {
-            Appearance::Dark => "zeron-dark",
-            Appearance::Light => "zeron-light",
+            Appearance::Dark => "clyra-dark",
+            Appearance::Light => "clyra-light",
         };
         let registry = ThemeRegistry::active();
-        Self::from_variant(registry.variant(id).expect("Zeron terminal palette exists"))
+        Self::from_variant(registry.variant(id).expect("Clyra terminal palette exists"))
     }
 }
 
@@ -809,16 +821,17 @@ impl Theme {
     } else {
         1.0
     };
-    /// Main-panel header height (zeron `h-11`) — in-card headers (changes pane).
+    /// Main-panel header height (clyra `h-11`) — in-card headers (changes pane).
     pub const HEADER_HEIGHT: f32 = 44.0;
     /// The unified window titlebar (traffic lights + cluster + tabs). Content
-    /// rides [`Self::TITLEBAR_TOP_PAD`] lower than center so the air above
-    /// matches the perceived gap to the inset card below (border + card body).
+    /// is vertically centered: rows pad symmetrically top and bottom, so the
+    /// row center matches the band center.
     pub const TITLEBAR_HEIGHT: f32 = 38.0;
-    /// Top-only padding moves the flex center by half this value. On macOS,
-    /// 38 / 2 + 4 / 2 = 21 matches the native traffic lights' center.
+    /// Symmetric row padding (top + bottom): content centers on the raw
+    /// titlebar center (38 / 2 = 19). Note the native macOS traffic lights
+    /// sit ~2px lower; that platform offset is accepted for a centered band.
     pub const TITLEBAR_TOP_PAD: f32 = 4.0;
-    /// Reserved status strip under the content outlet (zeron `h-6`) — the
+    /// Reserved status strip under the content outlet (clyra `h-6`) — the
     /// WorkingIndicator row; reserving it keeps the composer from shifting.
     pub const STATUS_STRIP_HEIGHT: f32 = 24.0;
     /// Height of the gradient that fades the transcript into the panel
@@ -846,7 +859,7 @@ impl Theme {
     /// The selected theme's shell tint painted over the blurred window
     /// background (macOS glass). Keeping the hue theme-owned matters when a
     /// user forces frost onto a palette authored for an opaque workbench: a
-    /// fixed Zeron grey would erase that palette's identity.
+    /// fixed Clyra grey would erase that palette's identity.
     pub fn glass(&self) -> Hsla {
         if self.surface_treatment == SurfaceTreatment::Opaque {
             return self.surface;
@@ -867,7 +880,7 @@ impl Theme {
         self.contrast_checked_tint_alpha(self.surface, base, self.adverse_backdrop())
     }
 
-    /// Increase tint coverage only as far as needed for Zeron's shared text
+    /// Increase tint coverage only as far as needed for Clyra's shared text
     /// roles. This is used for both window glass and in-app frosted surfaces,
     /// whose blurred content can otherwise invalidate an imported palette's
     /// original solid-background assumptions.
@@ -900,6 +913,31 @@ impl Theme {
         self.glass().a < 1.0
     }
 
+    /// Sidebar-chrome paint at a user coverage level: the sidebar tone
+    /// pre-composited onto the surface, then cut to `level` (0 = window
+    /// glass only, 1 = fully solid). Sidebar column, titlebar band, and
+    /// joint filler all share this one paint so they can never seam against
+    /// each other at any level.
+    pub fn sidebar_chrome_bg(&self, level: f32) -> Hsla {
+        let solid = flatten(wash(SIDEBAR_TONE_WASH), self.surface);
+        hsla(solid.h, solid.s, solid.l, level.clamp(0.0, 1.0))
+    }
+
+    /// Chat-panel paint at a user coverage level: the theme background cut
+    /// to `level` (0 = window glass only, 1 = fully opaque). Unlike
+    /// [`Self::panel_bg`] (a glass tint), this reaches solid.
+    pub fn chat_panel_bg(&self, level: f32) -> Hsla {
+        let bg = self.bg;
+        hsla(bg.h, bg.s, bg.l, level.clamp(0.0, 1.0))
+    }
+
+    /// Composer-pill paint at a user coverage level: the input plate
+    /// composite cut to `level` (0 = window glass only, 1 = fully opaque).
+    pub fn composer_plate_bg(&self, level: f32) -> Hsla {
+        let plate = flatten(self.input_bg, self.bg);
+        hsla(plate.h, plate.s, plate.l, level.clamp(0.0, 1.0))
+    }
+
     /// Shared background for the editor host and the adjacent Files column.
     pub fn panel_bg(&self) -> Hsla {
         if self.is_glass() {
@@ -927,9 +965,26 @@ impl Theme {
 
     /// Theme-owned hover wash for chrome that sits on glass (sidebar rows,
     /// tabs, titlebar buttons). The importer maps this role from the source
-    /// theme, so forcing frost does not reintroduce Zeron's neutral hover.
+    /// theme, so forcing frost does not reintroduce Clyra's neutral hover.
     pub fn glass_hover(&self) -> Hsla {
         self.element_hover
+    }
+
+    /// Solid accent plate under white labels and knobs — primary buttons,
+    /// switched-on toggles, the settings nav marker. The accent is deepened
+    /// (lightness only, hue kept) until white reads at 4.5:1; Clyra's light
+    /// accent (#7c3aed) already does, the dark one (#a78bfa) steps down.
+    pub fn accent_fill(&self) -> Hsla {
+        let mut fill = self.accent;
+        fill.a = 1.0;
+        let white = gpui::white();
+        for _ in 0..100 {
+            if contrast_ratio(white, fill) >= 4.5 {
+                break;
+            }
+            fill.l = (fill.l - 0.01).max(0.0);
+        }
+        fill
     }
 
     /// Muted popup text is the theme foreground composited onto the glass.
@@ -1012,14 +1067,15 @@ impl Theme {
     /// Section-card fill (settings cards and similar in-panel cards). The
     /// opaque `surface` tone read as a harsh solid slab floating on the
     /// frosted blur (user report), so glass thins it to a translucent tint;
-    /// opaque platforms keep the true card tone.
+    /// opaque platforms keep the true card tone. Cards use the card plane
+    /// (one step above the shell) so they separate clearly from the page.
     pub fn card_glass_bg(&self) -> Hsla {
         if !self.is_frost() {
-            return self.surface;
+            return self.surface_card;
         }
         let window = flatten(self.glass(), self.adverse_backdrop());
-        self.surface
-            .opacity(self.contrast_checked_tint_alpha(self.surface, 0.40, window))
+        self.surface_card
+            .opacity(self.contrast_checked_tint_alpha(self.surface_card, 0.55, window))
     }
 
     /// The standard modal backdrop — see [`scrim`].
@@ -1054,9 +1110,9 @@ impl Theme {
         }
     }
 
-    /// Build the dark theme. The surface tones are sampled straight from the
-    /// reference screenshots of the original app (docs/reference): main panel
-    /// `#060606`, shell/sidebar `#0d0d0d`.
+    /// Build the dark theme: pure neutral planes matching the `clyra-dark`
+    /// built-in seeds — main panel `#080808`, shell/sidebar `#101010`, cards
+    /// `#1a1a1a`.
     pub fn dark() -> Self {
         Self::dark_with_accent(AccentColor::default())
     }
@@ -1065,18 +1121,18 @@ impl Theme {
         let accent = accent_color.tokens(Appearance::Dark);
         Self {
             appearance: Appearance::Dark,
-            variant_id: "zeron-dark".into(),
-            family_id: "zeron".into(),
+            variant_id: "clyra-dark".into(),
+            family_id: "clyra".into(),
             accent_selection: AccentSelection::Preset(accent_color.into()),
             surface_preference: SurfacePreference::ThemeDefault,
             surface_treatment: SurfaceTreatment::Frosted,
             accent_color,
-            bg: grey(6),       // main panel — sampled #060606
-            surface: grey(13), // shell / sidebar — sampled #0d0d0d
-            surface_raised: neutral(0.235),
-            surface_card: grey(0x0e),
-            surface_dialog: grey(0x10),
-            surface_overlay: grey(0x16),
+            bg: grey(8),       // main panel — #080808
+            surface: grey(16), // shell / sidebar — #101010
+            surface_raised: grey(0x26),
+            surface_card: grey(0x1a),
+            surface_dialog: grey(0x1d),
+            surface_overlay: grey(0x20),
             element_hover: hsla(0.0, 0.0, 0.92, 0.11),
             element_active: hsla(0.0, 0.0, 0.92, 0.16),
             border: hsla(0.0, 0.0, 1.0, 0.08),
@@ -1117,7 +1173,7 @@ impl Theme {
             diff_add: oklch(0.765, 0.177, 163.223), // emerald-400
             diff_del: oklch(0.704, 0.191, 22.216),  // red-400
             diff_hunk_bg: hsla(0.6, 0.35, 0.6, 0.05),
-            terminal: TerminalColors::zeron(Appearance::Dark),
+            terminal: TerminalColors::clyra(Appearance::Dark),
             font_sans: "Geist".into(),
             font_sans_fixed: "Geist".into(),
             font_mono: "Geist Mono".into(),
@@ -1145,8 +1201,8 @@ impl Theme {
         let accent = accent_color.tokens(Appearance::Light);
         Self {
             appearance: Appearance::Light,
-            variant_id: "zeron-light".into(),
-            family_id: "zeron".into(),
+            variant_id: "clyra-light".into(),
+            family_id: "clyra".into(),
             accent_selection: AccentSelection::Preset(accent_color.into()),
             surface_preference: SurfacePreference::ThemeDefault,
             surface_treatment: SurfaceTreatment::Frosted,
@@ -1216,7 +1272,7 @@ impl Theme {
             diff_add: oklch(0.596, 0.145, 163.225), // emerald-600
             diff_del: oklch(0.577, 0.245, 27.325),  // red-600
             diff_hunk_bg: hsla(0.6, 0.35, 0.35, 0.07),
-            terminal: TerminalColors::zeron(Appearance::Light),
+            terminal: TerminalColors::clyra(Appearance::Light),
             font_sans: "Geist".into(),
             font_sans_fixed: "Geist".into(),
             font_mono: "Geist Mono".into(),
@@ -1276,14 +1332,14 @@ impl Theme {
     ) -> Self {
         let registry = ThemeRegistry::active();
         let fallback_id = match appearance {
-            Appearance::Dark => "zeron-dark",
-            Appearance::Light => "zeron-light",
+            Appearance::Dark => "clyra-dark",
+            Appearance::Light => "clyra-light",
         };
         let variant = registry
             .variant(variant_id)
             .filter(|variant| model_appearance(variant.appearance) == appearance)
             .or_else(|| registry.variant(fallback_id))
-            .expect("the built-in registry contains both Zeron appearances");
+            .expect("the built-in registry contains both Clyra appearances");
         Self::from_variant(variant, accent_selection, surface_preference)
     }
 
@@ -1294,7 +1350,7 @@ impl Theme {
     ) -> Self {
         let appearance = model_appearance(variant.appearance);
         let accent_color = match accent_selection {
-            AccentSelection::ThemeDefault => AccentColor::Zeron,
+            AccentSelection::ThemeDefault => AccentColor::Clyra,
             AccentSelection::Preset(preset) => preset.into(),
         };
         let mut theme = Self::for_preferences(appearance, accent_color);
@@ -1864,6 +1920,14 @@ pub fn flatten(fg: Hsla, bg: Hsla) -> Hsla {
 }
 
 /// Linear per-component mix of two colors (paint helper for the gradient spinner).
+/// Scale a paint color's alpha by a user opacity level: the level multiplies
+/// the authored alpha (clamped 0..1), so 1.0 is exactly the authored color
+/// and 0.0 fully transparent.
+pub fn scaled_alpha(color: Hsla, level: f32) -> Hsla {
+    let mut color = color;
+    color.a = (color.a * level.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    color
+}
 pub fn mix(a: Hsla, b: Hsla, t: f32) -> Hsla {
     let t = t.clamp(0.0, 1.0);
     let lerp = |x: f32, y: f32| x + (y - x) * t;
@@ -1891,7 +1955,7 @@ mod tests {
 
     #[test]
     fn neutral_950_is_0a0a0a() {
-        // oklch(0.145 0 0) is Tailwind neutral-950, zeron's app background.
+        // oklch(0.145 0 0) is Tailwind neutral-950, clyra's app background.
         let rgb = srgb_u8(oklch_to_srgb(0.145, 0.0, 0.0));
         assert_eq!(rgb, [10, 10, 10]);
     }
@@ -1951,18 +2015,18 @@ mod tests {
     }
 
     #[test]
-    fn zeron_accent_is_the_exact_upstream_default() {
+    fn clyra_accent_is_the_brand_default() {
         let dark = Theme::dark();
         let light = Theme::light();
-        assert_eq!(dark.accent_color, AccentColor::Zeron);
-        assert_eq!(dark.accent, oklch(0.673, 0.182, 276.935));
-        assert_eq!(dark.accent_strong, oklch(0.585, 0.233, 277.117));
+        assert_eq!(dark.accent_color, AccentColor::Clyra);
+        assert_eq!(dark.accent, oklch(0.709, 0.159, 293.541));
+        assert_eq!(dark.accent_strong, oklch(0.541, 0.247, 293.009));
         assert_eq!(dark.code_text, dark.accent);
         assert_eq!(dark.busy, dark.accent);
         assert_eq!(dark.glyph.mid, dark.accent);
         assert_eq!(dark.caret, dark.accent);
-        assert_eq!(light.accent, oklch(0.511, 0.262, 276.966));
-        assert_eq!(light.accent_strong, oklch(0.511, 0.262, 276.966));
+        assert_eq!(light.accent, oklch(0.541, 0.247, 293.009));
+        assert_eq!(light.accent_strong, oklch(0.541, 0.247, 293.009));
         assert_eq!(light.code_text, light.accent);
         assert_eq!(light.busy, light.accent);
         assert_eq!(light.glyph.mid, light.accent);
@@ -1974,7 +2038,7 @@ mod tests {
         for old_default in ["violet", "indigo", "red", "purple"] {
             assert_eq!(
                 serde_json::from_str::<AccentColor>(&format!(r#""{old_default}""#)).unwrap(),
-                AccentColor::Zeron
+                AccentColor::Clyra
             );
         }
         assert_eq!(
@@ -1991,8 +2055,8 @@ mod tests {
             AccentSelection::ThemeDefault,
             SurfacePreference::ThemeDefault,
         );
-        let zeron = Theme::dark();
-        assert_ne!(catppuccin.surface, zeron.surface);
+        let clyra = Theme::dark();
+        assert_ne!(catppuccin.surface, clyra.surface);
         assert_eq!(catppuccin.busy, catppuccin.accent);
         assert_eq!(catppuccin.glyph.mid, catppuccin.accent);
         assert_eq!(catppuccin.surface_treatment, SurfaceTreatment::Opaque);
@@ -2022,7 +2086,7 @@ mod tests {
 
         let opaque_zeron = Theme::for_selection(
             Appearance::Dark,
-            "zeron-dark",
+            "clyra-dark",
             AccentSelection::ThemeDefault,
             SurfacePreference::Opaque,
         );
@@ -2080,7 +2144,7 @@ mod tests {
     #[test]
     fn runtime_hardening_protects_native_custom_theme_edits() {
         let mut variant = ThemeRegistry::builtin()
-            .variant("zeron-dark")
+            .variant("clyra-dark")
             .unwrap()
             .clone();
         variant.colors.text = variant.colors.background;
@@ -2181,7 +2245,7 @@ mod tests {
                 assert_eq!(theme.success, baseline.success);
                 assert_eq!(theme.diff_add, baseline.diff_add);
                 assert_eq!(theme.diff_del, baseline.diff_del);
-                if accent != AccentColor::Zeron {
+                if accent != AccentColor::Clyra {
                     assert_ne!(theme.code_text, baseline.code_text);
                     assert_ne!(theme.busy, baseline.busy);
                     assert_ne!(theme.selection, baseline.selection);

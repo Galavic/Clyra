@@ -9,7 +9,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use zeron_engine::ChangeRequestResolver;
+use clyra_engine::ChangeRequestResolver;
 
 fn write_executable(path: &Path, body: &str) {
     std::fs::write(path, body).unwrap();
@@ -51,7 +51,7 @@ if [ "$GH_PROMPT_DISABLED" != "1" ]; then
   echo "interactive auth was not disabled" >&2
   exit 2
 fi
-printf '%s\n' '[{"number":90,"title":"Login shell pull request","url":"https://github.com/acme/zeron/pull/90","state":"OPEN","baseRefName":"main","headRefName":"feature/status","updatedAt":"2026-08-15T12:00:00Z","isCrossRepository":false,"headRepositoryOwner":{"login":"acme"}}]'
+printf '%s\n' '[{"number":90,"title":"Login shell pull request","url":"https://github.com/acme/clyra/pull/90","state":"OPEN","baseRefName":"main","headRefName":"feature/status","updatedAt":"2026-08-15T12:00:00Z","isCrossRepository":false,"headRepositoryOwner":{"login":"acme"}}]'
 "##,
     );
 
@@ -78,7 +78,7 @@ printf '%s\n' '[{"number":90,"title":"Login shell pull request","url":"https://g
             "remote",
             "add",
             "origin",
-            "https://github.com/acme/zeron.git",
+            "https://github.com/acme/clyra.git",
         ],
     );
 

@@ -159,13 +159,13 @@ async fn write_loop(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Strin
             stdin.flush().await
         };
         if let Err(e) = write.await {
-            tracing::debug!(target: "zeron_harness::rpc", "stdin write failed (tolerated): {e}");
+            tracing::debug!(target: "clyra_harness::rpc", "stdin write failed (tolerated): {e}");
             return;
         }
     }
 }
 
-/// The id of a response, tolerantly. zeron always sends numeric ids, but
+/// The id of a response, tolerantly. clyra always sends numeric ids, but
 /// JSON-RPC lets a server echo them re-encoded — a string `"5"` or float
 /// `5.0` still names request 5. Dropping such a response would strand its
 /// caller forever (the session would spin Working with no per-turn timeout).
@@ -228,7 +228,7 @@ async fn read_loop(
             continue;
         }
         let Ok(mut msg) = serde_json::from_str::<Value>(line) else {
-            tracing::debug!(target: "zeron_harness::rpc", "non-JSON stdout line (skipped)");
+            tracing::debug!(target: "clyra_harness::rpc", "non-JSON stdout line (skipped)");
             continue;
         };
         if !msg.is_object() || msg.get("jsonrpc").is_some_and(|version| version != "2.0") {

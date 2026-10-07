@@ -23,8 +23,8 @@ use gpui::{
     Subscription, Task, Window, actions, div, prelude::*, px,
 };
 
-use zeron_proto::{TerminalEvent, TerminalSession};
-use zeron_rpc::methods;
+use clyra_proto::{TerminalEvent, TerminalSession};
+use clyra_rpc::methods;
 
 use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
 use crate::popover::{MenuScrollbarMetrics, MenuScrollbarState, ScrollRailHost};
@@ -1439,7 +1439,7 @@ impl TerminalPanel {
 
         let bar_chat = chat_owned.clone();
         let drop_chat = chat_owned.clone();
-        // Zeron terminal-panel.tsx: `flex h-10 items-center border-b
+        // Clyra terminal-panel.tsx: `flex h-10 items-center border-b
         // border-white/[0.07] pl-2 pr-1.5` on the #090909 panel — no separate
         // bar fill.
         div()
@@ -1485,7 +1485,7 @@ impl TerminalPanel {
                         let chat_close2 = chat_owned.clone();
                         let chat_drag = chat_owned.clone();
                         let ghost_title = title.clone();
-                        // Zeron tab: `h-7 rounded-lg pl-2 pr-1 gap-1.5 text-xs`,
+                        // Clyra tab: `h-7 rounded-lg pl-2 pr-1 gap-1.5 text-xs`,
                         // terminal glyph + label + close; active = white/8 wash.
                         let (text_color, bg, glyph_alpha) = if selected {
                             (theme.text, crate::theme::ink(0.08), 0.8)
@@ -1528,7 +1528,7 @@ impl TerminalPanel {
                             .pl(px(8.0))
                             .pr(px(4.0))
                             .rounded(px(8.0))
-                            // zeron terminal-panel.tsx tab: `transition-colors`.
+                            // clyra terminal-panel.tsx tab: `transition-colors`.
                             .bg(motion::hover_blend(
                                 &format!("term-tab-{key}"),
                                 bg,
@@ -1609,7 +1609,7 @@ impl TerminalPanel {
                     .justify_center()
                     .rounded(px(8.0))
                     .cursor_pointer()
-                    // zeron terminal-panel.tsx icon buttons: `transition-colors`.
+                    // clyra terminal-panel.tsx icon buttons: `transition-colors`.
                     .bg(motion::hover_blend(
                         "term-new-tab",
                         gpui::transparent_black(),
@@ -1628,7 +1628,7 @@ impl TerminalPanel {
                             .text_color(theme.text_muted.opacity(0.6)),
                     ),
             )
-            // Collapse chevron pinned right (zeron "Hide terminal" ⌘J).
+            // Collapse chevron pinned right (clyra "Hide terminal" ⌘J).
             .child(div().flex_1())
             .child(
                 div()

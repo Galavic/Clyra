@@ -1,7 +1,7 @@
-//! The app shell (zeron `__root.tsx`): sidebar column + main panel + optional
+//! The app shell (clyra `__root.tsx`): sidebar column + main panel + optional
 //! right "Changes" pane, plus the boot splash and the connection gate.
 //!
-//! Layout is zeron's: collapsible drag-resizable sidebar (224–400px, default
+//! Layout is clyra's: collapsible drag-resizable sidebar (224–400px, default
 //! 256) with a 200ms ease-out width transition; main panel with an h-11 header,
 //! content outlet, and a reserved h-6 status strip so later content never
 //! shifts; right pane scaffold (360px floor, default 520), hidden by default.
@@ -22,10 +22,10 @@ use gpui::{
     WindowControlArea, actions, div, prelude::*, px,
 };
 
+use clyra_engine::InstanceLock;
+use clyra_proto::{AuthState, WorkspaceScope};
+use clyra_rpc::methods;
 use gpui_tokio::Tokio;
-use zeron_engine::InstanceLock;
-use zeron_proto::{AuthState, WorkspaceScope};
-use zeron_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
@@ -187,6 +187,17 @@ const PANE_RESIZE_HITBOX_TOP: f32 = Theme::TITLEBAR_HEIGHT;
 /// Chrome layers that paint full-bleed at a window edge round their own
 /// backgrounds with it — see [`Shell::window_corner_radius`].
 pub(crate) const LINUX_WINDOW_CORNER_RADIUS: f32 = 10.0;
+/// Height of the pane header row docked at the top of the right pane, below
+/// the navbar: surface tabs + expand + explorer toggles on 24-28px controls
+/// with a little air.
+const PANE_HEADER_HEIGHT: f32 = 32.0;
+/// Rounded joint where the chat panel meets the sidebar (reference: Codex
+/// app — a single curve on the panel's top-left corner, everything else
+/// flush edge to edge). The panel starts below the titlebar strip; the
+/// sidebar tone shows through the rounded cutout.
+pub(crate) const CHAT_CORNER_RADIUS: f32 = 12.0;
+/// Breathing room so transcript text never kisses the rounded corner.
+pub(crate) const CHAT_CORNER_INSET: f32 = 8.0;
 const TERMINAL_RESIZE_HITBOX_HEIGHT: f32 = 10.0;
 
 fn stable_panel_content_width(target: f32, transition: Option<(f32, f32)>) -> f32 {
@@ -224,7 +235,7 @@ pub struct JumpSession(pub usize);
 // ---------------------------------------------------------------------------
 
 /// Where the top-left window-control cluster starts, in px from the window's
-/// left edge (zeron window-controls.tsx: `left: fullscreen ? 12 : 88`). The
+/// left edge (clyra window-controls.tsx: `left: fullscreen ? 12 : 88`). The
 /// frameless hiddenInset chrome puts the macOS traffic lights at {14,15};
 /// fullscreen hides them and the cluster reclaims the inset.
 pub fn titlebar_cluster_start(fullscreen: bool) -> f32 {
@@ -273,7 +284,7 @@ pub fn caption_buttons_width(count: usize) -> f32 {
 }
 
 /// Where the cluster's first button starts, from the window's left edge.
-/// `linux_left_captions` is the number of caption buttons zeron draws at the
+/// `linux_left_captions` is the number of caption buttons clyra draws at the
 /// top-left on Linux (GNOME `close:…` layouts) — the app cluster follows them
 /// at the shared 2px rhythm.
 pub fn cluster_buttons_start(is_macos: bool, fullscreen: bool, linux_left_captions: usize) -> f32 {
@@ -320,7 +331,7 @@ pub fn apply_keymap(
     cx.clear_key_bindings();
     // `clear_key_bindings` also removes the contextual editing actions that
     // gpui-base installed at startup. Reinitialize the component layer before
-    // rebuilding Zeron's bindings so the file editor keymap remains active.
+    // rebuilding Clyra's bindings so the file editor keymap remains active.
     gpui_base::init(cx);
     crate::composer::init(cx, composer_send_behavior);
     // Fixed app-level shortcuts (Settings on every platform; ⌘Q quit, ⌘W
@@ -425,13 +436,16 @@ pub enum SettingsSection {
     Shortcuts,
     Appshots,
     Archived,
+    /// Usage charts: activity, prompts over time, by hour, per agent.
+    Analytics,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 9] = [
+    pub const ALL: [SettingsSection; 10] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
+        SettingsSection::Analytics,
         SettingsSection::Appearance,
         SettingsSection::Files,
         SettingsSection::Notifications,
@@ -440,7 +454,7 @@ impl SettingsSection {
         SettingsSection::Archived,
     ];
 
-    /// Sidebar + header label (zeron settings-sidebar.tsx SECTIONS / __root.tsx
+    /// Sidebar + header label (clyra settings-sidebar.tsx SECTIONS / __root.tsx
     /// `settingsTitle` — the same strings in both places).
     pub fn label(self) -> &'static str {
         match self {
@@ -453,8 +467,28 @@ impl SettingsSection {
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Appshots => "Appshots",
             SettingsSection::Archived => "Archived sessions",
+            SettingsSection::Analytics => "Analytics",
         }
     }
+
+    /// Nav row + page header glyph.
+    pub fn icon(self) -> &'static str {
+        match self {
+            SettingsSection::Devices => icons::LAPTOP,
+            SettingsSection::Harnesses => icons::BOT,
+            SettingsSection::Agents => icons::KEY_MINIMALISTIC,
+            SettingsSection::Appearance => icons::PALETTE_SEARCH,
+            SettingsSection::Files => icons::FOLDER,
+            SettingsSection::Notifications => icons::BELL,
+            SettingsSection::Shortcuts => icons::KEYBOARD,
+            SettingsSection::Appshots => icons::FILE_IMAGE,
+            SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
+            SettingsSection::Analytics => icons::CHART_COLUMN,
+        }
+    }
+
+    /// Where Settings opens: the first nav row.
+    pub const DEFAULT: SettingsSection = SettingsSection::Devices;
 }
 
 /// What the main outlet shows.
@@ -462,6 +496,12 @@ impl SettingsSection {
 pub enum Route {
     Chat,
     Settings(SettingsSection),
+    /// The automations list — a destination of its own, not a settings page:
+    /// it is where runs start, so it belongs next to the sessions.
+    Automations,
+    /// Equipos / ADE — multi-agent teams (Líder, Backend, Frontend,
+    /// Programador). Config destination next to sessions, like Automations.
+    Teams,
 }
 
 /// Maximum width the right pane may occupy while retaining the conversation
@@ -507,7 +547,7 @@ fn workspace_file_title(path: &str) -> SharedString {
     path.rsplit('/').next().unwrap_or(path).to_string().into()
 }
 
-/// Per-chat panel open flags (zeron parity: `sessionPanels` — the terminal and
+/// Per-chat panel open flags (clyra parity: `sessionPanels` — the terminal and
 /// changes panels open *per session*, in memory only; heights and every other
 /// persisted setting stay global).
 ///
@@ -560,17 +600,19 @@ impl SessionPanels {
     }
 }
 
-/// One route-history entry (zeron parity: the renderer's TanStack memory
+/// One route-history entry (clyra parity: the renderer's TanStack memory
 /// history — every route the user visited, browser-style).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavEntry {
     /// A chat route; the id of the selected chat ("" = the new-chat canvas).
     Chat(String),
     Settings(SettingsSection),
+    Automations,
+    Teams,
 }
 
 /// Browser-style navigation history for the titlebar back/forward buttons
-/// (zeron window-controls.tsx semantics): every route change pushes an entry;
+/// (clyra window-controls.tsx semantics): every route change pushes an entry;
 /// Back/Forward walk the stack without changing it; pushing while behind the
 /// tip truncates the entries ahead (a new branch, exactly like a browser).
 #[derive(Debug)]
@@ -604,7 +646,7 @@ impl NavHistory {
     }
 
     /// Swap the current entry in place without growing the stack — the native
-    /// equivalent of a `replace: true` navigation (zeron's boot redirect from
+    /// equivalent of a `replace: true` navigation (clyra's boot redirect from
     /// `/` into the last-used chat leaves no dead Back target behind).
     pub fn replace(&mut self, entry: NavEntry) {
         self.entries[self.index] = entry;
@@ -615,7 +657,7 @@ impl NavHistory {
     }
 
     /// Memory history keeps every entry, so "behind the last entry" is exactly
-    /// "can go forward" (zeron window-controls.tsx).
+    /// "can go forward" (clyra window-controls.tsx).
     pub fn can_forward(&self) -> bool {
         self.index + 1 < self.entries.len()
     }
@@ -686,7 +728,7 @@ fn sidebar_key_order_changed(old: &[(String, f32)], new: &[(String, f32)]) -> bo
             .any(|((old_key, _), (new_key, _))| old_key != new_key)
 }
 
-/// Exact active-session row height. Harness identity lives on the title line
+/// Exact active-session row height. The agent identity lives on the title line
 /// and the Working glyph lives in the status corner, so neither adds a third
 /// line. Compact rows omit the metadata line and its preceding gap entirely;
 /// branch / pull-request rows add the exact height of their tallest child.
@@ -706,11 +748,11 @@ pub(super) fn chat_row_height(shows_branch: bool, shows_pull_request: bool) -> f
         47.0 + metadata_height
     }
 }
-fn sidebar_row_height(compact: bool, show_label: bool, branch: bool, pr: bool) -> f32 {
+fn sidebar_row_height(compact: bool, identity_line: bool, branch: bool, pr: bool) -> f32 {
     if compact {
         29.0
     } else {
-        chat_row_height(branch, pr) - if show_label { 0.0 } else { 16.0 }
+        chat_row_height(branch, pr) - if identity_line { 0.0 } else { 16.0 }
     }
 }
 
@@ -994,10 +1036,11 @@ impl WidthTween {
 }
 
 fn titlebar_island_vertical_geometry(progress: f32) -> (f32, f32) {
-    // Match the padded flex row's center, not the raw titlebar center.
-    // Keep the native 24px controls untouched and give them 4px of air.
+    // Match the centered flex row: content sits at the raw titlebar center
+    // now that rows pad symmetrically. Keep the native 24px controls
+    // untouched and give them 4px of air.
     let height = 28.0 + 4.0 * progress.clamp(0.0, 1.0);
-    let center = (Theme::TITLEBAR_HEIGHT + Theme::TITLEBAR_TOP_PAD) * 0.5;
+    let center = Theme::TITLEBAR_HEIGHT * 0.5;
     (center - height * 0.5, height)
 }
 
@@ -1436,7 +1479,11 @@ impl Render for SidebarPane {
             let theme = Theme::of(cx).clone();
             match shell.route {
                 Route::Settings(section) => shell.render_settings_nav(section, &theme, cx),
-                Route::Chat => shell.render_chat_sidebar(&theme, cx),
+                // The session list stays: automations and teams are
+                // destinations you reach from it.
+                Route::Chat | Route::Automations | Route::Teams => {
+                    shell.render_chat_sidebar(&theme, cx)
+                }
             }
         });
         div().size_full().child(inner).into_any_element()
@@ -1456,6 +1503,10 @@ pub struct Shell {
     sidebar_pane: Entity<SidebarPane>,
     transcript: Entity<Transcript>,
     composer: Entity<Composer>,
+    /// Provider account quota item in the status strip (its own entity: it
+    /// owns a poll timer and a probe in flight, which the shell render must
+    /// not carry).
+    account_usage: Entity<crate::account_usage::AccountUsage>,
     /// Measured height of the bottom chrome stack (status strip + composer +
     /// terminal dock) the full-height transcript scrolls under. Paint-time
     /// measurement schedules another frame whenever this value changes.
@@ -1540,6 +1591,12 @@ pub struct Shell {
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
+    analytics_page: Option<Entity<crate::settings::analytics::AnalyticsPage>>,
+    /// Lazy: no entity (and no list call) until the destination is opened.
+    automations_page: Option<Entity<crate::automations::AutomationsPage>>,
+    /// Equipos / ADE page — lazy like automations.
+    teams_page: Option<Entity<crate::teams::TeamsPage>>,
+    teams_sub: Option<Subscription>,
     notifications_page: Option<Entity<NotificationsPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
@@ -1617,7 +1674,7 @@ pub struct Shell {
     update_dismissed: Option<String>,
     /// How this binary was installed — decides the strip's click behavior.
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
-    install: zeron_update::InstallKind,
+    install: clyra_update::InstallKind,
     org: Option<OrgGateUi>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
@@ -1695,7 +1752,7 @@ pub struct Shell {
     /// Armed by mouse-down on a titlebar strip; the next mouse-move hands the
     /// drag to the compositor (zed's platform-titlebar pattern).
     titlebar_should_move: bool,
-    /// The caption buttons zeron itself draws on Linux under client-side
+    /// The caption buttons clyra itself draws on Linux under client-side
     /// decorations, per side, already filtered to what the compositor
     /// supports — `None` off Linux or under server decorations (where the WM
     /// draws real buttons). Re-resolved every frame at the top of `render`.
@@ -1749,6 +1806,15 @@ impl Shell {
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         transcript.update(cx, |transcript, _| transcript.retain_for_route_exit());
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        // The strip's quota item reports on the provider the composer will
+        // run, so it borrows the composer's pickers for the effective harness.
+        let account_usage = cx.new(|cx| {
+            crate::account_usage::AccountUsage::new(
+                state.clone(),
+                composer.read(cx).pickers.clone(),
+                cx,
+            )
+        });
         let links = Self::session_links(None, cx);
         transcript.update(cx, |transcript, _| {
             transcript.set_workspace_link_handler(links)
@@ -1817,8 +1883,8 @@ impl Shell {
                             // same per-second refresh while degraded.
                             || matches!(
                                 s.connectivity.state,
-                                zeron_proto::ConnectivityState::Offline
-                                    | zeron_proto::ConnectivityState::Reconnecting
+                                clyra_proto::ConnectivityState::Offline
+                                    | clyra_proto::ConnectivityState::Reconnecting
                             )
                     };
                     // Relative sidebar times still advance when unchanged
@@ -1855,6 +1921,9 @@ impl Shell {
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/appshots") => Route::Settings(SettingsSection::Appshots),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
+            Some("settings/analytics") => Route::Settings(SettingsSection::Analytics),
+            Some("automations") => Route::Automations,
+            Some("teams") | Some("ade") | Some("equipos") => Route::Teams,
             // `new` pins the new-chat canvas (suppresses boot auto-select).
             Some("new") => {
                 state.update(cx, |s, _| s.auto_selected = true);
@@ -1876,13 +1945,15 @@ impl Shell {
             Some("signin") => Some(GatePhase::SignIn),
             Some("org") => Some(GatePhase::OrgGate),
             Some("failed") => Some(GatePhase::Failed(
-                "Could not reach the zeron engine on port 27901".into(),
+                "Could not reach the clyra engine on port 27901".into(),
             )),
             _ => None,
         };
         let nav = NavHistory::new(match route {
             Route::Chat => NavEntry::Chat(String::new()),
             Route::Settings(section) => NavEntry::Settings(section),
+            Route::Automations => NavEntry::Automations,
+            Route::Teams => NavEntry::Teams,
         });
         // Parent notifications carry presentation changes (session status,
         // elapsed labels, menus); sibling animation/caret ticks do not.
@@ -1899,6 +1970,7 @@ impl Shell {
             sidebar_pane,
             transcript,
             composer,
+            account_usage,
             // Seed with the compact composer stack's rough height so the
             // first frame's clearance isn't zero (the measure corrects it).
             bottom_stack: std::rc::Rc::new(std::cell::Cell::new(120.0)),
@@ -1944,6 +2016,10 @@ impl Shell {
             archived_page: None,
             appearance_page: None,
             files_settings_page: None,
+            analytics_page: None,
+            automations_page: None,
+            teams_page: None,
+            teams_sub: None,
             notifications_page: None,
             shortcuts_page: None,
             accounts_page: None,
@@ -1991,7 +2067,7 @@ impl Shell {
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,
-            install: zeron_update::detect_install(),
+            install: clyra_update::detect_install(),
             org: None,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
@@ -2194,10 +2270,10 @@ impl Shell {
                     "Here is the screenshot of the bug.",
                     std::slice::from_ref(&pending_path),
                 );
-                let echo = zeron_doc::SessionMessageEntry {
+                let echo = clyra_doc::SessionMessageEntry {
                     id: "demo-upload-echo".into(),
-                    role: zeron_doc::MessageRole::User,
-                    parts: vec![zeron_doc::MessagePart::Text {
+                    role: clyra_doc::MessageRole::User,
+                    parts: vec![clyra_doc::MessagePart::Text {
                         id: "t0".into(),
                         text,
                     }],
@@ -2253,9 +2329,9 @@ impl Shell {
                 )
             };
             // Background-only banners: `active_window()` is app-level (any
-            // Zeron window being key), so a ping for a *background chat* in a
+            // Clyra window being key), so a ping for a *background chat* in a
             // focused app still stays a chime — you're already looking at
-            // Zeron; the sidebar dot carries the rest.
+            // Clyra; the sidebar dot carries the rest.
             let app_focused = cx.active_window().is_some();
             for (chat_id, status, send_pending, title) in sessions {
                 let prev = self.sound_prev.insert(chat_id.clone(), status.clone());
@@ -2300,8 +2376,8 @@ impl Shell {
                     && !(self.settings.notifications_background_only && app_focused)
                 {
                     let body = match connectivity {
-                        zeron_proto::ConnectivityState::Offline => "Your device is offline",
-                        _ => "Zeron is trying to reconnect",
+                        clyra_proto::ConnectivityState::Offline => "Your device is offline",
+                        _ => "Clyra is trying to reconnect",
                     };
                     crate::notify::post("Connection unavailable", body, None);
                 }
@@ -2375,7 +2451,7 @@ impl Shell {
             self.active_chat = selected;
             // Route history: a chat switch is a navigation. The very first
             // selection off the untouched boot canvas REPLACES that entry —
-            // zeron's `/` route redirected into the last-used chat, leaving no
+            // clyra's `/` route redirected into the last-used chat, leaving no
             // dead Back target. Walking history lands here too, but the
             // destination already equals `current()`, so the push dedups.
             if matches!(self.route, Route::Chat) {
@@ -2460,13 +2536,37 @@ impl Shell {
         }
     }
 
+    /// The new-session canvas has no chat, so its surfaces read the picked
+    /// project instead — the checkout the session is about to be minted into.
+    /// `None` for a deliberately project-less canvas ("Don't work in a
+    /// project"), which has no repository to read: there the right pane stays
+    /// shut rather than opening onto nothing.
+    fn canvas_diff_scope(&self, cx: &App) -> Option<crate::changes::SpaceDiffScope> {
+        if !self.active_chat.is_empty() {
+            return None;
+        }
+        let state = self.state.read(cx);
+        let space = state.selected_space_row()?;
+        Some(crate::changes::SpaceDiffScope {
+            space_id: space.id.clone(),
+            cwd: space.path.clone(),
+            device_id: space.device_id.clone(),
+        })
+    }
+
+    /// Whether the surface host has something to host. A chat always does; the
+    /// canvas does once a project is picked, which is what makes "check the
+    /// unstaged changes before I start" possible without a session.
+    fn right_pane_hostable(&self, cx: &App) -> bool {
+        !self.active_chat.is_empty() || self.canvas_diff_scope(cx).is_some()
+    }
+
     /// Whether the right pane shows. NOT gated on git any more: the pane is
     /// a surface HOST now (terminals work in any space), so only the Git
-    /// surface rows check `space_git_detected`. Still hidden on the
-    /// new-session canvas, where the titlebar carries no toggle to close it
-    /// again (an earlier user request).
+    /// surface rows check `space_git_detected`. The new-session canvas hosts
+    /// surfaces too, scoped to the picked project.
     fn right_pane_open(&self, cx: &App) -> bool {
-        !self.active_chat.is_empty() && self.panels.get(&self.panel_key(cx)).changes_open
+        self.right_pane_hostable(cx) && self.panels.get(&self.panel_key(cx)).changes_open
     }
 
     /// The current chat's terminal flag (per-session, in-memory).
@@ -2511,8 +2611,21 @@ impl Shell {
     /// surface host portion of the right pane: with just the explorer docked
     /// it opens the surface host beside it, and it never hides the explorer —
     /// only the explorer's own toggle undocks that portion.
+    ///
+    /// On the new-session canvas there are no surfaces yet, so opening one
+    /// lands on the picked project's working tree: the canvas toggle is the
+    /// "let me see what's uncommitted" gesture, and an empty surface picker in
+    /// its place would be a second click for the same answer.
     fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
-        self.set_surfaces_open(!self.right_pane_open(cx), cx);
+        let opening = !self.right_pane_open(cx);
+        if opening && self.canvas_diff_scope(cx).is_some() {
+            let key = self.panel_key(cx);
+            if self.right_tabs.get(&key).is_none_or(Vec::is_empty) {
+                self.add_diff_surface(cx);
+                return;
+            }
+        }
+        self.set_surfaces_open(opening, cx);
     }
 
     /// Closing the last surface tab closes the surface host; a docked
@@ -2529,7 +2642,7 @@ impl Shell {
     /// already in the requested state, so programmatic opens (a file, a
     /// browser link, a subagent chip) never close a pane the user has open.
     fn set_surfaces_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        if self.active_chat.is_empty() || self.right_pane_open(cx) == open {
+        if !self.right_pane_hostable(cx) || self.right_pane_open(cx) == open {
             return;
         }
         // Reverse from the visible width when toggled during an animation.
@@ -2885,7 +2998,7 @@ impl Shell {
         }
         let mut resolved = activation.clone();
         if resolved.action == LinkAction::Primary {
-            resolved.action = if crate::settings::current(cx).open_web_links_in_zeron {
+            resolved.action = if crate::settings::current(cx).open_web_links_in_clyra {
                 LinkAction::Internal
             } else {
                 LinkAction::External
@@ -2964,6 +3077,15 @@ impl Shell {
     /// FRESH diff tab with its own scope/base selection (multiple diff
     /// panels, user request).
     fn add_diff_surface(&mut self, cx: &mut Context<Self>) {
+        // On the canvas the pane's whole point is "what is uncommitted in the
+        // project I am about to work in", so it opens straight onto that
+        // project's working tree instead of the chat-resolved one.
+        if let Some(scope) = self.canvas_diff_scope(cx) {
+            let changes = cx.new(|cx| Changes::for_space(self.state.clone(), scope, cx));
+            self.set_surfaces_open(true, cx);
+            self.register_diff_surface(changes, cx);
+            return;
+        }
         let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
         self.register_diff_surface(changes, cx);
     }
@@ -3119,7 +3241,7 @@ impl Shell {
     /// (user request).
     fn add_commit_diff_surface(
         &mut self,
-        commit: zeron_proto::GitHistoryCommit,
+        commit: clyra_proto::GitHistoryCommit,
         cx: &mut Context<Self>,
     ) {
         let changes = cx.new(|cx| Changes::for_commit(self.state.clone(), commit, cx));
@@ -3184,6 +3306,18 @@ impl Shell {
                     *frozen,
                     cx,
                 );
+            }
+            TranscriptEvent::ReviewChanges { latest_turn } => {
+                // The card lives in the conversation column — the pane it
+                // opens into may still be closed.
+                self.set_surfaces_open(true, cx);
+                let state = self.state.clone();
+                let changes = if *latest_turn {
+                    cx.new(|cx| Changes::for_latest_turn(state, cx))
+                } else {
+                    cx.new(|cx| Changes::new(state, cx))
+                };
+                self.register_diff_surface(changes, cx);
             }
         }
     }
@@ -3277,17 +3411,17 @@ impl Shell {
                 .background_executor()
                 .spawn(async move {
                     let value = reply.ok()?;
-                    let entries: Vec<zeron_doc::SessionMessageEntry> =
+                    let entries: Vec<clyra_doc::SessionMessageEntry> =
                         serde_json::from_str(value.get("text")?.as_str()?).ok()?;
-                    let update = zeron_doc::TranscriptUpdate {
-                        replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&entries)),
-                        frame: zeron_doc::TranscriptFrame::Reset { reset: entries },
+                    let update = clyra_doc::TranscriptUpdate {
+                        replay_baseline: Some(clyra_doc::TranscriptBaseline::capture(&entries)),
+                        frame: clyra_doc::TranscriptFrame::Reset { reset: entries },
                         context_usage: None,
                     };
                     let prepared = crate::transcript::TranscriptPreparation::default()
                         .prepare(&update)
                         .ok()?;
-                    let zeron_doc::TranscriptFrame::Reset { reset } = update.frame else {
+                    let clyra_doc::TranscriptFrame::Reset { reset } = update.frame else {
                         unreachable!()
                     };
                     Some((reset, prepared))
@@ -3418,7 +3552,7 @@ impl Shell {
 
     /// The right pane's closable surface for the `⌘W` cascade: the resolved
     /// active surface while the pane is open, or `None` on the picker empty
-    /// state / a closed pane / the new-session canvas.
+    /// state / a closed pane.
     fn closable_right_surface(&self, cx: &App) -> Option<RightSurface> {
         if !self.right_pane_open(cx) {
             return None;
@@ -3529,7 +3663,7 @@ impl Shell {
 
     /// Cmd/Ctrl+J and the header button (feature-inventory §1.10). Height
     /// animates 200 ms; closing detaches (PTYs stay alive), opening restores.
-    /// The flag is per chat (zeron `sessionPanels`).
+    /// The flag is per chat (clyra `sessionPanels`).
     fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let from = self.terminal_target(cx);
         let key = self.panel_key(cx);
@@ -3542,7 +3676,7 @@ impl Shell {
                 .update(cx, |composer, _| composer.focus_pending = false);
             panel.update(cx, |panel, cx| panel.request_focus(cx));
             // Opening lands keyboard focus IN the shell — typing goes straight
-            // to the prompt, no click needed (zeron terminal-panel.tsx: the
+            // to the prompt, no click needed (clyra terminal-panel.tsx: the
             // visible+active effect calls `terminal.focus()` on every open).
             // The handle is focusable before the panel's first paint; once the
             // terminal body mounts with `track_focus` it receives the keys.
@@ -3551,7 +3685,7 @@ impl Shell {
             // Hiding the panel removes the (likely focused) terminal view;
             // with nothing focused, window key bindings stop dispatching, so
             // hand focus to the composer. (Cmd+J is a pure toggle — a second
-            // press closes even while the terminal is focused, as in zeron's
+            // press closes even while the terminal is focused, as in clyra's
             // `useHotkey(toggleShortcut, ... setOpenScoped(!open))`.)
             window.focus(&self.composer.focus_handle(cx), cx);
         }
@@ -3717,7 +3851,7 @@ impl Shell {
         self.settings.window_geometry = current.window_geometry;
         self.settings.new_thread_composer_background = current.new_thread_composer_background;
         self.settings.new_thread_background_effect = current.new_thread_background_effect;
-        self.settings.open_web_links_in_zeron = current.open_web_links_in_zeron;
+        self.settings.open_web_links_in_clyra = current.open_web_links_in_clyra;
         self.settings.ui_font_family = current.ui_font_family;
         self.settings.ui_font_size = current.ui_font_size;
         self.settings.terminal_font_family = current.terminal_font_family;
@@ -3725,6 +3859,8 @@ impl Shell {
         self.settings.code_font_family = current.code_font_family;
         self.settings.code_font_size = current.code_font_size;
         self.settings.transcript_width = current.transcript_width;
+        self.settings.sidebar_opacity = current.sidebar_opacity;
+        self.settings.chat_opacity = current.chat_opacity;
         self.settings.skill_completion_by_harness = current.skill_completion_by_harness;
         self.settings.skills_in_slash_menu = current.skills_in_slash_menu;
     }
@@ -3758,7 +3894,7 @@ impl Shell {
         }
     }
 
-    fn copy_zeron_conversation_link(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+    fn copy_clyra_conversation_link(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         let link = {
             let state = self.state.read(cx);
             crate::links::workspace_locator(
@@ -3766,11 +3902,11 @@ impl Shell {
                 state.auth.as_ref(),
                 state.local_device_id.as_deref(),
             )
-            .map(|workspace| crate::links::zeron_conversation_link(chat_id, &workspace))
+            .map(|workspace| crate::links::clyra_conversation_link(chat_id, &workspace))
         };
         if let Some(link) = link {
             cx.write_to_clipboard(ClipboardItem::new_string(link));
-            self.sidebar_notice = Some("Zeron conversation link copied".into());
+            self.sidebar_notice = Some("Clyra conversation link copied".into());
         } else {
             self.sidebar_notice = Some("Conversation link is not ready yet".into());
         }
@@ -3806,6 +3942,29 @@ impl Shell {
             cx.write_to_clipboard(ClipboardItem::new_string(id));
             self.sidebar_notice = Some("Harness session ID copied".into());
         }
+        self.close_chat_menu(cx);
+        cx.notify();
+    }
+
+    /// Enter the automations destination. The page is created on the way in
+    /// (its first list is the point of arriving), and the nav entry is what
+    /// the titlebar back arrow walks.
+    fn open_automations(&mut self, cx: &mut Context<Self>) {
+        self.command_palette = None;
+        self.route = Route::Automations;
+        self.nav.push(NavEntry::Automations);
+        self.close_user_menu(cx);
+        self.close_chat_menu(cx);
+        cx.notify();
+    }
+
+    /// Enter the Equipos / ADE destination (sidebar button). Same pattern as
+    /// automations: lazy page, nav entry for back/forward.
+    fn open_teams(&mut self, cx: &mut Context<Self>) {
+        self.command_palette = None;
+        self.route = Route::Teams;
+        self.nav.push(NavEntry::Teams);
+        self.close_user_menu(cx);
         self.close_chat_menu(cx);
         cx.notify();
     }
@@ -3871,6 +4030,22 @@ impl Shell {
                     page.update(cx, |page, cx| page.load_completion_harnesses(cx));
                 }
                 self.route = Route::Settings(section);
+            }
+            NavEntry::Automations => {
+                // Re-probed on every arrival: a schedule may have fired, or a
+                // run may have finished, since the last visit.
+                self.route = Route::Automations;
+                if let Some(page) = &self.automations_page {
+                    page.update(cx, |page, cx| page.load(cx));
+                }
+            }
+            NavEntry::Teams => {
+                // Re-probed on every arrival: a run may have started or
+                // finished since the last visit.
+                self.route = Route::Teams;
+                if let Some(page) = &self.teams_page {
+                    page.update(cx, |page, cx| page.reload(cx));
+                }
             }
         }
         self.close_user_menu(cx);
@@ -4108,6 +4283,13 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::Analytics => {
+                let page = self.analytics_page.get_or_insert_with(|| {
+                    let state = self.state.clone();
+                    cx.new(|cx| crate::settings::analytics::AnalyticsPage::new(state, cx))
+                });
+                page.clone().into_any_element()
+            }
         }
     }
 
@@ -4264,7 +4446,7 @@ impl Shell {
             Err("Pins are still syncing")
         } else {
             let current = self.active_sidebar_pins(cx);
-            zeron_proto::validate_sidebar_pin_update(&current, pins)
+            clyra_proto::validate_sidebar_pin_update(&current, pins)
         };
         if let Err(message) = result {
             self.sidebar_notice = Some(message.into());
@@ -4277,7 +4459,7 @@ impl Shell {
     fn apply_sidebar_pin_change(
         &mut self,
         profile_key: String,
-        change: zeron_proto::SidebarPinChange,
+        change: clyra_proto::SidebarPinChange,
         cx: &mut Context<Self>,
     ) -> bool {
         let mut pinned_session_ids = self.raw_sidebar_pins(cx);
@@ -4333,13 +4515,13 @@ impl Shell {
             return;
         }
         let change = if pinned {
-            zeron_proto::SidebarPinChange::Pin {
+            clyra_proto::SidebarPinChange::Pin {
                 session_id: chat_id.clone(),
                 after: pins.last().cloned(),
                 before: None,
             }
         } else {
-            zeron_proto::SidebarPinChange::Unpin {
+            clyra_proto::SidebarPinChange::Unpin {
                 session_id: chat_id.clone(),
             }
         };
@@ -4858,7 +5040,7 @@ impl Shell {
                     },
                     Err(err) => {
                         shell.runtime_change_error = Some(format!(
-                            "Could not stop the remote engine: {err}. Run `zeron daemon stop`, then quit and reopen Zeron."
+                            "Could not stop the remote engine: {err}. Run `clyra daemon stop`, then quit and reopen Clyra."
                         ).into());
                         cx.notify();
                     }
@@ -5157,11 +5339,11 @@ impl Shell {
     }
 
     /// The header's content row with the animated left inset — the native port
-    /// of zeron __root.tsx `transition-[padding-left] duration-200 ease-out` +
+    /// of clyra __root.tsx `transition-[padding-left] duration-200 ease-out` +
     /// `style={{ paddingLeft: headerInset }}`: on sidebar toggles (and macOS
     /// fullscreen flips) the SAME element's padding tweens, so the title
     /// glides to its new x-position. Route changes SNAP: the tween is killed
-    /// by every route transition (zeron remounts the keyed header variants —
+    /// by every route transition (clyra remounts the keyed header variants —
     /// instant swap, zero horizontal motion).
     /// Where unified-titlebar content (tabs / the settings label) starts: past
     /// the traffic lights + control cluster, riding the fullscreen inset tween.
@@ -5181,23 +5363,32 @@ impl Shell {
     fn render_title_bar(&mut self, viewport_height: Pixels, cx: &mut Context<Self>) -> AnyElement {
         match self.route {
             Route::Chat => self.render_session_title_bar(viewport_height, cx),
-            Route::Settings(_) => {
+            // Settings, Automations and Teams share the bare drag strip: the
+            // page's own header carries the label.
+            Route::Settings(_) | Route::Automations | Route::Teams => {
                 let inner = div()
                     .size_full()
                     .flex()
                     .items_center()
                     .pt(px(Theme::TITLEBAR_TOP_PAD))
+                    .pb(px(Theme::TITLEBAR_TOP_PAD))
                     .pl(px(self.title_bar_content_start()))
                     .pr(px(self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET)));
                 let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
-                self.titlebar_drag_region("settings-header-titlebar", bar, cx)
-                    .into_any_element()
+                let id = if matches!(self.route, Route::Automations) {
+                    "automations-header-titlebar"
+                } else if matches!(self.route, Route::Teams) {
+                    "teams-header-titlebar"
+                } else {
+                    "settings-header-titlebar"
+                };
+                self.titlebar_drag_region(id, bar, cx).into_any_element()
             }
         }
     }
 
     /// Make a titlebar strip drag the window — zed's platform-titlebar
-    /// pattern (zeron's `.drag` region): mark it a [`WindowControlArea::Drag`]
+    /// pattern (clyra's `.drag` region): mark it a [`WindowControlArea::Drag`]
     /// (macOS app-owned titlebar), hand the drag to the compositor once the
     /// pointer moves with the button down, and double-click zooms.
     fn titlebar_drag_region(
@@ -5249,7 +5440,7 @@ impl Shell {
     }
 
     /// The ONE top-left window-control cluster (sidebar toggle + back/forward —
-    /// zeron window-controls.tsx): rendered once, in a paint-only overlay layer
+    /// clyra window-controls.tsx): rendered once, in a paint-only overlay layer
     /// pinned at the window's top-left, ABOVE the sidebar and headers. The
     /// sidebar width animates *beneath* it, so the buttons keep their element
     /// identity and never move or remount on collapse/expand; only the
@@ -5299,6 +5490,7 @@ impl Shell {
             .flex_row()
             .items_center()
             .pt(px(Theme::TITLEBAR_TOP_PAD))
+            .pb(px(Theme::TITLEBAR_TOP_PAD))
             .px(px(TITLEBAR_CLUSTER_PAD))
             .child(
                 div()
@@ -5382,7 +5574,7 @@ impl Shell {
         )
     }
 
-    /// Native Windows caption controls integrated into Zeron's unified
+    /// Native Windows caption controls integrated into Clyra's unified
     /// titlebar. `WindowControlArea` maps these hit targets to HTMINBUTTON,
     /// HTMAXBUTTON, and HTCLOSE, so Windows owns their behavior (including
     /// Snap Layouts) while GPUI renders the system Segoe caption glyphs.
@@ -5432,7 +5624,7 @@ impl Shell {
         )
     }
 
-    /// Which caption buttons zeron itself must draw on Linux: under
+    /// Which caption buttons clyra itself must draw on Linux: under
     /// client-side decorations (the Wayland default) nobody else will —
     /// without these the window has NO minimize/maximize/close at all.
     /// Server-side decorations (X11 WMs, KDE with SSD) already draw real
@@ -5493,7 +5685,7 @@ impl Shell {
     }
 
     /// Right padding titlebar content needs to clear the platform's caption
-    /// controls (native Windows cluster / zeron-drawn Linux buttons).
+    /// controls (native Windows cluster / clyra-drawn Linux buttons).
     pub(super) fn titlebar_right_pad(&self, base: f32) -> f32 {
         titlebar_right_padding(
             cfg!(target_os = "windows"),
@@ -5502,7 +5694,7 @@ impl Shell {
         )
     }
 
-    /// Zeron-drawn Linux caption controls, one overlay per populated side.
+    /// Clyra-drawn Linux caption controls, one overlay per populated side.
     /// Shell-level chrome like the Windows cluster: mounted at the root so
     /// they stay above the splash and every auth/org/error gate.
     fn render_linux_caption_controls(&self, window: &Window, cx: &App) -> Vec<AnyElement> {
@@ -5522,6 +5714,7 @@ impl Shell {
                 .flex_row()
                 .items_center()
                 .pt(px(Theme::TITLEBAR_TOP_PAD))
+                .pb(px(Theme::TITLEBAR_TOP_PAD))
                 .gap(px(2.0))
                 .px(px(10.0))
                 .children(buttons.iter().flatten().map(|button| {
@@ -5712,7 +5905,7 @@ impl Shell {
     }
 
     fn render_sidebar(&mut self, _cx: &mut Context<Self>) -> AnyElement {
-        // The sidebar is part of the resolved theme. A second fixed-Zeron
+        // The sidebar is part of the resolved theme. A second fixed-Clyra
         // palette here made imported families look split in half and froze
         // activity/glyph personality independently of the selected variant.
         let inner = self.sidebar_pane.clone().cached(
@@ -5734,7 +5927,7 @@ impl Shell {
             .into_any_element()
     }
 
-    /// Settings-mode sidebar (zeron settings-sidebar.tsx): window-control
+    /// Settings-mode sidebar (clyra settings-sidebar.tsx): window-control
     /// strip, "Settings" heading, icon section rows styled like session rows,
     /// and a Back row pinned to the bottom.
     fn render_settings_nav(
@@ -5753,6 +5946,7 @@ impl Shell {
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Appshots => icons::MONITOR,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
+            SettingsSection::Analytics => icons::CHART_COLUMN,
         };
         // Match the user's dragged sidebar width — the pane container clips to
         // it, so a hardcoded default here left hover washes stopping short of
@@ -5828,7 +6022,7 @@ impl Shell {
                         ),
                     ),
             )
-            // Back pinned to the bottom (zeron settings-sidebar.tsx).
+            // Back pinned to the bottom (clyra settings-sidebar.tsx).
             .child(
                 div().px(px(Theme::SPACE_SM)).pb(px(12.0)).child(
                     div()
@@ -5846,7 +6040,7 @@ impl Shell {
                         .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
                         .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
                         .child(
-                            // AltArrowLeft chevron (zeron settings-sidebar.tsx),
+                            // AltArrowLeft chevron (clyra settings-sidebar.tsx),
                             // not the straight history arrow.
                             icon(icons::ALT_ARROW_LEFT)
                                 .size(px(16.0))
@@ -5858,9 +6052,22 @@ impl Shell {
             .into_any_element()
     }
 
-    /// One session row: context + status on line one, harness + title on line
-    /// two, and source metadata below. Working uses the live thread glyph in
-    /// the status corner. Click selects; right-click opens the context menu.
+    /// A non-compact row carries an identity line (agent + activity corner) as
+    /// soon as it has an identity to show. This is a per-ROW question, not a
+    /// per-view one: a session with no config has no agent to name, and every
+    /// height computation has to ask it exactly as the renderer does or the list
+    /// reserves a line that never paints.
+    fn sidebar_row_identity_line(&self, chat: &clyra_proto::Chat) -> bool {
+        !self.settings.sidebar_compact
+            && (self.settings.sidebar_show_project_label
+                || (self.settings.sidebar_show_harness && chat.config.is_some()))
+    }
+
+    /// One session row, laid out the way a session card reads best: the agent
+    /// identity and the activity corner share line one, the title owns line two
+    /// on its own, and the branch / pull request sit on line three in the
+    /// repository's own mono. Working uses the live thread glyph in the corner.
+    /// Click selects; right-click opens the context menu.
     #[allow(clippy::too_many_arguments)]
     fn render_chat_row(
         &self,
@@ -5869,9 +6076,10 @@ impl Shell {
         time_ago: SharedString,
         space_name: SharedString,
         branch: Option<SharedString>,
-        change_request: Option<zeron_proto::ChangeRequestSummary>,
-        harness: Option<zeron_proto::HarnessId>,
-        status: zeron_proto::ChatIndicator,
+        change_request: Option<clyra_proto::ChangeRequestSummary>,
+        harness: Option<clyra_proto::HarnessId>,
+        model: Option<String>,
+        status: clyra_proto::ChatIndicator,
         selected: bool,
         archived: bool,
         preview: bool,
@@ -5900,6 +6108,18 @@ impl Shell {
         };
         let compact = search_query.is_none() && self.settings.sidebar_compact;
         let show_label = search_query.is_some() || self.settings.sidebar_show_project_label;
+        // Line one is the identity line: the model (or the agent behind it) on
+        // the left, the activity corner on the right. It exists whenever either
+        // identity is on — with both off there is nothing to put there and the
+        // corner rides the title line instead, which is the pre-existing
+        // two-line row.
+        let agent_name: Option<SharedString> = harness.map(|id| {
+            model
+                .filter(|model| !model.trim().is_empty())
+                .map(SharedString::from)
+                .unwrap_or_else(|| crate::pickers::harness_name(id).into())
+        });
+        let identity_line = !compact && (agent_name.is_some() || show_label);
         let remote = self
             .state
             .read(cx)
@@ -5946,16 +6166,16 @@ impl Shell {
             Some("Queued")
         } else {
             match status {
-                zeron_proto::ChatIndicator::Working => Some("Working"),
-                zeron_proto::ChatIndicator::AwaitingInput => Some("Input"),
-                zeron_proto::ChatIndicator::Errored => Some("Failed"),
-                zeron_proto::ChatIndicator::Completed => Some("Done"),
-                zeron_proto::ChatIndicator::Idle => None,
+                clyra_proto::ChatIndicator::Working => Some("Working"),
+                clyra_proto::ChatIndicator::AwaitingInput => Some("Input"),
+                clyra_proto::ChatIndicator::Errored => Some("Failed"),
+                clyra_proto::ChatIndicator::Completed => Some("Done"),
+                clyra_proto::ChatIndicator::Idle => None,
             }
         };
         let shows_metadata = branch.is_some() || change_request.is_some();
         let queued = queued && !undelivered;
-        let working = status == zeron_proto::ChatIndicator::Working && !queued && !undelivered;
+        let working = status == clyra_proto::ChatIndicator::Working && !queued && !undelivered;
         let compact_status = compact.then(|| {
             let glyph = if working {
                 loaders::mini_glyph_spinner(
@@ -5966,7 +6186,7 @@ impl Shell {
                     cx,
                 )
                 .into_any_element()
-            } else if status == zeron_proto::ChatIndicator::Completed && !queued && !undelivered {
+            } else if status == clyra_proto::ChatIndicator::Completed && !queued && !undelivered {
                 icon(icons::CHECK)
                     .size(px(11.0))
                     .text_color(status_color)
@@ -6001,14 +6221,18 @@ impl Shell {
             // rounded 4, borderless 0.08-fill with 0.85 text of one tone —
             // neutral here — and the label in the badge's mono at 10 MEDIUM.
             // Any other geometry reads as a second badge system on the row.
+            // Modifiers read faint, the key keeps the badge tone — the same
+            // split as the sidebar kbd chips.
             {
                 let tone = theme.text_muted;
+                let (mods, key) = Self::split_kbd_badge(&label.to_string());
                 div()
                     .h(px(16.0))
                     .flex_none()
                     .flex()
                     .flex_row()
                     .items_center()
+                    .gap(px(4.0))
                     .px(px(4.0))
                     .rounded(px(4.0))
                     .bg(tone.opacity(0.08))
@@ -6016,7 +6240,14 @@ impl Shell {
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(tone.opacity(0.85))
                     .font_family(theme.font_mono.clone())
-                    .child(label)
+                    .when(!mods.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(mods)),
+                        )
+                    })
+                    .child(SharedString::from(key))
                     .into_any_element()
             }
         } else if corner_hovered {
@@ -6075,7 +6306,7 @@ impl Shell {
                     // Glyph slot: Working wears the preset's animated pixel
                     // glyph beside its label, Done wears the check, and the
                     // remaining statuses use a compact dot.
-                    let glyph: AnyElement = if status == zeron_proto::ChatIndicator::Completed {
+                    let glyph: AnyElement = if status == clyra_proto::ChatIndicator::Completed {
                         icon(icons::CHECK)
                             .size(px(11.0))
                             .flex_none()
@@ -6176,7 +6407,7 @@ impl Shell {
         };
         let select_id = id.clone();
         let menu_id = id.clone();
-        // Hover fades over transition-colors (zeron session-row.tsx) — both
+        // Hover fades over transition-colors (clyra session-row.tsx) — both
         // the wash and the title brighten ride the same 150ms blend.
         let fade_key = format!("{row_id}-hover");
         let rest_bg = if selected {
@@ -6269,29 +6500,78 @@ impl Shell {
                     cx.new(|_| DragGhost)
                 })
             })
-            // Line 1: "project @ device", status word / time-ago right.
-            .when(!compact && show_label, |el| {
+            // Line 1: the agent identity, then the status / time corner. The
+            // project name trails the model rather than replacing it, so
+            // turning the project label on costs a dim word instead of a line.
+            .when(identity_line, |el| {
                 el.child(
                     div()
                         .w_full()
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(Theme::SPACE_SM))
+                        .gap(px(6.0))
                         .child(sidebar_faded_label(
-                            format!("chat-device-{content_id}").into(),
+                            format!("chat-agent-{content_id}").into(),
                             true,
                             div()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0))
                                 .text_size(crate::typography::ui_rems(11.0))
                                 .line_height(px(14.0))
                                 .text_color(subline)
-                                .child(popover::search_highlight(space_name, search_query, theme)),
+                                .when_some(agent_name.clone(), |row, name| {
+                                    row.when_some(
+                                        harness.map(crate::pickers::harness_brand_icon),
+                                        |row, (path, tint)| {
+                                            row.child(
+                                                icon(path)
+                                                    .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                                                    .flex_none()
+                                                    .text_color(tint.unwrap_or(subline).opacity(
+                                                        if archived_muted { 0.4 } else { 0.8 },
+                                                    )),
+                                            )
+                                        },
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w(px(0.0))
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .child(name),
+                                    )
+                                })
+                                .when(agent_name.is_some() && show_label, |row| {
+                                    row.child(
+                                        div()
+                                            .flex_none()
+                                            .text_color(theme.text_faint)
+                                            .child(SharedString::from("·")),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w(px(0.0))
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .text_color(subline)
+                                            .child(popover::search_highlight(
+                                                space_name.clone(),
+                                                search_query,
+                                                theme,
+                                            )),
+                                    )
+                                }),
                         ))
                         .child(div().text_color(subline).children(corner.take())),
                 )
             })
-            // Line 2: harness identity belongs directly with the title,
-            // instead of floating as unrelated metadata below it.
+            // Line 2: the title alone, and the heaviest thing on the card. The
+            // harness glyph moved up to line 1 with the name it belongs to, so
+            // nothing competes with the title here.
             .child(
                 div()
                     .w_full()
@@ -6304,33 +6584,37 @@ impl Shell {
                         SIDEBAR_ACTIVE_HARNESS_TITLE_GAP
                     }))
                     .children(compact_status)
-                    .when_some(
-                        harness.map(crate::pickers::harness_brand_icon),
-                        |el, (path, tint)| {
-                            el.child(
-                                icon(path)
-                                    .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
-                                    .flex_none()
-                                    .text_color(
-                                        tint.unwrap_or(subline).opacity(if archived_muted {
-                                            0.4
-                                        } else {
-                                            0.8
-                                        }),
-                                    ),
-                            )
-                        },
-                    )
+                    .when(compact, |el| {
+                        el.when_some(
+                            harness.map(crate::pickers::harness_brand_icon),
+                            |el, (path, tint)| {
+                                el.child(
+                                    icon(path)
+                                        .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                                        .flex_none()
+                                        .text_color(
+                                            tint.unwrap_or(subline).opacity(if archived_muted {
+                                                0.4
+                                            } else {
+                                                0.8
+                                            }),
+                                        ),
+                                )
+                            },
+                        )
+                    })
                     .children(project_icon)
                     .child(sidebar_faded_label(
                         format!("chat-title-{content_id}").into(),
                         true,
                         div()
+                            .min_w(px(0.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
                             .text_size(crate::typography::ui_rems(13.0))
                             .line_height(px(17.0))
                             .child(popover::search_highlight(title, search_query, theme)),
                     ))
-                    .when(!compact && !show_label && remote, |el| {
+                    .when(!compact && !identity_line && remote, |el| {
                         el.child(
                             icon(icons::REMOTE_SERVER)
                                 .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
@@ -6342,7 +6626,7 @@ impl Shell {
                         if compact {
                             remote || corner_hovered
                         } else {
-                            !show_label
+                            !identity_line
                         },
                         |el| {
                             el.child(
@@ -6373,8 +6657,36 @@ impl Shell {
                         }))
                     })
                     .when(compact, |el| {
-                        el.child(
-                            div()
+                        el.child(match compact_jump_label {
+                            // Jump hint in the time slot: two-tone mods + key
+                            // on one line (the fixed 30px time box would wrap
+                            // "Ctrl+1" in two), auto width only while held.
+                            Some(jump) => {
+                                let (mods, key) = Self::split_kbd_badge(&jump.to_string());
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_end()
+                                    .gap(px(3.0))
+                                    .text_size(crate::typography::ui_rems(11.0))
+                                    .when(!mods.is_empty(), |el| {
+                                        el.child(
+                                            div()
+                                                .text_color(theme.text_faint)
+                                                .child(SharedString::from(mods)),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(subline)
+                                            .child(SharedString::from(key)),
+                                    )
+                                    .into_any_element()
+                            }
+                            None => div()
                                 .debug_selector({
                                     let id = id.clone();
                                     move || format!("chat-time-{id}")
@@ -6384,8 +6696,9 @@ impl Shell {
                                 .text_right()
                                 .text_size(crate::typography::ui_rems(11.0))
                                 .text_color(subline)
-                                .child(compact_jump_label.unwrap_or(time_ago)),
-                        )
+                                .child(time_ago)
+                                .into_any_element(),
+                        })
                     }),
             )
             // Line 3 is structural, not reserved whitespace: compact states
@@ -6408,7 +6721,13 @@ impl Shell {
                             .child(sidebar_faded_label(
                                 format!("chat-branch-{content_id}").into(),
                                 false,
+                                // The branch is a repository identifier, so it
+                                // wears the repository's own mono: it reads as
+                                // code, and its slashes and dashes stop looking
+                                // like a sentence.
                                 div()
+                                    .min_w(px(0.0))
+                                    .font_family(theme.font_mono.clone())
                                     .text_size(crate::typography::ui_rems(11.0))
                                     .line_height(px(14.0))
                                     .text_color(subline)
@@ -6543,7 +6862,7 @@ impl Shell {
     /// reconnecting; an amber dot only when the OS says offline. The
     /// transport error belongs in logs, not the sidebar.
     fn render_connection_pill(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        use zeron_proto::ConnectivityState as S;
+        use clyra_proto::ConnectivityState as S;
         let conn = self.state.read(cx).connectivity.clone();
         let (label, glyph): (SharedString, AnyElement) = match conn.state {
             S::Disabled | S::Connected => return None,
@@ -6589,6 +6908,184 @@ impl Shell {
             )
             .into_any_element(),
         )
+    }
+
+    /// Split a badge combo ("⌘N", "Ctrl+Shift+N") into modifier and key
+    /// parts for two-tone kbd chips. A bare key renders alone.
+    fn split_kbd_badge(badge: &str) -> (String, String) {
+        const GLYPHS: [char; 4] = ['⌃', '⌥', '⇧', '⌘'];
+        let cut: usize = badge
+            .chars()
+            .take_while(|c| GLYPHS.contains(c))
+            .map(|c| c.len_utf8())
+            .sum();
+        if cut > 0 && cut < badge.len() {
+            return (badge[..cut].to_string(), badge[cut..].to_string());
+        }
+        let parts: Vec<&str> = badge.split('+').collect();
+        if parts.len() > 1 {
+            let key = parts.last().copied().unwrap_or("");
+            let mods = parts[..parts.len() - 1].join("+");
+            return (mods, key.to_string());
+        }
+        (String::new(), badge.to_string())
+    }
+
+    /// Quick actions under the space filter (Linear-style): New session and
+    /// Search, each with the user's live keybinding as a kbd chip.
+    /// Fixed above the scroll region like the filter itself, so the list can
+    /// scroll underneath without moving them.
+    fn render_sidebar_quick_actions(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        fn kbd_chip(badge: &str, theme: &Theme) -> gpui::Div {
+            let (mods, key) = Shell::split_kbd_badge(badge);
+            div()
+                .flex_none()
+                .px(px(6.0))
+                .py(px(3.0))
+                .rounded(px(6.0))
+                .bg(crate::theme::ink(0.08))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .when(!mods.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .text_size(px(11.0))
+                            .line_height(px(13.0))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(mods)),
+                    )
+                })
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .line_height(px(13.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(key)),
+                )
+        }
+        fn row(
+            id: &'static str,
+            icon_path: &'static str,
+            label: &str,
+            hint: &str,
+            theme: &Theme,
+            cx: &mut Context<Shell>,
+        ) -> gpui::Stateful<gpui::Div> {
+            div()
+                .id(id)
+                .h(px(32.0))
+                .w_full()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .px(px(Theme::SPACE_SM))
+                .rounded(px(8.0))
+                .text_size(crate::typography::ui_rems(13.0))
+                .text_color(theme.text_muted)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
+                .child(
+                    div()
+                        .size(px(16.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(id == "sidebar-quick-teams", |el| el.child(crate::teams::dot_div(0xFF7950, 18.0, cx)))
+                        .when(id != "sidebar-quick-teams", |el| el.child(icon(icon_path).size(px(14.0)).text_color(theme.text_muted))),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(SharedString::from(label)),
+                )
+                .when(!hint.is_empty(), |el| el.child(kbd_chip(hint, theme)))
+        }
+        let new_hint = badge_combo(&platform_combo(
+            self.settings.keymap.get(ShortcutId::NewSession),
+        ));
+        // The palette binding is fixed (mod-k), not a customizable shortcut.
+        let search_hint = badge_combo(&platform_combo("mod-k"));
+        div()
+            .flex_none()
+            .w_full()
+            .px(px(Theme::SPACE_SM))
+            .pt(px(6.0))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(
+                row(
+                    "sidebar-quick-new-session",
+                    icons::PLUS,
+                    "New session",
+                    &new_hint,
+                    theme,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.open_new_session(cx);
+                })),
+            )
+            .child(
+                row(
+                    "sidebar-quick-search",
+                    icons::MAGNIFER,
+                    "Search",
+                    &search_hint,
+                    theme,
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.toggle_command_palette(window, cx);
+                })),
+            )
+            // Automations: a destination, so it sits with the other two
+            // one-press entries above the session list, and carries the
+            // selected wash while it is the open route.
+            .child(
+                row(
+                    "sidebar-quick-automations",
+                    icons::CLOCK_CIRCLE,
+                    "Automations",
+                    "",
+                    theme,
+                    cx,
+                )
+                .when(matches!(self.route, Route::Automations), |el| {
+                    el.bg(theme.glass_hover()).text_color(theme.text)
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.open_automations(cx);
+                })),
+            )
+            // Equipos / ADE: mismo patrón — destino de configuración de
+            // equipos multi-agente (Líder, Backend, Frontend, Programador).
+            .child(
+                row("sidebar-quick-teams", icons::BOT, "Your dot", "", theme, cx)
+                    .when(matches!(self.route, Route::Teams), |el| {
+                        el.bg(theme.glass_hover()).text_color(theme.text)
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.open_teams(cx);
+                    })),
+            )
+            .into_any_element()
     }
 
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -7000,6 +7497,7 @@ impl Shell {
             // (No titlebar strip: the unified window titlebar spans the whole
             // window above this column.)
             .child(filter_row)
+            .child(self.render_sidebar_quick_actions(theme, cx))
             .child(sidebar_lists)
             // Global connection pill (durable-by-design UI truth): appears
             // whenever the edge posture is degraded; hidden while healthy —
@@ -7034,6 +7532,11 @@ impl Shell {
                 )
             })
             .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
+            // Provider account quota: its own section at the very bottom of
+            // the column, below the account menu. It paints its own hairline
+            // and padding, and stays invisible (hairline included) when there
+            // is no quota to report.
+            .child(self.account_usage.clone())
             .into_any_element()
     }
 
@@ -7041,7 +7544,7 @@ impl Shell {
     /// UpdateStatus stream reports a newer release. On a macOS bundle install
     /// it drives the whole flow — click to download, then click to restart into
     /// the staged bundle. Elsewhere (managed/source installs) it is advisory
-    /// (`zeron update`); click dismisses it for that version.
+    /// (`clyra update`); click dismisses it for that version.
     fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let status = self.state.read(cx).update.clone()?;
         if !status.update_available {
@@ -7062,7 +7565,7 @@ impl Shell {
             }
         } else {
             (
-                format!("Update available — v{latest} · run `zeron update`").into(),
+                format!("Update available — v{latest} · run `clyra update`").into(),
                 true,
             )
         };
@@ -7121,7 +7624,7 @@ impl Shell {
         }
     }
 
-    /// Fetch the manifest and stage the new Zeron desktop bundle under the data dir
+    /// Fetch the manifest and stage the new Clyra desktop bundle under the data dir
     /// (tokio — reqwest); the strip flips to "restart to apply" when done.
     fn begin_update_download(&mut self, cx: &mut Context<Self>) {
         let edge_url = self.boot.edge_url.clone();
@@ -7129,7 +7632,7 @@ impl Shell {
         let install = self.install.clone();
         self.update_flow = UpdateFlow::Downloading;
         let download = Tokio::spawn(cx, async move {
-            let manifest = zeron_update::fetch_latest(&edge_url).await?;
+            let manifest = clyra_update::fetch_latest(&edge_url).await?;
             install.stage_desktop(&edge_url, &manifest, &data_dir).await
         });
         self.update_task = Some(cx.spawn(async move |this, cx| {
@@ -7235,7 +7738,7 @@ impl Shell {
                 cx.notify();
             }))
             .child(
-                // Avatar: white circle, initial in near-black (zeron user-menu.tsx).
+                // Avatar: white circle, initial in near-black (clyra user-menu.tsx).
                 div()
                     .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
                     .flex_none()
@@ -7328,7 +7831,7 @@ impl Shell {
                     popover::menu_row(theme, false, "user-menu-settings")
                         .id("user-menu-settings")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.open_settings(SettingsSection::Devices, cx)
+                            this.open_settings(SettingsSection::DEFAULT, cx)
                         }))
                         .child(
                             icon(icons::SETTINGS_MINIMALISTIC)
@@ -7367,7 +7870,7 @@ impl Shell {
         } else if remote_engine {
             "Stop daemon and quit"
         } else {
-            "Quit Zeron"
+            "Quit Clyra"
         };
 
         if self.sync_flow == SyncFlow::Enabling && needs_org {
@@ -7392,7 +7895,7 @@ impl Shell {
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Finish signing in in your browser. Zeron will keep using this local workspace until you quit and reopen.",
+                        "Finish signing in in your browser. Clyra will keep using this local workspace until you quit and reopen.",
                     )),
                 )
                 .child(
@@ -7436,14 +7939,14 @@ impl Shell {
                     )
                     .into(),
                     (Some(email), None) => format!(
-                        "You're signed in as {email}. Zeron can switch to your synced workspace now."
+                        "You're signed in as {email}. Clyra can switch to your synced workspace now."
                     )
                     .into(),
                     (None, Some(phrase)) => format!(
                         "Bring {phrase} from this device into your synced workspace, or start it fresh."
                     )
                     .into(),
-                    (None, None) => "Zeron can switch to your synced workspace now.".into(),
+                    (None, None) => "Clyra can switch to your synced workspace now.".into(),
                 };
                 let mut actions = div()
                     .mt(px(16.0))
@@ -7632,9 +8135,9 @@ impl Shell {
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
                         if remote_engine {
-                            "Zeron is using a background daemon. Stop it and quit Zeron, then reopen to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
+                            "Clyra is using a background daemon. Stop it and quit Clyra, then reopen to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
                         } else {
-                            "Quit and reopen Zeron to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
+                            "Quit and reopen Clyra to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
                         },
                     )),
                 )
@@ -7679,7 +8182,7 @@ impl Shell {
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Zeron will remove your credentials, close the synced workspace, and continue in local mode.",
+                        "Clyra will remove your credentials, close the synced workspace, and continue in local mode.",
                     )),
                 )
                 .child(
@@ -7963,7 +8466,7 @@ impl Shell {
                         .as_ref()
                         .and_then(|chat| chat.harness_session_id.as_deref())
                         .is_some_and(|id| !id.trim().is_empty());
-                    let zeron_id = chat_id.clone();
+                    let clyra_id = chat_id.clone();
                     let harness_id = chat_id.clone();
                     let session_chat_id = chat_id.clone();
                     menu.child(
@@ -7984,17 +8487,17 @@ impl Shell {
                     )
                     .child(popover::menu_separator())
                     .child(
-                        popover::menu_row(&theme, false, format!("chat-copy-zeron-{chat_id}"))
-                            .id("chat-copy-zeron")
+                        popover::menu_row(&theme, false, format!("chat-copy-clyra-{chat_id}"))
+                            .id("chat-copy-clyra")
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.copy_zeron_conversation_link(&zeron_id, cx)
+                                this.copy_clyra_conversation_link(&clyra_id, cx)
                             }))
                             .child(
                                 icon(icons::COPY)
                                     .size(px(16.0))
                                     .text_color(theme.text_muted),
                             )
-                            .child(SharedString::from("Zeron conversation link")),
+                            .child(SharedString::from("Clyra conversation link")),
                     )
                     .when_some(harness_link, |menu, link| {
                         menu.child(
@@ -8264,18 +8767,70 @@ impl Shell {
         let (border, text, faint) = (theme.border, theme.text, theme.text_faint);
 
         // Settings route: just the section outlet — the section label lives in
-        // the unified window titlebar now (render_title_bar). Settings never
-        // underlaps: pad below the overlaid titlebar.
+        // the unified window titlebar now (render_title_bar). The outer card
+        // pads below the overlaid titlebar, like the chat column.
         if let Route::Settings(section) = self.route {
             let outlet = self.settings_outlet(section, window, cx);
             return div()
                 .flex_1()
                 .min_w_0()
                 .h_full()
-                .pt(px(Theme::TITLEBAR_HEIGHT))
                 .flex()
                 .flex_col()
                 .child(div().flex_1().min_h_0().child(outlet))
+                .into_any_element();
+        }
+        // Automations: a full-page list, no transcript and no composer — the
+        // same short-circuit Settings takes.
+        if matches!(self.route, Route::Automations) {
+            let page = self.automations_page.get_or_insert_with(|| {
+                let state = self.state.clone();
+                cx.new(|cx| crate::automations::AutomationsPage::new(state, cx))
+            });
+            return div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .flex_col()
+                .child(div().flex_1().min_h_0().child(page.clone()))
+                .into_any_element();
+        }
+        // Equipos / Dots: misma idea — página completa, sin transcript ni
+        // composer. La página emite OpenChat cuando un dot abre sesión real y
+        // el Shell salta a ella para revisar.
+        if matches!(self.route, Route::Teams) {
+            if self.teams_page.is_none() {
+                let page = cx.new(|cx| {
+                    crate::teams::TeamsPage::new(self.state.clone(), cx)
+                });
+                self.teams_sub = Some(cx.subscribe(
+                    &page,
+                    |this: &mut Shell, _, event: &crate::teams::TeamsEvent, cx| {
+                        match event {
+                            crate::teams::TeamsEvent::OpenChat(chat_id) => this.open_chat(chat_id.clone(), cx),
+                            crate::teams::TeamsEvent::WorkspaceCommand { command, chat_id } => {
+                                if !matches!(command, crate::composer::WorkspaceCommand::New
+                                    | crate::composer::WorkspaceCommand::Resume | crate::composer::WorkspaceCommand::Settings)
+                                    && let Some(chat_id) = chat_id {
+                                    this.open_chat(chat_id.clone(), cx);
+                                }
+                                this.pending_workspace_command = Some(*command);
+                                cx.notify();
+                            }
+                        }
+                    },
+                ));
+                self.teams_page = Some(page);
+            }
+            let page = self.teams_page.clone().unwrap();
+            return div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .flex_col()
+                .child(div().flex_1().min_h_0().child(page.clone()))
                 .into_any_element();
         }
 
@@ -8334,7 +8889,10 @@ impl Shell {
             new_thread_background(
                 artwork,
                 self.viewport_height,
-                (self.viewport_width - self.sidebar_now()).max(0.0),
+                // Clipped to the Codex-style card (not the full window span):
+                // the hero must never rescale on navigation and must fade
+                // inside the rounded panel.
+                main_content_width.max(0.0),
                 self.composer.read(cx).surface_bounds(),
                 dock_frame.dissolve(),
                 artwork_opacity * new_thread_background_opacity(theme.is_frost()),
@@ -8390,7 +8948,7 @@ impl Shell {
                         .flex_col()
                         .items_center()
                         .child(
-                            icon(icons::ZERON_LOGO)
+                            icon(icons::CLYRA_LOGO)
                                 .w(px(41.9))
                                 .h(px(48.0))
                                 .text_color(theme.text.opacity(0.09)),
@@ -8444,8 +9002,17 @@ impl Shell {
             .flex_col()
             .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
                 let paths = paths.paths().to_vec();
-                this.composer
-                    .update(cx, |composer, cx| composer.add_paths(paths, cx));
+                // Dropped folders become projects (spaces) on this device;
+                // files keep the attachment pipeline.
+                let (dirs, files): (Vec<PathBuf>, Vec<PathBuf>) =
+                    paths.into_iter().partition(|p| p.is_dir());
+                for dir in dirs {
+                    this.create_space_from_dropped_folder(dir, cx);
+                }
+                if !files.is_empty() {
+                    this.composer
+                        .update(cx, |composer, cx| composer.add_paths(files, cx));
+                }
                 cx.notify();
             }))
             .on_drop::<WorkspacePathDrag>(cx.listener(
@@ -8501,10 +9068,11 @@ impl Shell {
                             true,
                             div().size_full().child(outlet),
                         )
-                        // Fully faded BY the titlebar's bottom edge (the
-                        // title text is opaque — overlap read as collision),
+                        // Detached joint: the panel starts below the titlebar,
+                        // so there is no underlap to hide under — just keep a
+                        // small inset so text never kisses the rounded corner,
                         // ramping in the band just below it.
-                        .inset_top(Theme::TITLEBAR_HEIGHT)
+                        .inset_top(CHAT_CORNER_INSET)
                         .band_top(Theme::TRANSCRIPT_FADE_BAND)
                         .band_bottom(bottom_band),
                     )
@@ -8595,7 +9163,7 @@ impl Shell {
                             style
                         }
                     })
-                    .child("Drop to attach"),
+                    .child("Drop folders to add a project · files to attach"),
             )
             .into_any_element()
     }
@@ -8833,7 +9401,7 @@ impl Shell {
         let state = self.state.read(cx);
 
         // Aligned with the composer column: centered, same max width, small
-        // inner gutter (zeron's `mx-auto h-6 max-w-3xl px-2`).
+        // inner gutter (clyra's `mx-auto h-6 max-w-3xl px-2`).
         let strip = div()
             .h(px(Theme::STATUS_STRIP_HEIGHT))
             .flex_none()
@@ -8881,7 +9449,7 @@ impl Shell {
                 .child(SharedString::from("Run failed"))
                 .into_any_element(),
             Indicator::None if sending => strip
-                .child(loaders::gradient_spinner(
+                .child(loaders::dotm_helix(
                     "sending-indicator",
                     &theme,
                     2.5,
@@ -9000,10 +9568,66 @@ impl Shell {
             gpui::Empty.into_any_element()
         };
         // Flush panel (user request — the inset card is gone): full window
-        // height with a left hairline, glass-friendly like the terminal dock
-        // (translucent over the frost; solid otherwise). The resize grabber
+        // height with a left hairline. Coverage comes from the chat opacity
+        // level in settings (solid at 100%). The resize grabber
         // lives outside this clipped container, on the root layout's seam.
-        let panel_bg = theme.panel_bg();
+        let panel_bg = theme.chat_panel_bg(self.settings.chat_opacity.clamp(0.0, 1.0));
+        // Pane header below the navbar: surface tabs + expand + the explorer
+        // toggles live HERE, not in the titlebar (user request). Tabs mount
+        // only while any exist; the buttons stay while the host is open so
+        // the pane is always closable from itself. Content below fills the
+        // remaining height (every surface root is size_full and resolves
+        // against the wrapper).
+        let tabs: AnyElement = if self.right_surface_rows(cx).is_empty() {
+            div().flex_1().into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .overflow_hidden()
+                .child(self.render_right_tab_strip(cx))
+                .into_any_element()
+        };
+        let header = div()
+            .flex_none()
+            .w_full()
+            .h(px(PANE_HEADER_HEIGHT))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .px(px(8.0))
+            .child(tabs)
+            .child(header_icon_button(
+                "expand-changes",
+                tabs::right_pane_expand_icon(self.right_pane_expanded),
+                &theme,
+                cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
+            ))
+            .child(
+                header_icon_button(
+                    "toggle-files-panel",
+                    icons::FILE_TREE,
+                    &theme,
+                    cx.listener(|this, _, window, cx| this.toggle_files_panel(window, cx)),
+                )
+                .role(gpui::Role::Button)
+                .aria_label(if self.files_panel_open(cx) {
+                    "Hide files panel"
+                } else {
+                    "Show files panel"
+                })
+                .when(self.files_panel_open(cx), |button| {
+                    button.bg(crate::theme::wash(0.09))
+                }),
+            )
+            .child(header_icon_button(
+                "toggle-changes",
+                icons::SIDEBAR_MINIMALISTIC,
+                &theme,
+                cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
+            ));
         let panel = div()
             .size_full()
             .flex()
@@ -9014,24 +9638,21 @@ impl Shell {
             .when(!self.right_pane_expanded, |el| {
                 el.border_l_1().border_color(theme.border)
             })
-            // With the explorer undocked the panel's right edge IS the
-            // window's right edge: it carries the CSD window's rounded corners
+            // With the explorer undocked the panel's bottom-right corner IS the
+            // window's bottom-right corner: it carries the CSD window's curve
             // directly (gpui cannot clip children rounded — each full-bleed
-            // layer rounds itself; see [`Self::window_corner_radius`]). Docked,
-            // the explorer column is the rightmost layer and rounds instead.
+            // layer rounds itself; see [`Self::window_corner_radius`]).
+            // The panel starts below the titlebar band, so it never owns the
+            // top corner. Docked, the explorer column is the rightmost layer
+            // and rounds instead.
             .when(
                 Self::window_corner_radius(window) > 0.0 && self.files_visible_width(cx) <= 0.0,
-                |el| {
-                    let corner = Self::window_corner_radius(window);
-                    el.rounded_tr(px(corner)).rounded_br(px(corner))
-                },
+                |el| el.rounded_br(px(Self::window_corner_radius(window))),
             )
             .bg(panel_bg)
             .overflow_hidden()
-            // The titlebar is a glass overlay over the full-height content
-            // row; the panel's own chrome starts below it.
-            .pt(px(Theme::TITLEBAR_HEIGHT))
-            .child(content);
+            .child(header)
+            .child(div().flex_1().min_h_0().overflow_hidden().child(content));
         let target = self.right_target(cx);
         let edge_offset = self.eval_resize_edge_bounce(
             self.right_edge_bounce,
@@ -9042,7 +9663,15 @@ impl Shell {
             target,
             self.right_visible_width(cx),
             edge_offset,
-            div().h_full().relative().child(panel).into_any_element(),
+            // The panel starts below the titlebar band (like the main card):
+            // up there the band composites over bare frost, so panes beneath
+            // it can never shift its tone (user report).
+            div()
+                .h_full()
+                .relative()
+                .pt(px(Theme::TITLEBAR_HEIGHT))
+                .child(panel)
+                .into_any_element(),
         )
     }
 
@@ -9146,7 +9775,7 @@ impl Shell {
             .items_center()
             .text_center()
             .child(
-                icon(icons::ZERON_LOGO)
+                icon(icons::CLYRA_LOGO)
                     .w(px(31.4))
                     .h(px(36.0))
                     .text_color(theme.text),
@@ -9167,7 +9796,7 @@ impl Shell {
                     .line_height(px(19.0))
                     .text_color(theme.text_muted)
                     .child(SharedString::from(
-                        "Zeron removed your credentials but could not finish closing the previous synced workspace. Retry before continuing in local mode.",
+                        "Clyra removed your credentials but could not finish closing the previous synced workspace. Retry before continuing in local mode.",
                     )),
             )
             .when_some(self.runtime_change_error.clone(), |card, error| {
@@ -9334,7 +9963,7 @@ impl Shell {
                         .read(cx)
                         .sub_transcript(&tab.doc_id)
                         .last()
-                        .is_some_and(|e| e.status == Some(zeron_doc::MessageStatus::Streaming))
+                        .is_some_and(|e| e.status == Some(clyra_doc::MessageStatus::Streaming))
                 }),
                 _ => false,
             };
@@ -9751,7 +10380,7 @@ impl Shell {
     fn render_gate_card(&mut self, phase: &GatePhase, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let content: AnyElement = match phase {
-            // Backend unreachable: quiet centered copy (zeron Gate `Failed`),
+            // Backend unreachable: quiet centered copy (clyra Gate `Failed`),
             // plus a Retry affordance (the native engine doesn't self-redial).
             GatePhase::Failed(error) => div()
                 .flex()
@@ -9780,8 +10409,8 @@ impl Shell {
                         .child(SharedString::from("Retry")),
                 )
                 .into_any_element(),
-            // Login card (zeron App.tsx Gate): centered card on the grid —
-            // logo, "Log in to Zeron", copy, full-width white Log in button.
+            // Login card (clyra App.tsx Gate): centered card on the grid —
+            // logo, "Log in to Clyra", copy, full-width white Log in button.
             _ => div()
                 .w(px(360.0))
                 .px(px(32.0))
@@ -9796,7 +10425,7 @@ impl Shell {
                 .items_center()
                 .text_center()
                 .child(
-                    icon(icons::ZERON_LOGO)
+                    icon(icons::CLYRA_LOGO)
                         .w(px(31.4))
                         .h(px(36.0))
                         .text_color(theme.text),
@@ -9807,7 +10436,7 @@ impl Shell {
                         .text_size(crate::typography::ui_rems(18.0))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(theme.text)
-                        .child(SharedString::from("Log in to Zeron")),
+                        .child(SharedString::from("Log in to Clyra")),
                 )
                 .child(
                     div()
@@ -9852,7 +10481,7 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    // Keyed per phase (zeron App.tsx `<div key={phase}
+                    // Keyed per phase (clyra App.tsx `<div key={phase}
                     // className="animate-in">`): every gate swap replays the
                     // 0.5s entrance instead of mutating one animated element.
                     .child(motion::fade_in(
@@ -9957,16 +10586,16 @@ impl Shell {
                     .into_any_element(),
             };
 
-        // zeron App.tsx OrgGate: w-400 card on the grid — logo, headline,
+        // clyra App.tsx OrgGate: w-400 card on the grid — logo, headline,
         // explainer (+ signed-in email), name form with a white Create button,
         // then existing memberships and the account escape hatch.
         let blurb: SharedString = match email {
             Some(email) => format!(
-                "Zeron is organized around workspaces — create one for yourself or your team. Signed in as {email}."
+                "Clyra is organized around workspaces — create one for yourself or your team. Signed in as {email}."
             )
             .into(),
             None => {
-                "Zeron is organized around workspaces — create one for yourself or your team."
+                "Clyra is organized around workspaces — create one for yourself or your team."
                     .into()
             }
         };
@@ -9982,7 +10611,7 @@ impl Shell {
             .flex()
             .flex_col()
             .child(
-                icon(icons::ZERON_LOGO)
+                icon(icons::CLYRA_LOGO)
                     .w(px(24.4))
                     .h(px(28.0))
                     .text_color(theme.text),
@@ -10094,7 +10723,7 @@ impl Shell {
     }
 }
 
-/// The sign-in gate's faint grid backdrop (zeron styles.css `.bg-grid`):
+/// The sign-in gate's faint grid backdrop (clyra styles.css `.bg-grid`):
 /// 44px hairlines at white 3.5%, with the radial mask approximated by edge
 /// gradients back into the page background (gpui has no mask-image).
 fn grid_backdrop(theme: &Theme) -> AnyElement {
@@ -10183,7 +10812,7 @@ fn grid_backdrop(theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// A size-6 icon button for the titlebar strip (zeron window-controls.tsx:
+/// A size-6 icon button for the titlebar strip (clyra window-controls.tsx:
 /// `grid size-6 place-items-center rounded-md text-muted-foreground`).
 fn window_control_button(
     id: &'static str,
@@ -10202,7 +10831,7 @@ fn window_control_button(
         .justify_center()
         .rounded(px(6.0))
         .cursor_pointer()
-        // zeron window-controls.tsx: `transition-colors` — the wash fades.
+        // clyra window-controls.tsx: `transition-colors` — the wash fades.
         .bg(motion::hover_blend(
             &fade_key,
             theme.glass_hover().opacity(0.0),
@@ -10234,7 +10863,7 @@ const WINDOWS_CAPTION_BUTTON_WIDTH: f32 = 36.0;
 const WINDOWS_CAPTION_WIDTH: f32 = WINDOWS_CAPTION_BUTTON_WIDTH * 3.0;
 
 /// Right padding for titlebar content: past the native Windows caption
-/// cluster, or past zeron's own Linux caption buttons (10px edge inset +
+/// cluster, or past clyra's own Linux caption buttons (10px edge inset +
 /// the button row) when the layout puts any on the right.
 fn titlebar_right_padding(is_windows: bool, linux_right_captions: usize, base: f32) -> f32 {
     base + if is_windows {
@@ -10288,7 +10917,7 @@ fn windows_caption_button(
         .child(glyph)
 }
 
-/// A Linux caption button in zeron's own cluster style (24px, rounded-6,
+/// A Linux caption button in clyra's own cluster style (24px, rounded-6,
 /// 16px linear icon). gpui's `WindowControlArea` hit-testing is inert on
 /// Linux, so unlike the Windows cluster these carry explicit click handlers
 /// (`minimize_window` / `zoom_window` / `remove_window`), the same calls
@@ -10336,7 +10965,7 @@ fn linux_caption_button(
         )
 }
 
-/// A titlebar history button (zeron window-controls.tsx): enabled it is a
+/// A titlebar history button (clyra window-controls.tsx): enabled it is a
 /// normal window-control button; disabled it dims to 35% opacity and ignores
 /// the pointer (`disabled:pointer-events-none disabled:opacity-35`).
 fn nav_history_button(
@@ -10366,7 +10995,7 @@ fn nav_history_button(
     window_control_button(id, icon_path, theme, on_click).into_any_element()
 }
 
-/// A size-7 icon button for the main-panel header (zeron __root.tsx:
+/// A size-7 icon button for the main-panel header (clyra __root.tsx:
 /// `grid size-7 place-items-center rounded-md text-muted-foreground`).
 fn header_icon_button(
     id: &'static str,
@@ -10385,7 +11014,7 @@ fn header_icon_button(
         .justify_center()
         .rounded(px(6.0))
         .cursor_pointer()
-        // zeron __root.tsx header buttons: `transition-colors`.
+        // clyra __root.tsx header buttons: `transition-colors`.
         .bg(motion::hover_blend(
             &fade_key,
             crate::theme::wash(0.0),
@@ -10406,6 +11035,10 @@ fn header_icon_button(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::dot_animation::set_view_active(cx.entity_id(), window.is_window_active() && matches!(self.route, Route::Teams), cx);
+        if let Some(teams) = &self.teams_page {
+            crate::dot_animation::set_view_active(teams.entity_id(), window.is_window_active() && matches!(self.route, Route::Teams), cx);
+        }
         if let Some(command) = self.pending_workspace_command.take() {
             use crate::composer::WorkspaceCommand;
             match command {
@@ -10665,7 +11298,7 @@ impl Render for Shell {
             .on_drag_move(cx.listener(Self::on_files_panel_drag))
             .on_drag_move(cx.listener(Self::on_terminal_drag))
             // The panel shortcuts are chat-scoped chrome: in Settings they are
-            // no-ops (zeron __root.tsx gates the hotkey on `!isSettings`, and
+            // no-ops (clyra __root.tsx gates the hotkey on `!isSettings`, and
             // the terminal panel is only mounted on session routes). The
             // sidebar toggle stays live everywhere, as in the original.
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
@@ -10691,7 +11324,7 @@ impl Render for Shell {
             // Native Settings menu item and the platform convention (Cmd+, on
             // macOS, Ctrl+, elsewhere) always land on the default section.
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
-                this.open_settings(SettingsSection::Devices, cx)
+                this.open_settings(SettingsSection::DEFAULT, cx)
             }))
             // Chat-scoped, unlike new-session — `cycle_session` holds the guard
             // and says why.
@@ -10866,7 +11499,7 @@ impl Render for Shell {
                 );
                 let main = self.render_main(window, main_content_width, transcript_width, cx);
                 // The Changes pane is chat-scoped chrome: the Settings route
-                // never renders it (zeron __root.tsx `!isSettings && activeChat`
+                // never renders it (clyra __root.tsx `!isSettings && activeChat`
                 // around the diff column) — the per-session open flags stay
                 // intact for the return trip.
                 let right_open = on_chat && self.right_pane_open(cx);
@@ -10900,10 +11533,29 @@ impl Render for Shell {
                 let overlays = self.render_overlays(window.viewport_size(), window, cx);
                 // Copied out (not held) — `render_title_bar` needs `cx` mutable.
                 let border_color = Theme::of(cx).border;
-                // No inset cards (user request): the conversation column sits
-                // flush and unbordered, the transcript directly on the frost
-                // glass; the changes pane is a flush left-bordered glass panel
-                // (built inside `render_right_pane`).
+                // User opacity levels (settings → Appearance): the sidebar
+                // chrome (sidebar + titlebar band + joint) and the chat
+                // panels scale independently; 1.0 is exactly the authored
+                // palette.
+                let sidebar_level = self.settings.sidebar_opacity.clamp(0.0, 1.0);
+                let chat_level = self.settings.chat_opacity.clamp(0.0, 1.0);
+                let panel_bg = Theme::of(cx).chat_panel_bg(chat_level);
+                // The chat AND settings columns share the detached rounded
+                // panel (user request); gates stay flush full-bleed.
+                let rounded_panel = on_chat
+                    || matches!(
+                        self.route,
+                        Route::Settings(_) | Route::Automations | Route::Teams
+                    );
+                // Chat/settings route: the conversation column stays flush edge
+                // to edge, except for ONE curve — the panel's top-left corner
+                // rounds where it meets the sidebar (reference: Codex app). The
+                // panel starts below the titlebar strip with a top + left
+                // hairline that follows the curve; bottom and right stay
+                // borderless and flush to the window (or to the right pane).
+                // The panel's left border replaces the sidebar hairline as
+                // the divider.
+                // Settings stays as-is.
                 let main = if main_transition.is_some() {
                     div()
                         .h_full()
@@ -10915,15 +11567,37 @@ impl Render for Shell {
                 } else {
                     main
                 };
-                let card: AnyElement = div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_row()
-                    .overflow_hidden()
-                    .child(main)
-                    .into_any_element();
-                // The whole app page is one keyed `animate-in` entrance (zeron
+                let card: AnyElement = if rounded_panel {
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .pt(px(Theme::TITLEBAR_HEIGHT))
+                        .child(
+                            div()
+                                .size_full()
+                                .flex()
+                                .flex_row()
+                                .overflow_hidden()
+                                .rounded_tl(px(CHAT_CORNER_RADIUS))
+                                .bg(panel_bg)
+                                .border_t_1()
+                                .border_l_1()
+                                .border_color(border_color)
+                                .child(main),
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_row()
+                        .overflow_hidden()
+                        .child(main)
+                        .into_any_element()
+                };
+                // The whole app page is one keyed `animate-in` entrance (clyra
                 // App.tsx `<div key={phase} className="animate-in h-full">`):
                 // arriving from the splash or any gate fades the page in; the
                 // splash-out crossfades over it on boot.
@@ -10987,9 +11661,52 @@ impl Render for Shell {
                             el.top(px(window_corner)).bottom(px(window_corner))
                         }
                     })
-                    .bg(crate::theme::wash(0.05))
-                    .border_r_1()
-                    .border_color(border_color);
+                    .bg(Theme::of(cx).sidebar_chrome_bg(sidebar_level));
+                // Hairline on the sidebar's right edge — starting BELOW the
+                // top band (the band is sidebar chrome; a line through it
+                // would cut the strip it belongs to). Same collapse tween
+                // as the tone, same corner trim.
+                // Chat route uses the rounded joint: the panel's own left
+                // border carries the separation, so the hairline stays hidden
+                // and never doubles up along the seam.
+                let sliver = window_corner > 0.0 && sidebar_now < 2.0 * window_corner;
+                let sidebar_hairline: AnyElement = if rounded_panel {
+                    Empty.into_any_element()
+                } else {
+                    div()
+                        .absolute()
+                        .top(px(Theme::TITLEBAR_HEIGHT.max(if sliver {
+                            window_corner
+                        } else {
+                            0.0
+                        })))
+                        .when(sliver, |el| el.bottom(px(window_corner)))
+                        .when(!sliver, |el| el.bottom_0())
+                        .left(px((sidebar_now - 1.0).max(0.0)))
+                        .w(px(1.0))
+                        .bg(crate::theme::scaled_alpha(border_color, sidebar_level))
+                        .into_any_element()
+                };
+                // Top band: the titlebar strip reads as sidebar chrome. Every
+                // column (sidebar content, main card, panes) starts below
+                // this band, so the wash composites over bare frost along the
+                // whole strip — uniform with the sidebar in every appearance,
+                // glass included. It rides the sidebar width tween like the
+                // tone, carries the top-right window corner the way the tone
+                // carries the left, and is paint-only (no id, no listeners)
+                // so drag regions and clicks fall through to the titlebar
+                // strips below.
+                // Inner joint with the sidebar stays square: the band must
+                // read as one continuous strip with the sidebar tone
+                // (user request — no rounded inner corners).
+                let top_band = div()
+                    .absolute()
+                    .top_0()
+                    .left(px(sidebar_now))
+                    .right_0()
+                    .h(px(Theme::TITLEBAR_HEIGHT))
+                    .when(window_corner > 0.0, |el| el.rounded_tr(px(window_corner)))
+                    .bg(Theme::of(cx).sidebar_chrome_bg(sidebar_level));
                 // The content row spans the FULL window height — the titlebar
                 // overlays it (glass, no fill), so the transcript can scroll
                 // under the header and fade out at its edge. Columns that
@@ -11026,10 +11743,33 @@ impl Render for Shell {
                                     .child(right_seam),
                             ),
                     )
+                    .child(top_band)
                     .child(div().absolute().top_0().left_0().right_0().child(title_bar))
                     .child(self.render_titlebar_cluster(cx))
                     .children(overlays);
+                // Corner filler: the panel's rounded top-left leaves a small
+                // triangle that would otherwise show bare frost — paint exactly
+                // that triangle with the sidebar tone (same paint as the tone
+                // and the top band) so the joint reads as one filled surface
+                // and only the curve itself separates panel from sidebar. It
+                // sits under the page: the panel covers all of it except the
+                // cutout. Hidden when the main column has no width (right-pane
+                // takeover) so it never overlaps the expanded pane.
+                let corner_filler: AnyElement = if rounded_panel && main_content_width > 0.5 {
+                    div()
+                        .absolute()
+                        .top(px(Theme::TITLEBAR_HEIGHT))
+                        .left(px(sidebar_now))
+                        .w(px(CHAT_CORNER_RADIUS))
+                        .h(px(CHAT_CORNER_RADIUS))
+                        .bg(Theme::of(cx).sidebar_chrome_bg(sidebar_level))
+                        .into_any_element()
+                } else {
+                    Empty.into_any_element()
+                };
                 root.child(sidebar_tone)
+                    .child(sidebar_hairline)
+                    .child(corner_filler)
                     .child(motion::fade_in("phase-app", page))
             }
             GatePhase::Loading => root, // splash overlay covers boot
@@ -11227,14 +11967,14 @@ mod tests {
 
     #[test]
     fn island_stays_centered_on_controls_while_expanding() {
-        let center = (Theme::TITLEBAR_HEIGHT + Theme::TITLEBAR_TOP_PAD) * 0.5;
+        let center = Theme::TITLEBAR_HEIGHT * 0.5;
         for step in 0..=20 {
             let (top, height) = titlebar_island_vertical_geometry(step as f32 / 20.0);
             assert_eq!(top + height * 0.5, center);
             assert!((28.0..=32.0).contains(&height));
         }
         let (top, height) = titlebar_island_vertical_geometry(1.0);
-        assert_eq!(center, 21.0);
+        assert_eq!(center, 19.0);
         assert_eq!(center - 12.0 - top, 4.0);
         assert_eq!(top + height - (center + 12.0), 4.0);
     }
@@ -11463,7 +12203,7 @@ mod tests {
             edge_token: None,
             org_id: None,
             workos_client_id: Some("client_test".into()),
-            default_harness: zeron_proto::HarnessId::Mock,
+            default_harness: clyra_proto::HarnessId::Mock,
         };
         let synced = crate::state::EngineHandle::bootstrap(boot.clone())
             .await
@@ -11543,7 +12283,7 @@ mod tests {
     #[test]
     fn local_sign_in_offers_the_in_place_switch() {
         let signed_in = AuthState::SignedIn {
-            user: zeron_proto::UserProfile {
+            user: clyra_proto::UserProfile {
                 id: "user-1".into(),
                 email: "user@example.com".into(),
                 name: None,
@@ -11655,7 +12395,7 @@ mod tests {
     #[test]
     fn dismissed_import_failure_stays_reachable_on_a_synced_runtime() {
         let signed_in = AuthState::SignedIn {
-            user: zeron_proto::UserProfile {
+            user: clyra_proto::UserProfile {
                 id: "user-1".into(),
                 email: "user@example.com".into(),
                 name: None,
@@ -11698,7 +12438,7 @@ mod tests {
     #[test]
     fn switch_lifecycle_survives_the_runtime_replacement_window() {
         let signed_in = AuthState::SignedIn {
-            user: zeron_proto::UserProfile {
+            user: clyra_proto::UserProfile {
                 id: "user-1".into(),
                 email: "user@example.com".into(),
                 name: None,
@@ -11733,7 +12473,7 @@ mod tests {
     #[test]
     fn synced_sign_out_blocks_every_viewport_and_cannot_switch_accounts() {
         let signed_in_as_another_user = AuthState::SignedIn {
-            user: zeron_proto::UserProfile {
+            user: clyra_proto::UserProfile {
                 id: "user-2".into(),
                 email: "other@example.com".into(),
                 name: None,
@@ -11771,8 +12511,8 @@ mod tests {
     }
 
     #[test]
-    fn titlebar_cluster_matches_zeron_window_controls() {
-        // zeron window-controls.tsx: `left: fullscreen ? 12 : 88` — the
+    fn titlebar_cluster_matches_clyra_window_controls() {
+        // clyra window-controls.tsx: `left: fullscreen ? 12 : 88` — the
         // cluster clears the {14,15} traffic lights, and reclaims the inset
         // when fullscreen hides them.
         assert_eq!(titlebar_cluster_start(false), 88.0);
@@ -11851,7 +12591,7 @@ mod tests {
         );
     }
 
-    // ---- per-session panel flags (§1.10/1.11 parity: zeron sessionPanels) ----
+    // ---- per-session panel flags (§1.10/1.11 parity: clyra sessionPanels) ----
 
     #[test]
     fn session_panels_default_closed_per_chat() {
@@ -12073,7 +12813,7 @@ mod tests {
     #[test]
     fn nav_push_truncates_the_forward_branch() {
         // a → b → c, back to a, then push d: the b/c branch is gone (browser
-        // semantics — zeron's memory history PUSH truncates entries ahead).
+        // semantics — clyra's memory history PUSH truncates entries ahead).
         let mut nav = NavHistory::new(chat("a"));
         nav.push(chat("b"));
         nav.push(chat("c"));
@@ -12155,7 +12895,7 @@ mod exit_regressions {
                     edge_token: None,
                     org_id: None,
                     workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
+                    default_harness: clyra_proto::HarnessId::Mock,
                 },
                 cx,
             )
@@ -12227,7 +12967,7 @@ mod exit_regressions {
                     edge_token: None,
                     org_id: None,
                     workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
+                    default_harness: clyra_proto::HarnessId::Mock,
                 },
                 cx,
             )
@@ -12304,6 +13044,94 @@ mod exit_regressions {
             .unwrap();
     }
 
+    /// The new-session canvas has no chat, so the right pane is scoped to the
+    /// picked project: one toggle lands on that project's working tree, and a
+    /// deliberately project-less canvas keeps no opener at all.
+    #[gpui::test]
+    fn canvas_right_pane_is_scoped_to_the_picked_project(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: clyra_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, window, cx| {
+                let space: clyra_proto::Space = serde_json::from_value(serde_json::json!({
+                    "id": "space-1", "name": "Clyra", "path": dir.path().to_string_lossy(),
+                    "deviceId": "local", "createdAt": Utc::now(),
+                }))
+                .unwrap();
+                shell.state.update(cx, |state, cx| {
+                    state.local_device_id = Some("local".into());
+                    state.spaces = vec![space];
+                    state.select_space(Some("space-1".into()), cx);
+                });
+                let root = dir.path().to_string_lossy().to_string();
+
+                // A picked project makes the canvas hostable; the toggle lands
+                // straight on a diff scoped to that project, not the picker.
+                assert!(shell.active_chat.is_empty());
+                assert_eq!(
+                    shell.canvas_diff_scope(cx).map(|s| s.cwd),
+                    Some(root.clone())
+                );
+                assert!(shell.right_pane_hostable(cx));
+                assert!(!shell.right_pane_open(cx));
+                shell.toggle_right_pane(cx);
+                assert!(shell.right_pane_open(cx));
+                assert_eq!(
+                    shell.panel_key(cx),
+                    "space-canvas:space-1",
+                    "canvas panes key per space"
+                );
+                let RightSurface::Diff(id) = shell.resolved_right_active(cx) else {
+                    panic!("the canvas toggle must land on a diff surface");
+                };
+                assert_eq!(
+                    shell.diffs[&id]
+                        .read(cx)
+                        .space_scope()
+                        .map(|s| s.cwd.as_str()),
+                    Some(root.as_str())
+                );
+
+                // ⌘W closes that surface and the pane with it, so the canvas
+                // never strands a pane it cannot dismiss.
+                assert!(shell.closable_right_surface(cx).is_some());
+                assert!(shell.close_active_surface(window, cx));
+                assert!(!shell.right_pane_open(cx));
+
+                // "Don't work in a project": no checkout, so no host and no
+                // opener — the pane stays shut rather than opening onto nothing.
+                shell.state.update(cx, |state, cx| {
+                    state.select_space(None, cx);
+                });
+                assert!(shell.canvas_diff_scope(cx).is_none());
+                assert!(!shell.right_pane_hostable(cx));
+                shell.toggle_right_pane(cx);
+                assert!(!shell.right_pane_open(cx));
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn panel_saves_preserve_settings_selected_outside_the_shell(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -12331,7 +13159,7 @@ mod exit_regressions {
                     edge_token: None,
                     org_id: None,
                     workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
+                    default_harness: clyra_proto::HarnessId::Mock,
                 },
                 cx,
             )
@@ -12370,14 +13198,14 @@ mod exit_regressions {
                     settings::set_new_thread_background_effect(effect, cx);
                     settings::update(settings::SavePolicy::Immediate, cx, |settings| {
                         settings.window_geometry = geometry;
-                        settings.open_web_links_in_zeron = open_links_in_zeron;
+                        settings.open_web_links_in_clyra = open_links_in_zeron;
                         settings.terminal_font_family = terminal_family.clone();
                         settings.terminal_font_size = terminal_size;
                         settings.code_font_family = code_family.clone();
                         settings.code_font_size = code_size;
                         settings.transcript_width = transcript_width;
                         settings.skill_completion_by_harness.insert(
-                            zeron_proto::HarnessId::ClaudeCode,
+                            clyra_proto::HarnessId::ClaudeCode,
                             settings::SkillCompletionSettings {
                                 dollar: open_links_in_zeron,
                                 separate_from_slash: true,
@@ -12392,7 +13220,7 @@ mod exit_regressions {
                         let current = settings::current(cx);
                         assert_eq!(current.window_geometry, geometry);
                         assert_eq!(current.new_thread_background_effect, effect);
-                        assert_eq!(current.open_web_links_in_zeron, open_links_in_zeron);
+                        assert_eq!(current.open_web_links_in_clyra, open_links_in_zeron);
                         assert_eq!(current.terminal_font_family, terminal_family);
                         assert_eq!(current.terminal_font_size, terminal_size);
                         assert_eq!(current.code_font_family, code_family);
@@ -12400,13 +13228,13 @@ mod exit_regressions {
                         assert_eq!(current.transcript_width, transcript_width);
                         assert_eq!(
                             current
-                                .skill_completion(zeron_proto::HarnessId::ClaudeCode)
+                                .skill_completion(clyra_proto::HarnessId::ClaudeCode)
                                 .dollar,
                             open_links_in_zeron
                         );
                         assert!(
                             current
-                                .skill_completion(zeron_proto::HarnessId::ClaudeCode)
+                                .skill_completion(clyra_proto::HarnessId::ClaudeCode)
                                 .separate_from_slash
                         );
                     }
@@ -12414,7 +13242,7 @@ mod exit_regressions {
                     let loaded = settings::UiSettings::load(dir.path());
                     assert_eq!(loaded.window_geometry, geometry);
                     assert_eq!(loaded.new_thread_background_effect, effect);
-                    assert_eq!(loaded.open_web_links_in_zeron, open_links_in_zeron);
+                    assert_eq!(loaded.open_web_links_in_clyra, open_links_in_zeron);
                     assert_eq!(loaded.terminal_font_family, terminal_family);
                     assert_eq!(loaded.terminal_font_size, terminal_size);
                     assert_eq!(loaded.code_font_family, code_family);
@@ -12429,7 +13257,7 @@ mod exit_regressions {
     }
 
     #[gpui::test]
-    fn workspace_slash_commands_open_existing_zeron_surfaces(cx: &mut TestAppContext) {
+    fn workspace_slash_commands_open_existing_clyra_surfaces(cx: &mut TestAppContext) {
         use crate::composer::WorkspaceCommand;
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
@@ -12456,7 +13284,7 @@ mod exit_regressions {
                     edge_token: None,
                     org_id: None,
                     workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
+                    default_harness: clyra_proto::HarnessId::Mock,
                 },
                 cx,
             )
@@ -12509,7 +13337,7 @@ mod exit_regressions {
                     edge_token: None,
                     org_id: None,
                     workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
+                    default_harness: clyra_proto::HarnessId::Mock,
                 },
                 cx,
             )
@@ -12594,7 +13422,7 @@ mod exit_regressions {
                     edge_token: None,
                     org_id: None,
                     workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
+                    default_harness: clyra_proto::HarnessId::Mock,
                 },
                 cx,
             )
@@ -12672,7 +13500,7 @@ mod exit_regressions {
                     edge_token: None,
                     org_id: None,
                     workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
+                    default_harness: clyra_proto::HarnessId::Mock,
                 },
                 cx,
             )
@@ -12680,7 +13508,7 @@ mod exit_regressions {
         window
             .update(cx, |shell, _, cx| {
                 shell.state.update(cx, |state, _| {
-                    state.apply_spaces(vec![zeron_proto::Space {
+                    state.apply_spaces(vec![clyra_proto::Space {
                         id: "repo".into(),
                         device_id: "local".into(),
                         path: "/repo".into(),
@@ -12737,7 +13565,7 @@ mod exit_regressions {
                     edge_token: None,
                     org_id: None,
                     workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
+                    default_harness: clyra_proto::HarnessId::Mock,
                 },
                 cx,
             )
@@ -12774,7 +13602,7 @@ mod exit_regressions {
                 shell.activate_session_link(&activation, window, cx);
                 assert_eq!(shell.browsers.len(), 2);
                 settings::update(settings::SavePolicy::Immediate, cx, |settings| {
-                    settings.open_web_links_in_zeron = false;
+                    settings.open_web_links_in_clyra = false;
                 });
                 assert_eq!(
                     shell.activate_session_link(&activation, window, cx),
@@ -12865,7 +13693,7 @@ mod exit_regressions {
                     edge_token: None,
                     org_id: None,
                     workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
+                    default_harness: clyra_proto::HarnessId::Mock,
                 },
                 cx,
             )
@@ -12961,7 +13789,7 @@ mod exit_regressions {
                     edge_token: None,
                     org_id: None,
                     workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
+                    default_harness: clyra_proto::HarnessId::Mock,
                 },
                 cx,
             )
@@ -13039,7 +13867,7 @@ mod exit_regressions {
                     edge_token: None,
                     org_id: None,
                     workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
+                    default_harness: clyra_proto::HarnessId::Mock,
                 },
                 cx,
             )
@@ -13103,7 +13931,7 @@ mod exit_regressions {
                     edge_token: None,
                     org_id: None,
                     workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
+                    default_harness: clyra_proto::HarnessId::Mock,
                 },
                 cx,
             )
@@ -13282,7 +14110,7 @@ mod right_tab_mouse_regressions {
                         edge_token: None,
                         org_id: None,
                         workos_client_id: None,
-                        default_harness: zeron_proto::HarnessId::Mock,
+                        default_harness: clyra_proto::HarnessId::Mock,
                     },
                     cx,
                 );

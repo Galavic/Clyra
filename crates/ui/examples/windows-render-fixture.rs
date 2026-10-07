@@ -1,11 +1,11 @@
 //! Static native-rendering regression. No engine, credentials, network, or user data.
 //! Run through scripts/test-windows-rendering.ps1 on an interactive Windows desktop.
+use clyra_ui::edge_fade::edge_faded;
 use gpui::{
     AppContext, Bounds, Context, IntoElement, ParentElement, Render, Styled, TitlebarOptions,
     Window, WindowBounds, WindowOptions, div, img, point, px, rgb, size,
 };
 use std::path::PathBuf;
-use zeron_ui::edge_fade::edge_faded;
 
 struct Fixture {
     image: PathBuf,
@@ -159,7 +159,7 @@ fn main() -> anyhow::Result<()> {
                     size(px(680.), px(640.)),
                 ))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Zeron Windows rendering fixture".into()),
+                    title: Some("Clyra Windows rendering fixture".into()),
                     ..Default::default()
                 }),
                 ..Default::default()

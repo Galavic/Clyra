@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use zeron_proto::{
+use clyra_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
     UserInputQuestion,
 };
@@ -15,7 +15,7 @@ pub struct MockHarness {
     pub script: Vec<AgentEvent>,
 }
 
-/// The scripted question set for the `ZERON_MOCK_QUESTION` variant (exercises
+/// The scripted question set for the `CLYRA_MOCK_QUESTION` variant (exercises
 /// the QuestionPanel end-to-end: single-select page, multi-select page).
 fn question_script() -> Vec<UserInputQuestion> {
     vec![
@@ -99,22 +99,24 @@ impl Harness for MockHarness {
         _request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        // Optional pacing knob for demos/manual testing: `ZERON_MOCK_DELAY_MS`
+        // Optional pacing knob for demos/manual testing: `CLYRA_MOCK_DELAY_MS`
         // spaces the scripted events out so live-run UI states (working
         // indicator, streaming fade, trailing tool-group auto-open) are
         // observable. Unset (the default, and in tests) streams instantly.
-        let delay_ms = std::env::var("ZERON_MOCK_DELAY_MS")
+        let delay_ms = std::env::var("CLYRA_MOCK_DELAY_MS")
+            .or_else(|_| std::env::var("ZERON_MOCK_DELAY_MS"))
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
         let delay = std::time::Duration::from_millis(delay_ms);
 
-        // Dev/testing knob: `ZERON_MOCK_QUESTION=1` swaps in a run that asks
+        // Dev/testing knob: `CLYRA_MOCK_QUESTION=1` swaps in a run that asks
         // the user questions mid-stream via `controls.request_input` (the
         // engine mints the request id, emits `InputRequested`, and resolves it
         // from the `RespondInput` doc command) — the only data-side way to put
         // the QuestionPanel on screen.
-        let question_mode = std::env::var("ZERON_MOCK_QUESTION")
+        let question_mode = std::env::var("CLYRA_MOCK_QUESTION")
+            .or_else(|_| std::env::var("ZERON_MOCK_QUESTION"))
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
         if question_mode {
@@ -284,7 +286,7 @@ impl Harness for MockHarness {
                     },
                     AgentEvent::ToolCall {
                         id: "mock-think-tool".into(),
-                        call: zeron_proto::ToolCall::Exec {
+                        call: clyra_proto::ToolCall::Exec {
                             command: "rg -n walletInsufficient apps/word/src | wc -l".into(),
                         },
                     },
@@ -318,7 +320,7 @@ impl Harness for MockHarness {
                     id: id.into(),
                     // The claude-driver spawn shape: `Agent: {description}`
                     // with the task in the input (names the chip AND the tab).
-                    call: zeron_proto::ToolCall::Unknown {
+                    call: clyra_proto::ToolCall::Unknown {
                         name: format!("Agent: {description}"),
                         input: Some(serde_json::json!({
                             "description": description,
@@ -376,7 +378,7 @@ impl Harness for MockHarness {
                         "mock-sub-1",
                         AgentEvent::ToolCall {
                             id: "sub1-grep".into(),
-                            call: zeron_proto::ToolCall::Exec {
+                            call: clyra_proto::ToolCall::Exec {
                                 command: "grep -rn fold_event_into_parts crates".into(),
                             },
                         },
@@ -418,8 +420,8 @@ impl Harness for MockHarness {
                         "mock-sub-2",
                         AgentEvent::ToolCall {
                             id: "sub2-burst".into(),
-                            call: zeron_proto::ToolCall::Exec {
-                                command: "cargo test -p zeron-doc cadence_burst -- --nocapture".into(),
+                            call: clyra_proto::ToolCall::Exec {
+                                command: "cargo test -p clyra-doc cadence_burst -- --nocapture".into(),
                             },
                         },
                     ),
@@ -450,8 +452,8 @@ impl Harness for MockHarness {
                         "mock-sub-2",
                         AgentEvent::ToolCall {
                             id: "sub2-steer-burst".into(),
-                            call: zeron_proto::ToolCall::Exec {
-                                command: "cargo test -p zeron-doc cadence_steer -- --nocapture"
+                            call: clyra_proto::ToolCall::Exec {
+                                command: "cargo test -p clyra-doc cadence_steer -- --nocapture"
                                     .into(),
                             },
                         },
@@ -487,7 +489,7 @@ impl Harness for MockHarness {
                 [
                     AgentEvent::ToolCall {
                         id: "mock-code-tool".into(),
-                        call: zeron_proto::ToolCall::Exec {
+                        call: clyra_proto::ToolCall::Exec {
                             command: "set -e\nfixture_in_original=0\ngrep -rn \"veil\" crates/ui/src | wc -l".into(),
                         },
                     },

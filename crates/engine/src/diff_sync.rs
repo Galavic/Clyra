@@ -1,5 +1,5 @@
 //! CheckoutDiffSync — checkout-scoped working-tree diff production (feature-inventory
-//! §3.5; port of zeron's `checkout-diff-sync.ts` + `git-metadata-sync.ts`).
+//! §3.5; port of clyra's `checkout-diff-sync.ts` + `git-metadata-sync.ts`).
 //!
 //! Chats do not own working-tree state: a concrete Git checkout does. This service
 //! groups this device's chats by their canonical checkout identity (`chat.cwd` →
@@ -44,7 +44,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use zeron_proto::{Chat, CheckoutDiff, DiffFileSummary};
+use clyra_proto::{Chat, CheckoutDiff, DiffFileSummary};
 
 use crate::EngineError;
 use crate::doc_host::EdgeConfig;
@@ -93,7 +93,7 @@ pub struct DiffSidecar {
 /// One bounded atomic snapshot of a checkout's working tree.
 #[derive(Debug, Clone)]
 pub struct DiffSnapshot {
-    pub git_status: Option<(Vec<zeron_proto::GitFileStatus>, bool)>,
+    pub git_status: Option<(Vec<clyra_proto::GitFileStatus>, bool)>,
     pub branch: String,
     pub head_sha: Option<String>,
     pub patch: String,
@@ -164,7 +164,7 @@ struct DiffSyncInner {
     /// How long an entry may sit chat-less before reconcile removes it.
     orphan_grace: Duration,
     diffs_tx: watch::Sender<Vec<CheckoutDiff>>,
-    statuses_tx: watch::Sender<Vec<zeron_proto::CheckoutGitStatus>>,
+    statuses_tx: watch::Sender<Vec<clyra_proto::CheckoutGitStatus>>,
     /// chat_id → turn-start tree (see [`TurnSnapshot`]).
     turn_trees: Mutex<HashMap<String, TurnSnapshot>>,
     /// The tasks hold `Weak` refs, but an in-flight iteration holds an
@@ -252,7 +252,7 @@ impl CheckoutDiffSync {
     }
 
     /// Consumers filter this shared cache; subscribing never starts another Git scan.
-    pub fn watch_git_statuses(&self) -> watch::Receiver<Vec<zeron_proto::CheckoutGitStatus>> {
+    pub fn watch_git_statuses(&self) -> watch::Receiver<Vec<clyra_proto::CheckoutGitStatus>> {
         self.inner.statuses_tx.subscribe()
     }
 
@@ -1194,7 +1194,7 @@ pub async fn capture_diff_against(
     if tracked.truncated {
         let boundary = patch.rfind('\n').unwrap_or(0);
         patch.truncate(boundary);
-        patch.push_str("\n# Zeron diff truncated\n");
+        patch.push_str("\n# Clyra diff truncated\n");
     }
 
     // `?? path` records; rename records (`R  new\0old`) consume their extra field.
@@ -1432,7 +1432,7 @@ pub async fn merge_base(root: &Path, base_ref: &str) -> Result<String, EngineErr
 /// capture already does.
 pub async fn snapshot_tree(root: &Path) -> Result<String, EngineError> {
     let index = std::env::temp_dir().join(format!(
-        "zeron-turn-index-{}-{}",
+        "clyra-turn-index-{}-{}",
         std::process::id(),
         chrono::Utc::now().timestamp_micros()
     ));
@@ -1543,7 +1543,7 @@ pub async fn capture_turn_diff(
     if tracked.truncated {
         let boundary = patch.rfind('\n').unwrap_or(0);
         patch.truncate(boundary);
-        patch.push_str("\n# Zeron diff truncated\n");
+        patch.push_str("\n# Clyra diff truncated\n");
     }
 
     let additions: u32 = files.iter().map(|f| f.additions).sum();
@@ -1572,6 +1572,159 @@ pub async fn capture_turn_diff(
         truncated,
         checksum,
     })
+}
+
+/// Paths per `git restore` invocation — keeps the command line well under
+/// the Windows 32K limit even for deep paths.
+const RESTORE_CHUNK: usize = 64;
+
+/// Undo a turn: put every file the turn changed back to its turn-start state.
+/// Modified and deleted files are restored from `turn_tree` into the working
+/// tree only (`git restore --worktree`; the real index is never touched);
+/// files the turn created are removed. Renames are diffed as delete + add
+/// (`--no-renames`), so both halves fall out of the same two cases. `only`
+/// limits the undo to those repo-relative paths (what the user was shown), so
+/// files touched after that are left alone. Returns the reverted paths.
+pub async fn revert_turn(
+    root: &Path,
+    turn_tree: &str,
+    only: Option<&[String]>,
+) -> Result<Vec<String>, EngineError> {
+    let current = snapshot_tree(root).await?;
+    let names = capture_git(
+        root,
+        &[
+            "diff",
+            "--name-status",
+            "-z",
+            "--no-renames",
+            turn_tree,
+            &current,
+            "--",
+        ],
+        2 * 1024 * 1024,
+    )
+    .await?;
+    if names.truncated {
+        return Err(EngineError::Other(
+            "turn changed too many files to undo".into(),
+        ));
+    }
+    let files = parse_name_status(&names.stdout)
+        .into_iter()
+        .filter(|file| only.is_none_or(|only| only.contains(&file.path)));
+    let (added, restored): (Vec<_>, Vec<_>) = files.partition(|file| file.status == "added");
+    // `:(literal)` keeps names with glob characters from matching siblings.
+    let restore: Vec<String> = restored
+        .iter()
+        .map(|file| format!(":(literal){}", file.path))
+        .collect();
+    let source = format!("--source={turn_tree}");
+    for chunk in restore.chunks(RESTORE_CHUNK) {
+        let mut args = vec!["restore", source.as_str(), "--worktree", "--"];
+        args.extend(chunk.iter().map(String::as_str));
+        capture_git(root, &args, 64 * 1024).await?;
+    }
+    for file in &added {
+        match tokio::fs::remove_file(root.join(&file.path)).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(EngineError::Other(format!("remove {}: {err}", file.path)));
+            }
+        }
+    }
+    Ok(restored
+        .into_iter()
+        .chain(added)
+        .map(|file| file.path)
+        .collect())
+}
+
+#[cfg(test)]
+mod revert_turn_tests {
+    use super::{revert_turn, snapshot_tree};
+    use std::path::Path;
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[tokio::test]
+    async fn revert_restores_modified_deleted_renamed_and_removes_added() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "t@example.com"]);
+        git(root, &["config", "user.name", "t"]);
+        git(root, &["config", "core.autocrlf", "false"]);
+        std::fs::write(root.join("keep.txt"), "keep\n").unwrap();
+        std::fs::write(root.join("edit.txt"), "before\n").unwrap();
+        std::fs::write(root.join("gone.txt"), "gone\n").unwrap();
+        std::fs::write(root.join("moved.txt"), "moved\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", "init"]);
+        // Untracked at turn start: the snapshot carries it, so it restores too.
+        std::fs::write(root.join("scratch.txt"), "scratch\n").unwrap();
+
+        let turn_tree = snapshot_tree(root).await.unwrap();
+
+        std::fs::write(root.join("edit.txt"), "after\n").unwrap();
+        std::fs::remove_file(root.join("gone.txt")).unwrap();
+        std::fs::rename(root.join("moved.txt"), root.join("renamed.txt")).unwrap();
+        std::fs::write(root.join("scratch.txt"), "changed\n").unwrap();
+        std::fs::create_dir_all(root.join("new")).unwrap();
+        std::fs::write(root.join("new/[file].txt"), "new\n").unwrap();
+
+        // Scoped: only the listed path reverts.
+        let only = vec!["edit.txt".to_string()];
+        assert_eq!(
+            revert_turn(root, &turn_tree, Some(&only)).await.unwrap(),
+            vec!["edit.txt"]
+        );
+        assert!(root.join("renamed.txt").exists());
+        std::fs::write(
+            root.join("edit.txt"),
+            "after
+",
+        )
+        .unwrap();
+
+        let mut reverted = revert_turn(root, &turn_tree, None).await.unwrap();
+        reverted.sort();
+        assert_eq!(
+            reverted,
+            vec![
+                "edit.txt",
+                "gone.txt",
+                "moved.txt",
+                "new/[file].txt",
+                "renamed.txt",
+                "scratch.txt"
+            ]
+        );
+        let read = |name: &str| std::fs::read_to_string(root.join(name)).unwrap();
+        assert_eq!(read("keep.txt"), "keep\n");
+        assert_eq!(read("edit.txt"), "before\n");
+        assert_eq!(read("gone.txt"), "gone\n");
+        assert_eq!(read("moved.txt"), "moved\n");
+        assert_eq!(read("scratch.txt"), "scratch\n");
+        assert!(!root.join("renamed.txt").exists());
+        assert!(!root.join("new/[file].txt").exists());
+        // Nothing left to undo.
+        assert!(
+            revert_turn(root, &turn_tree, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
 
 #[cfg(test)]

@@ -5,8 +5,8 @@ name: release
 #   - macOS dmg (Apple silicon) via scripts/package-macos.sh
 #   - Windows portable zip (x86_64) via scripts/package-windows.ps1
 # then create a GitHub Release AND upload everything to the
-# `comet-native-releases` R2 bucket (served at zeron.sh/releases/* for
-# `curl -fsSL https://zeron.sh/install.sh | sh`), bumping latest.txt.
+# `comet-native-releases` R2 bucket (served at clyra-cli.xyz/releases/* for
+# `curl -fsSL https://clyra-cli.xyz/install.sh | sh`), bumping latest.txt.
 #
 # Trigger: push a tag `v<version>` matching the workspace version in
 # Cargo.toml (bump it in the same commit), or run manually via
@@ -162,7 +162,7 @@ jobs:
           for platform in linux-x86_64.tar.gz linux-aarch64.tar.gz \
               macos-arm64.dmg macos-arm64-app.tar.gz \
               windows-x86_64.zip windows-x86_64.exe; do
-            test -f "dist/zeron-$ver-$platform" \
+            test -f "dist/clyra-$ver-$platform" \
               || { echo "missing artifact for tag v$ver: $platform — check builds and Cargo.toml version"; exit 1; }
           done
           echo "VERSION=$ver" >> "$GITHUB_ENV"
@@ -181,7 +181,7 @@ jobs:
             dist/*
             manifest.json
           generate_release_notes: true
-      - name: upload to R2 (zeron.sh/releases/*)
+      - name: upload to R2 (clyra-cli.xyz/releases/*)
         if: env.CLOUDFLARE_API_TOKEN != ''
         run: |
           for f in dist/*; do

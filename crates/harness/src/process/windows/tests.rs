@@ -251,7 +251,7 @@ async fn batch_scripts_spawn_through_cmd_with_literal_arguments() {
     let received = dir.path().join("received.txt");
     // A real shim shape: forward `%*` to an inner program. What that program's
     // C runtime parses is the contract — exactly what node receives under an
-    // npm `.cmd` shim launched by zeron.
+    // npm `.cmd` shim launched by clyra.
     let script = dir.path().join("forward-args.cmd");
     std::fs::write(
         &script,

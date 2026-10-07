@@ -5,15 +5,15 @@
 //! `npx -y` at chat time (zeronsh/comet#95).
 //!
 //! Ignored: needs network, npm, and the pi CLI on the machine. Run with
-//! `cargo test -p zeron-harness --test managed_install -- --ignored`.
+//! `cargo test -p clyra-harness --test managed_install -- --ignored`.
 //!
 //! Single-test binary: it mutates ZERON_ADAPTERS_DIR process-wide.
 
+use clyra_harness::{AcpHarness, Harness, RunControls};
+use clyra_proto::{AgentEvent, RunRequest};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use zeron_harness::{AcpHarness, Harness, RunControls};
-use zeron_proto::{AgentEvent, RunRequest};
 
 #[tokio::test]
 #[ignore = "network + npm + codex CLI; installs the pinned adapter for real"]
@@ -40,7 +40,7 @@ async fn managed_install_reaches_session_started() {
         reasoning: None,
         model_options: serde_json::Map::new(),
         cwd: std::env::temp_dir().display().to_string(),
-        sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+        sandbox: clyra_proto::SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
         worktree: None,
@@ -90,5 +90,5 @@ async fn managed_install_reaches_session_started() {
         .next()
         .expect("a pinned version dir")
         .path();
-    assert!(version_dir.join(".zeron-install-ok").exists());
+    assert!(version_dir.join(".clyra-install-ok").exists());
 }

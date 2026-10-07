@@ -10,8 +10,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use clyra_proto::{AgentEvent, DoneStatus};
 use serde_json::Value;
-use zeron_proto::{AgentEvent, DoneStatus};
 
 use super::normalize::map_update;
 
@@ -205,8 +205,8 @@ fn tag(parent: &str, event: AgentEvent) -> AgentEvent {
 
 #[cfg(test)]
 mod tests {
+    use clyra_proto::{AgentEvent, DoneStatus, ToolCall};
     use serde_json::json;
-    use zeron_proto::{AgentEvent, DoneStatus, ToolCall};
 
     use super::DevinTracker;
 

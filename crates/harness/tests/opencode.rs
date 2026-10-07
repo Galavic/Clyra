@@ -9,16 +9,16 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use clyra_harness::{
+    CancellationToken, Harness, HarnessError, OpencodeHarness, RunControls, SteerMessage,
+};
+use clyra_proto::{
+    AgentEvent, DoneStatus, ReasoningLevel, RunRequest, SandboxLevel, ToolCall, UserInputAnswer,
+};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use zeron_harness::{
-    CancellationToken, Harness, HarnessError, OpencodeHarness, RunControls, SteerMessage,
-};
-use zeron_proto::{
-    AgentEvent, DoneStatus, ReasoningLevel, RunRequest, SandboxLevel, ToolCall, UserInputAnswer,
-};
 
 // ---------------------------------------------------------------------------
 // Fake server
@@ -1035,7 +1035,7 @@ async fn slash_command_rejects_attachments_instead_of_dropping_them() {
 
 #[tokio::test]
 async fn dollar_selected_skill_uses_opencode_native_command_with_arguments() {
-    use zeron_proto::{
+    use clyra_proto::{
         HarnessId,
         invocation::{Invocation, harness_prompt},
     };

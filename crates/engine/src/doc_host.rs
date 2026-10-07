@@ -1,7 +1,7 @@
 //! DocHost — per-chat `SessionDoc` handles: snapshot persistence (debounced), edge room
 //! sync (offline-tolerant), and the HOST-ONLY durable command executor.
 //!
-//! Pragmatic port of zeron's `session-docs.ts` + the `main.ts` executor (spec:
+//! Pragmatic port of clyra's `session-docs.ts` + the `main.ts` executor (spec:
 //! feature-inventory §3.3, ARCHITECTURE §2 "command plane"):
 //! - the doc IS the outbox: commands and user entries commit locally and sync whenever a
 //!   room connection exists; the engine is fully functional with sync disabled;
@@ -28,14 +28,14 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use zeron_doc::{
+use clyra_doc::{
     COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, DocError, EvaluationContext,
     MessagePart, MessageRole, MessageStatus, QueueDeliveryGate, QueuedMessage, SessionCommandEntry,
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry, evaluate_command,
     join_continuation_entries,
 };
-use zeron_proto::{ConversationSourceContext, HarnessId, UserInputAnswer, UserInputQuestion};
-use zeron_sync::DocsStore;
+use clyra_proto::{ConversationSourceContext, HarnessId, UserInputAnswer, UserInputQuestion};
+use clyra_sync::DocsStore;
 
 use crate::http_error::describe_http_error;
 use crate::project_actions::{
@@ -54,7 +54,7 @@ const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
 pub const QUEUE_EDIT_LEASE_MS: i64 = 60_000;
 
 /// Warm-doc LRU: how many unwatched, run-less docs stay fully open. Everything
-/// beyond this (and beyond [`zeron_doc::DOC_LRU_BYTE_BUDGET`]) is evicted
+/// beyond this (and beyond [`clyra_doc::DOC_LRU_BYTE_BUDGET`]) is evicted
 /// oldest-access-first — reopening from the SQLite snapshot measured within
 /// ~11ms of a warm doc, so the cap trades no perceptible open latency.
 const WARM_DOC_CAP: usize = 12;
@@ -116,14 +116,14 @@ const RELAY_MIN_VERSION: (u64, u64, u64) = (0, 2, 12);
 /// Edge connection config. The bearer is a **provider**, never a snapshot:
 /// every room (re)connect and HTTP request re-reads it, so WorkOS access-token
 /// refreshes (~1h expiry) take effect without an engine restart. Dev bearers
-/// (which never expire) ride the same seam as a [`zeron_rpc::StaticToken`].
+/// (which never expire) ride the same seam as a [`clyra_rpc::StaticToken`].
 #[derive(Clone)]
 pub struct EdgeConfig {
     /// Edge base URL (`http(s)://…`); rewritten to `ws(s)` for the room socket.
     pub url: String,
     /// Fresh-bearer provider (the relay's `TokenSource`), consulted per
     /// connect/request. Temporary failures preserve the signed-in session.
-    pub token: Arc<dyn zeron_rpc::TokenSource>,
+    pub token: Arc<dyn clyra_rpc::TokenSource>,
     /// This engine's device id, carried on room dials (`&device=`) so the
     /// edge can attribute sockets in logs. Debugging the 2026-08-04 deaf
     /// socket meant reverse-engineering devices from rotating IPv6 privacy
@@ -141,7 +141,7 @@ impl std::fmt::Debug for EdgeConfig {
 }
 
 impl EdgeConfig {
-    pub fn new(url: impl Into<String>, token: Arc<dyn zeron_rpc::TokenSource>) -> Self {
+    pub fn new(url: impl Into<String>, token: Arc<dyn clyra_rpc::TokenSource>) -> Self {
         Self {
             url: url.into(),
             token,
@@ -157,11 +157,11 @@ impl EdgeConfig {
 
     /// Fixed bearer — dev mode and tests, where tokens never expire.
     pub fn with_static_token(url: impl Into<String>, token: impl Into<String>) -> Self {
-        Self::new(url, Arc::new(zeron_rpc::StaticToken(token.into())))
+        Self::new(url, Arc::new(clyra_rpc::StaticToken(token.into())))
     }
 
     /// The current bearer, or a distinct signed-out/temporarily-unavailable error.
-    pub async fn bearer(&self) -> Result<String, zeron_rpc::TokenError> {
+    pub async fn bearer(&self) -> Result<String, clyra_rpc::TokenError> {
         self.token.token().await
     }
 
@@ -172,7 +172,7 @@ impl EdgeConfig {
     /// A per-dial room URL provider for `path` (e.g. `/session/{chatId}/ws`):
     /// the bearer is re-fetched before every connect, so reconnects after a
     /// token expiry present a fresh `?token=` instead of the boot-time one.
-    pub fn room_url(&self, path: impl Into<String>) -> Arc<dyn zeron_sync::UrlProvider> {
+    pub fn room_url(&self, path: impl Into<String>) -> Arc<dyn clyra_sync::UrlProvider> {
         let ws_base = self.url.replacen("http", "ws", 1);
         Arc::new(EdgeRoomUrl {
             base: format!("{}{}", ws_base.trim_end_matches('/'), path.into()),
@@ -184,17 +184,17 @@ impl EdgeConfig {
 
 struct EdgeRoomUrl {
     base: String,
-    token: Arc<dyn zeron_rpc::TokenSource>,
+    token: Arc<dyn clyra_rpc::TokenSource>,
     device_id: String,
 }
 
-impl zeron_sync::UrlProvider for EdgeRoomUrl {
-    fn url(&self) -> futures::future::BoxFuture<'static, Result<String, zeron_sync::SyncError>> {
+impl clyra_sync::UrlProvider for EdgeRoomUrl {
+    fn url(&self) -> futures::future::BoxFuture<'static, Result<String, clyra_sync::SyncError>> {
         let token = self.token.clone();
         let base = self.base.clone();
         let device = self.device_id.clone();
         Box::pin(async move {
-            let token = token.token().await.map_err(zeron_sync::SyncError::from)?;
+            let token = token.token().await.map_err(clyra_sync::SyncError::from)?;
             let mut url = format!("{base}?token={token}");
             if !device.is_empty() {
                 url.push_str(&format!("&device={device}"));
@@ -252,14 +252,14 @@ struct DocHostInner {
     uploads: OnceLock<crate::uploads::Uploads>,
     /// Connectivity watch (`WatchConnectivity`): lazily-started monitor
     /// publishes the edge posture on change (see `watch_connectivity`).
-    connectivity: OnceLock<watch::Sender<zeron_proto::Connectivity>>,
+    connectivity: OnceLock<watch::Sender<clyra_proto::Connectivity>>,
     connectivity_started: AtomicBool,
     /// In-flight queued-attachment transfers, published per landed chunk
     /// (see `watch_transfers`). Entries live exactly as long as bytes are
     /// moving: added when a file's push starts, removed on commit or failure
     /// (a retry re-adds), so consumers can render a real percent while the
     /// relay leg runs and fall back to indeterminate otherwise.
-    transfers: watch::Sender<Vec<zeron_proto::TransferProgress>>,
+    transfers: watch::Sender<Vec<clyra_proto::TransferProgress>>,
     connectivity_grace: Mutex<DegradeGrace>,
     /// Command ids currently BETWEEN mark-processed and their resolution in a
     /// drain. Distinguishes "executing right now" from "consumed by the
@@ -269,7 +269,7 @@ struct DocHostInner {
     executing: Mutex<HashSet<String>>,
     /// Peer links (engine assembly, edge runtimes only) — the transport that
     /// pushes queued attachment bytes to a remote host.
-    links: OnceLock<Arc<zeron_rpc::LinkCache>>,
+    links: OnceLock<Arc<clyra_rpc::LinkCache>>,
     /// Shared client for sidecar blob PUT/GET (30s timeout, uploads.rs
     /// discipline — diff_sync's untimed client hung on dead links).
     http: reqwest::Client,
@@ -485,7 +485,7 @@ pub enum FinishQueueEditOutcome {
 #[derive(Clone, Default)]
 pub struct TranscriptSnapshot {
     pub entries: Arc<Vec<SessionMessageEntry>>,
-    pub replay_baseline: Arc<zeron_doc::TranscriptBaseline>,
+    pub replay_baseline: Arc<clyra_doc::TranscriptBaseline>,
 }
 
 /// One open chat doc: the `SessionDoc`, its change plumbing, and the room client.
@@ -543,7 +543,7 @@ pub struct ChatDocHandle {
     retired: AtomicBool,
     /// chat2 relay client (docs/chat2-sync.md C3) — populated once the
     /// registry names roomGen 2 for this chat and the join resolves.
-    chat2: Mutex<Option<zeron_sync::ChatClient>>,
+    chat2: Mutex<Option<clyra_sync::ChatClient>>,
     pub(crate) persistence: Option<Arc<crate::chat_persistence::ChatPersistence>>,
     /// Local commits made before the relay connects (the dial can take up
     /// to a minute; offline, forever): buffered here by the subscription
@@ -664,7 +664,7 @@ impl ChatDocHandle {
 
     /// Recovery sweep: stamp this device's abandoned `streaming` entries `aborted`, appending
     /// `note` as a visible error part so the transcript says WHY the turn
-    /// ended (zeron folded "Run interrupted by backend restart" the same
+    /// ended (clyra folded "Run interrupted by backend restart" the same
     /// way). Returns the stamped entries' `(id, created_at)` — recovery uses
     /// them for the resume-freshness check.
     pub fn mark_abandoned_streams(&self, note: &str) -> Result<Vec<(String, i64)>, DocError> {
@@ -817,7 +817,7 @@ impl DocHost {
 
     /// The sessions engine, once wired. `None` before assembly or after
     /// `shutdown_workers` — callers treat both as "executor unavailable".
-    fn sessions(&self) -> Option<SessionsEngine> {
+    pub(crate) fn sessions(&self) -> Option<SessionsEngine> {
         lock(&self.inner.sessions).clone()
     }
 
@@ -848,7 +848,7 @@ impl DocHost {
     /// see — so watch session status instead and re-drain every warm chat.
     /// `drain_queue` is a cheap no-op for empty queues and busy agents, which
     /// is why this can afford to be indiscriminate.
-    fn spawn_queue_flush_watcher(&self, mut statuses: watch::Receiver<Vec<zeron_proto::Session>>) {
+    fn spawn_queue_flush_watcher(&self, mut statuses: watch::Receiver<Vec<clyra_proto::Session>>) {
         let host = self.clone();
         self.spawn_worker(async move {
             while statuses.changed().await.is_ok() {
@@ -909,7 +909,7 @@ impl DocHost {
     }
 
     /// Wire the repos engine (engine assembly) — worktree materialization for
-    /// Run commands carrying a [`zeron_proto::WorktreeSpec`].
+    /// Run commands carrying a [`clyra_proto::WorktreeSpec`].
     pub fn set_repos(&self, repos: crate::repos::Repos) {
         let _ = self.inner.repos.set(repos);
     }
@@ -933,7 +933,7 @@ impl DocHost {
 
     /// Wire the peer-link cache (engine assembly, edge runtimes only) — the
     /// transport for queued attachment transfers to a remote host.
-    pub fn set_links(&self, links: Arc<zeron_rpc::LinkCache>) {
+    pub fn set_links(&self, links: Arc<clyra_rpc::LinkCache>) {
         let _ = self.inner.links.set(links);
     }
 
@@ -980,7 +980,7 @@ impl DocHost {
                     return; // edge-less engine: nothing to migrate onto
                 };
                 let Some(ws) = host.workspace() else { continue };
-                let chats: Vec<zeron_proto::Chat> = ws.watch_chats().borrow().clone();
+                let chats: Vec<clyra_proto::Chat> = ws.watch_chats().borrow().clone();
                 let device = host.inner.config.device_id.clone();
                 let now = now_ms();
                 let candidate = chats.into_iter().find(|c| {
@@ -1023,7 +1023,7 @@ impl DocHost {
     /// the chat2 adopt path. A handle with a LIVE local writer (a running
     /// turn's doc ref) is left alone — the host never flips mid-run, and a
     /// racing writer must never lose its doc out from under it.
-    fn spawn_cutover_watcher(&self, mut chats: watch::Receiver<Vec<zeron_proto::Chat>>) {
+    fn spawn_cutover_watcher(&self, mut chats: watch::Receiver<Vec<clyra_proto::Chat>>) {
         let host = self.clone();
         self.spawn_worker(async move {
             loop {
@@ -1475,7 +1475,7 @@ impl DocHost {
                 chat.clone(),
             ));
             let url = edge.room_url(format!("/chat2/{chat}/ws"));
-            let mut wake = zeron_sync::wake::subscribe();
+            let mut wake = clyra_sync::wake::subscribe();
             // Sibling-dial successes end a backoff wait immediately, exactly
             // like the joined clients' own reconnect loops (chat_client.rs).
             // Without this, a NEW chat whose first joins hit a network blip
@@ -1483,7 +1483,7 @@ impl DocHost {
             // established room redialed instantly on recovery — fresh sends
             // to new sessions stalled while other chats hummed (2026-08-19
             // user report, reproduced on two networks).
-            let mut online = zeron_sync::wake::subscribe_online();
+            let mut online = clyra_sync::wake::subscribe_online();
             let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
             loop {
                 if weak.upgrade().is_none() {
@@ -1502,7 +1502,7 @@ impl DocHost {
                 ));
                 let dial = tokio::time::timeout(
                     std::time::Duration::from_secs(60),
-                    zeron_sync::ChatClient::connect_via_transport(
+                    clyra_sync::ChatClient::connect_via_transport(
                         url.clone(),
                         sink.clone(),
                         fetcher.clone(),
@@ -1514,7 +1514,7 @@ impl DocHost {
                 .await;
                 match dial {
                     Ok(Ok(client)) => {
-                        if matches!(edge.bearer().await, Err(zeron_rpc::TokenError::SignedOut)) {
+                        if matches!(edge.bearer().await, Err(clyra_rpc::TokenError::SignedOut)) {
                             return;
                         }
                         let Some(handle) = weak.upgrade() else {
@@ -1610,7 +1610,7 @@ impl DocHost {
                             let weak = weak.clone();
                             let chat = chat.clone();
                             host.clone().spawn_worker(async move {
-                                use zeron_sync::chat_client::ChatEvent;
+                                use clyra_sync::chat_client::ChatEvent;
                                 loop {
                                     match events.recv().await {
                                         Ok(ChatEvent::ServerReset) => {
@@ -1641,7 +1641,7 @@ impl DocHost {
                                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                                 },
                                 _ = crate::workspace_host::token_changed(&mut token_changes) => {
-                                    if matches!(edge.bearer().await, Err(zeron_rpc::TokenError::SignedOut)) {
+                                    if matches!(edge.bearer().await, Err(clyra_rpc::TokenError::SignedOut)) {
                                         if let Some(handle) = weak.upgrade() {
                                             lock(&handle.chat2).take();
                                             // Keep journaling local cleanup after credentials disappear.
@@ -1780,7 +1780,7 @@ impl DocHost {
     ) -> Result<(), String> {
         use base64::Engine as _;
         let vv_at_rebuild = doc.doc().oplog_vv().encode();
-        let rebuilt = zeron_doc::rebuild::rebuild_thin_doc(&doc).map_err(|e| e.to_string())?;
+        let rebuilt = clyra_doc::rebuild::rebuild_thin_doc(&doc).map_err(|e| e.to_string())?;
         // The seed's own doc ref must be gone before the pinned re-check
         // below: `pinned` reads `Arc::strong_count(&handle.doc) > 1`, and
         // holding this clone made that true unconditionally — every seed
@@ -1904,7 +1904,7 @@ impl DocHost {
             // Let boot settle (registry load, room joins) before sweeping.
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let Some(ws) = host.workspace() else { return };
-            let chats: Vec<zeron_proto::Chat> = ws.watch_chats().borrow().clone();
+            let chats: Vec<clyra_proto::Chat> = ws.watch_chats().borrow().clone();
             for chat in chats {
                 if chat.device_id != host.inner.config.device_id {
                     continue; // only the host owns its chats' history
@@ -1924,6 +1924,109 @@ impl DocHost {
                 }
             }
         });
+    }
+
+    /// Settings → Analytics: every prompt sent in this device's chats (the
+    /// user entries' timestamps, attributed to the chat's agent) plus the
+    /// session count per agent. Transcripts only live on their host device,
+    /// so remote chats are left to their own engines.
+    pub async fn usage_analytics(&self) -> clyra_proto::UsageAnalytics {
+        use clyra_proto::{HarnessId, UsagePrompt, UsageSessionCount};
+        let Some(ws) = self.workspace() else {
+            return clyra_proto::UsageAnalytics::default();
+        };
+        let chats: Vec<clyra_proto::Chat> = ws.watch_chats().borrow().clone();
+        let mut prompts = Vec::new();
+        let mut sessions: HashMap<HarnessId, u32> = HashMap::new();
+        for chat in chats {
+            if chat.device_id != self.inner.config.device_id {
+                continue;
+            }
+            let Some(harness) = chat.config.as_ref().map(|config| config.harness) else {
+                continue;
+            };
+            if harness == HarnessId::Mock {
+                continue;
+            }
+            *sessions.entry(harness).or_default() += 1;
+            let Ok(handle) = self.open(&chat.id) else {
+                continue;
+            };
+            if let Ok(entries) = handle.doc().read_entries() {
+                prompts.extend(
+                    entries
+                        .iter()
+                        .filter(|entry| entry.role == clyra_doc::MessageRole::User)
+                        .map(|entry| UsagePrompt {
+                            at: entry.created_at,
+                            harness,
+                        }),
+                );
+            }
+            // Many chats: stay a good neighbour on the runtime.
+            tokio::task::yield_now().await;
+        }
+        let mut sessions: Vec<UsageSessionCount> = sessions
+            .into_iter()
+            .map(|(harness, count)| UsageSessionCount { harness, count })
+            .collect();
+        sessions.sort_by(|a, b| b.count.cmp(&a.count));
+        prompts.sort_by_key(|prompt| prompt.at);
+        clyra_proto::UsageAnalytics { prompts, sessions }
+    }
+
+    /// Boot sweep: give edit tool parts folded before line counts existed
+    /// their `diffStats`, recovered from each local chat's run journal (it
+    /// keeps the unsanitized edit payloads the doc strips). Parts the journal
+    /// cannot count get an empty marker, so each part is visited once.
+    pub fn spawn_diff_stats_backfill(&self, journals_dir: std::path::PathBuf) {
+        let host = self.clone();
+        self.spawn_worker(async move {
+            // After boot settles and the transcript salvage has had its turn.
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let Some(ws) = host.workspace() else { return };
+            let chats: Vec<clyra_proto::Chat> = ws.watch_chats().borrow().clone();
+            for chat in chats {
+                if chat.device_id != host.inner.config.device_id {
+                    continue; // only the host holds the journal
+                }
+                if chat.room_gen.unwrap_or(1) < 2 {
+                    continue; // s2-mode: the transcript lives in its room
+                }
+                let journal = journals_dir.join(format!("{}.jsonl", chat.id));
+                if !journal.is_file() {
+                    continue;
+                }
+                if let Err(err) = host.backfill_chat_diff_stats(&chat.id, journal).await {
+                    tracing::warn!(chat = %chat.id, error = %err, "diff-stats backfill failed");
+                }
+            }
+        });
+    }
+
+    async fn backfill_chat_diff_stats(
+        &self,
+        chat_id: &str,
+        journal: std::path::PathBuf,
+    ) -> Result<(), String> {
+        let handle = self.open(chat_id).map_err(|e| e.to_string())?;
+        let entries = handle.doc().read_entries().map_err(|e| e.to_string())?;
+        if !clyra_doc::needs_diff_stats_backfill(&entries) {
+            return Ok(());
+        }
+        let text = tokio::task::spawn_blocking(move || std::fs::read_to_string(journal))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        let stats = clyra_doc::diff_stats_from_journal(&entries, &text);
+        let written = handle
+            .doc()
+            .backfill_diff_stats(&stats)
+            .map_err(|e| e.to_string())?;
+        if written > 0 {
+            tracing::info!(chat = %chat_id, parts = written, "diff stats backfilled from journal");
+        }
+        Ok(())
     }
 
     async fn salvage_chat_transcript(&self, chat_id: &str) -> Result<(), String> {
@@ -1951,7 +2054,7 @@ impl DocHost {
         // Thin before appending (docs/chat2-sync.md A2): full outputs are
         // parked, exactly like a seed — they survive in the rollback copy
         // saved below and the run journal.
-        let rebuilt = zeron_doc::rebuild::rebuild_thin_doc(&fat).map_err(|e| e.to_string())?;
+        let rebuilt = clyra_doc::rebuild::rebuild_thin_doc(&fat).map_err(|e| e.to_string())?;
         let entries = rebuilt.doc.read_entries().map_err(|e| e.to_string())?;
         if entries.is_empty() {
             return Ok(());
@@ -2003,7 +2106,7 @@ impl DocHost {
         let doc = handle.doc.clone();
         let body = tokio::task::spawn_blocking(move || {
             let tail =
-                zeron_doc::materialize_tail(&doc, now_ms(), zeron_doc::TAIL_MESSAGE_COUNT).ok()?;
+                clyra_doc::materialize_tail(&doc, now_ms(), clyra_doc::TAIL_MESSAGE_COUNT).ok()?;
             serde_json::to_vec(&tail).ok()
         })
         .await
@@ -2173,7 +2276,7 @@ impl DocHost {
                         .sum::<usize>(),
                 )
             };
-            if count <= WARM_DOC_CAP && estimate <= zeron_doc::DOC_LRU_BYTE_BUDGET {
+            if count <= WARM_DOC_CAP && estimate <= clyra_doc::DOC_LRU_BYTE_BUDGET {
                 return;
             }
             let evicted = {
@@ -2283,14 +2386,14 @@ impl DocHost {
             if let Ok(res) = res
                 && res.status().is_success()
             {
-                zeron_sync::wake::notify_online();
+                clyra_sync::wake::notify_online();
             }
         });
     }
 
     /// The in-flight queued-attachment transfer set: current entries first,
     /// then a fresh snapshot per landed chunk (see `push_attachments`).
-    pub fn watch_transfers(&self) -> watch::Receiver<Vec<zeron_proto::TransferProgress>> {
+    pub fn watch_transfers(&self) -> watch::Receiver<Vec<clyra_proto::TransferProgress>> {
         self.inner.transfers.subscribe()
     }
 
@@ -2302,7 +2405,7 @@ impl DocHost {
                     t.done = done;
                     t.total = total;
                 }
-                None => list.push(zeron_proto::TransferProgress {
+                None => list.push(clyra_proto::TransferProgress {
                     upload_id: upload_id.to_string(),
                     file_name: file_name.to_string(),
                     done,
@@ -2325,7 +2428,7 @@ impl DocHost {
     /// (atomics + small locks), published only when the value changes. The
     /// retry countdown renders client-side from `retry_at_ms`, so quiet
     /// periods emit nothing at all.
-    pub fn watch_connectivity(&self) -> watch::Receiver<zeron_proto::Connectivity> {
+    pub fn watch_connectivity(&self) -> watch::Receiver<clyra_proto::Connectivity> {
         let tx = self
             .inner
             .connectivity
@@ -2366,8 +2469,8 @@ impl DocHost {
     /// those flashed amber warnings and "Queued" badges at every chat
     /// switch. Raw degradation must persist [`DEGRADE_GRACE`] before it is
     /// reported; recovery reports instantly.
-    fn compute_connectivity(&self) -> zeron_proto::Connectivity {
-        use zeron_proto::{ChatConnectivity, Connectivity, ConnectivityState};
+    fn compute_connectivity(&self) -> clyra_proto::Connectivity {
+        use clyra_proto::{ChatConnectivity, Connectivity, ConnectivityState};
         let workspace = self.workspace();
         let edge_expected = self.inner.config.edge.is_some()
             || workspace.as_ref().is_some_and(|w| w.edge_expected());
@@ -2396,7 +2499,7 @@ impl DocHost {
             .and_then(|w| w.sync_status())
             .is_some_and(|s| s.connected);
         let path_offline =
-            grace.degraded(GraceKey::OsPath, zeron_sync::wake::path_is_offline(), now);
+            grace.degraded(GraceKey::OsPath, clyra_sync::wake::path_is_offline(), now);
         let registry_down = grace.degraded(GraceKey::Registry, !registry_connected, now);
         let (state, retry_at_ms, last_failure) = if path_offline {
             (
@@ -2422,12 +2525,12 @@ impl DocHost {
         }
     }
 
-    /// Per-open-chat room introspection for SyncStatus / `zeron sync`.
+    /// Per-open-chat room introspection for SyncStatus / `clyra sync`.
     /// `None` room = still dialing (join retry loop) or edge-less.
-    pub fn sync_statuses(&self) -> Vec<(String, Option<zeron_sync::ChatStatsSnapshot>)> {
+    pub fn sync_statuses(&self) -> Vec<(String, Option<clyra_sync::ChatStatsSnapshot>)> {
         let handles: Vec<Arc<ChatDocHandle>> =
             lock(&self.inner.handles).values().cloned().collect();
-        let mut rows: Vec<(String, Option<zeron_sync::ChatStatsSnapshot>)> = handles
+        let mut rows: Vec<(String, Option<clyra_sync::ChatStatsSnapshot>)> = handles
             .iter()
             .map(|h| {
                 (
@@ -2549,8 +2652,45 @@ impl DocHost {
         attachments: Vec<String>,
         hold_for_turn_end: bool,
     ) -> Result<String, EngineError> {
+        self.append_queued_message(
+            chat_id,
+            &new_id(),
+            text,
+            attachments,
+            hold_for_turn_end,
+            false,
+        )
+    }
+
+    /// Stable ids make retried engine reports idempotent across a restart.
+    pub(crate) fn queue_message_with_id(
+        &self,
+        chat_id: &str,
+        id: &str,
+        text: &str,
+        attachments: Vec<String>,
+        hold_for_turn_end: bool,
+    ) -> Result<String, EngineError> {
+        self.append_queued_message(chat_id, id, text, attachments, hold_for_turn_end, true)
+    }
+
+    fn append_queued_message(
+        &self,
+        chat_id: &str,
+        id: &str,
+        text: &str,
+        attachments: Vec<String>,
+        hold_for_turn_end: bool,
+        deduplicate: bool,
+    ) -> Result<String, EngineError> {
         let handle = self.open(chat_id)?;
-        let id = new_id();
+        let id = id.to_string();
+        if deduplicate
+            && (handle.doc.read_queue()?.iter().any(|q| q.id == id)
+                || handle.doc.read_entries()?.iter().any(|e| e.id == id))
+        {
+            return Ok(id);
+        }
         handle.doc.push_queued(&QueuedMessage {
             id: id.clone(),
             text: text.to_string(),
@@ -3315,7 +3455,7 @@ impl DocHost {
     /// 2. give the normal path (chat2 rows → edge → host's room) a short
     ///    grace to ack;
     /// 3. rows still not at the edge but the peer link alive → relay-forward
-    ///    the entry itself ([`zeron_rpc::methods::RELAY_COMMAND`]). The
+    ///    the entry itself ([`clyra_rpc::methods::RELAY_COMMAND`]). The
     ///    host's processed ledger claims the client-minted id, so the doc
     ///    row arriving later dedupes to a no-op — exactly-once by
     ///    construction (the 2026-08-18 03:45 incident shape: nudges flowed,
@@ -3340,8 +3480,8 @@ impl DocHost {
             if !transfers.is_empty() && !host.deliver_attachments(&chat, &transfers).await {
                 return; // gave up; the drain's wait cap surfaces the failure
             }
-            let mut wake = zeron_sync::wake::subscribe();
-            let mut online = zeron_sync::wake::subscribe_online();
+            let mut wake = clyra_sync::wake::subscribe();
+            let mut online = clyra_sync::wake::subscribe_online();
             let give_up = tokio::time::Instant::now() + RELAY_GIVE_UP;
             let grace_end = tokio::time::Instant::now() + ROWS_GRACE;
             while tokio::time::Instant::now() < grace_end {
@@ -3392,8 +3532,8 @@ impl DocHost {
         chat: &str,
         transfers: &[crate::uploads::AttachmentTransfer],
     ) -> bool {
-        let mut wake = zeron_sync::wake::subscribe();
-        let mut online = zeron_sync::wake::subscribe_online();
+        let mut wake = clyra_sync::wake::subscribe();
+        let mut online = clyra_sync::wake::subscribe_online();
         let mut backoff = TRANSFER_BACKOFF_BASE;
         let deadline = tokio::time::Instant::now() + ATTACHMENT_WAIT_MAX;
         loop {
@@ -3464,7 +3604,7 @@ impl DocHost {
             .into_iter()
             .flatten()
             .find(|d| d.id == target)
-            .and_then(|d| d.version.as_deref().and_then(zeron_proto::version_triple))
+            .and_then(|d| d.version.as_deref().and_then(clyra_proto::version_triple))
             .is_some_and(|v| v >= RELAY_MIN_VERSION);
         if !supported {
             return Err("host does not support relay delivery (version gate)".into());
@@ -3479,13 +3619,13 @@ impl DocHost {
             .await
             .map_err(|e| format!("peer link: {e}"))?;
         let params = serde_json::json!({ "chatId": chat_id, "entry": entry });
-        let call = client.call(zeron_rpc::methods::RELAY_COMMAND, params);
+        let call = client.call(clyra_rpc::methods::RELAY_COMMAND, params);
         match tokio::time::timeout(RELAY_CALL_TIMEOUT, call).await {
             Err(_) => {
                 links.invalidate(target);
                 Err("relay call timed out; peer link suspect".into())
             }
-            Ok(Err(zeron_rpc::RpcError::Failed(err))) => Err(format!("host refused: {err}")),
+            Ok(Err(clyra_rpc::RpcError::Failed(err))) => Err(format!("host refused: {err}")),
             Ok(Err(err)) => {
                 links.invalidate(target);
                 Err(format!("relay call failed: {err}"))
@@ -3635,7 +3775,7 @@ impl DocHost {
         Ok(())
     }
 
-    /// Host side of [`zeron_rpc::methods::RELAY_COMMAND`]: evaluate the
+    /// Host side of [`clyra_rpc::methods::RELAY_COMMAND`]: evaluate the
     /// forwarded entry against OUR doc (dedupe/TTL/supersede rules apply
     /// unchanged), claim its client-minted id in the processed ledger, then
     /// execute. The claim is what makes the doc row arriving later — over
@@ -3743,13 +3883,13 @@ impl DocHost {
                 let params = serde_json::json!({
                     "uploadId": transfer.upload_id, "seq": seq, "data": &b64[start..end],
                 });
-                let call = client.call(zeron_rpc::methods::UPLOAD_CHUNK, params);
+                let call = client.call(clyra_rpc::methods::UPLOAD_CHUNK, params);
                 match tokio::time::timeout(TRANSFER_CHUNK_TIMEOUT, call).await {
                     Err(_) => {
                         links.invalidate(target);
                         return Err(Transient("chunk push timed out; peer link suspect".into()));
                     }
-                    Ok(Err(zeron_rpc::RpcError::Failed(err))) => {
+                    Ok(Err(clyra_rpc::RpcError::Failed(err))) => {
                         return Err(Permanent(format!("host refused chunk: {err}")));
                     }
                     Ok(Err(err)) => {
@@ -3771,13 +3911,13 @@ impl DocHost {
             let params = serde_json::json!({
                 "uploadId": transfer.upload_id, "fileName": transfer.file_name,
             });
-            let call = client.call(zeron_rpc::methods::UPLOAD_COMMIT, params);
+            let call = client.call(clyra_rpc::methods::UPLOAD_COMMIT, params);
             match tokio::time::timeout(TRANSFER_COMMIT_TIMEOUT, call).await {
                 Err(_) => {
                     links.invalidate(target);
                     return Err(Transient("commit timed out; peer link suspect".into()));
                 }
-                Ok(Err(zeron_rpc::RpcError::Failed(err))) => {
+                Ok(Err(clyra_rpc::RpcError::Failed(err))) => {
                     return Err(Permanent(format!("host refused commit: {err}")));
                 }
                 Ok(Err(err)) => {
@@ -3795,7 +3935,7 @@ impl DocHost {
     /// Fire-and-forget: the doc already carries the summary, so a lost upload
     /// degrades to "full output unavailable" — it must never block or fail
     /// the run. Offline/edge-less engines skip silently.
-    pub fn upload_tool_sidecar(&self, chat_id: &str, payload: zeron_doc::SidecarPayload) {
+    pub fn upload_tool_sidecar(&self, chat_id: &str, payload: clyra_doc::SidecarPayload) {
         let Some(edge) = self.inner.config.edge.clone() else {
             return;
         };
@@ -3927,7 +4067,7 @@ impl DocHost {
     pub(crate) fn harness_for_request(
         &self,
         chat_id: &str,
-        request: &zeron_proto::RunRequest,
+        request: &clyra_proto::RunRequest,
     ) -> HarnessId {
         request.harness.unwrap_or_else(|| self.harness_for(chat_id))
     }
@@ -4133,7 +4273,7 @@ impl DocHost {
     /// paths — in the attachments list AND the prompt text — so the harness
     /// (and the persisted user entry) see ordinary local files, exactly like
     /// the legacy pre-upload flow produced.
-    fn resolve_request_attachments(&self, request: &mut zeron_proto::RunRequest) {
+    fn resolve_request_attachments(&self, request: &mut clyra_proto::RunRequest) {
         let Some(uploads) = self.inner.uploads.get() else {
             return;
         };
@@ -4220,7 +4360,7 @@ impl DocHost {
                     ws.claim_chat(chat_id, Some(&request.cwd))?;
                     // A pre-existing row (the client's createChat raced ahead)
                     // still carries the repo folder — repoint it at the fresh
-                    // worktree, and stamp the actual `zeron/<name>` branch so
+                    // worktree, and stamp the actual `clyra/<name>` branch so
                     // the footer and the title-rename flow see it.
                     if let Some(wt) = &fresh_worktree {
                         if let Err(err) = ws.set_chat_cwd(chat_id, &wt.path) {
@@ -4250,7 +4390,7 @@ impl DocHost {
                 if let Some(ws) = self.workspace()
                     && ws.chat_config(chat_id).is_none()
                 {
-                    let config = zeron_proto::ChatConfig {
+                    let config = clyra_proto::ChatConfig {
                         harness,
                         model: request.model.clone(),
                         reasoning: request.reasoning,
@@ -4375,7 +4515,7 @@ impl DocHost {
     /// Put a typed prompt in front of a live agent: steer it in, or — with no
     /// live steerable run — deliver the durable command as the next turn.
     /// After an engine restart `last_request` is empty too, so rebuild the run
-    /// config from the chat's workspace row (zeron derived dispatch config from
+    /// config from the chat's workspace row (clyra derived dispatch config from
     /// the chat row the same way — sessions.ts:601-620); dispatch's engine-owned
     /// resume then reattaches the prior harness conversation.
     ///
@@ -4508,7 +4648,7 @@ impl DocHost {
         sessions: &SessionsEngine,
         chat_id: &str,
         harness: HarnessId,
-        request: zeron_proto::RunRequest,
+        request: clyra_proto::RunRequest,
         message_id: Option<String>,
     ) -> Result<String, EngineError> {
         if let Some(workspace) = self.workspace()
@@ -4522,7 +4662,7 @@ impl DocHost {
             .await
     }
 
-    /// Create (or reuse) the isolated worktree a Run's [`zeron_proto::WorktreeSpec`]
+    /// Create (or reuse) the isolated worktree a Run's [`clyra_proto::WorktreeSpec`]
     /// asks for, returning the resolved cwd plus the fresh worktree when one was
     /// actually created. Reuse guard: a chat whose row already points inside a
     /// linked worktree of the same repo keeps it — a duplicate Run (client retry
@@ -4530,8 +4670,8 @@ impl DocHost {
     async fn materialize_worktree(
         &self,
         chat_id: &str,
-        spec: &zeron_proto::WorktreeSpec,
-    ) -> Result<(String, Option<zeron_proto::Worktree>), EngineError> {
+        spec: &clyra_proto::WorktreeSpec,
+    ) -> Result<(String, Option<clyra_proto::Worktree>), EngineError> {
         if let Some(ws) = self.workspace()
             && let Ok(Some(chat)) = ws.chat(chat_id)
             && let Some(cwd) = chat.cwd
@@ -4563,8 +4703,8 @@ impl DocHost {
         &self,
         command_id: &str,
         chat_id: &str,
-        spec: &zeron_proto::WorktreeSpec,
-        fresh_worktree: Option<&zeron_proto::Worktree>,
+        spec: &clyra_proto::WorktreeSpec,
+        fresh_worktree: Option<&clyra_proto::Worktree>,
     ) {
         let Some((project_actions, terminals)) = self.inner.project_action_runtime.get() else {
             return;
@@ -4595,8 +4735,8 @@ impl DocHost {
         project_actions: &ProjectActionsStore,
         terminals: &Terminals,
         space_id: &str,
-        spec: &zeron_proto::WorktreeSpec,
-        worktree: &zeron_proto::Worktree,
+        spec: &clyra_proto::WorktreeSpec,
+        worktree: &clyra_proto::Worktree,
     ) -> Result<ProjectActionSetupHandoff, EngineError> {
         let workspace = self
             .workspace()
@@ -4646,7 +4786,7 @@ impl DocHost {
         &self,
         chat_id: &str,
         prompt: &str,
-    ) -> Option<zeron_proto::RunRequest> {
+    ) -> Option<clyra_proto::RunRequest> {
         let workspace = self.workspace()?;
         let chat = match workspace.chat(chat_id) {
             Ok(chat) => chat?,
@@ -4656,7 +4796,7 @@ impl DocHost {
             }
         };
         let config = chat.config;
-        Some(zeron_proto::RunRequest {
+        Some(clyra_proto::RunRequest {
             prompt: prompt.to_string(),
             harness: config.as_ref().map(|c| c.harness),
             model: config.as_ref().and_then(|c| c.model.clone()),
@@ -4669,7 +4809,7 @@ impl DocHost {
             sandbox: config
                 .as_ref()
                 .map(|c| c.sandbox)
-                .unwrap_or(zeron_proto::SandboxLevel::WorkspaceWrite),
+                .unwrap_or(clyra_proto::SandboxLevel::WorkspaceWrite),
             auto_approve: false,
             attachments: Vec::new(),
             resume: None,
@@ -4777,12 +4917,12 @@ mod transfer_progress_tests {
 
     fn host() -> (tempfile::TempDir, DocHost) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).expect("store opens"));
+        let store = Arc::new(clyra_sync::DocsStore::open(dir.path()).expect("store opens"));
         let host = DocHost::new(
             store,
             DocHostConfig {
                 device_id: "dev-test".into(),
-                default_harness: zeron_proto::HarnessId::Mock,
+                default_harness: clyra_proto::HarnessId::Mock,
                 edge: None,
             },
         );
@@ -4792,13 +4932,13 @@ mod transfer_progress_tests {
     #[tokio::test]
     async fn whale_snapshot_opens_and_reopens_without_network() {
         let (_dir, host) = host();
-        let source = zeron_doc::SessionDoc::init("persisted-whale").unwrap();
+        let source = clyra_doc::SessionDoc::init("persisted-whale").unwrap();
         for i in 0..2000 {
             source
-                .push_message(&zeron_doc::SessionMessageEntry {
+                .push_message(&clyra_doc::SessionMessageEntry {
                     id: format!("row-{i}"),
-                    role: zeron_doc::MessageRole::User,
-                    parts: vec![zeron_doc::MessagePart::Text {
+                    role: clyra_doc::MessageRole::User,
+                    parts: vec![clyra_doc::MessagePart::Text {
                         id: "text".into(),
                         text: "x".repeat(2048),
                     }],
@@ -4943,19 +5083,19 @@ mod source_context_tests {
         let repo = dir.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
         git(&repo, &["init", "-b", "feature/captured"]);
-        git(&repo, &["config", "user.name", "Zeron Test"]);
-        git(&repo, &["config", "user.email", "zeron@example.com"]);
+        git(&repo, &["config", "user.name", "Clyra Test"]);
+        git(&repo, &["config", "user.email", "clyra@example.com"]);
         std::fs::write(repo.join("README.md"), "capture\n").unwrap();
         git(&repo, &["add", "README.md"]);
         git(&repo, &["commit", "-m", "capture"]);
 
         let store =
-            Arc::new(zeron_sync::DocsStore::open(dir.path().join("docs")).expect("store opens"));
+            Arc::new(clyra_sync::DocsStore::open(dir.path().join("docs")).expect("store opens"));
         let host = DocHost::new(
             store,
             DocHostConfig {
                 device_id: "device-a".into(),
-                default_harness: zeron_proto::HarnessId::Mock,
+                default_harness: clyra_proto::HarnessId::Mock,
                 edge: None,
             },
         );

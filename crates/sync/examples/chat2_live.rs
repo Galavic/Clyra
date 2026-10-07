@@ -5,16 +5,16 @@
 //! checkpoint-then-rows on a fresh doc, then live push/ack.
 //!
 //! Usage:
-//!   cargo run -p zeron-sync --example chat2_live -- <baseUrl> <chatId> <token> <device>
+//!   cargo run -p clyra-sync --example chat2_live -- <baseUrl> <chatId> <token> <device>
 //!
 //! Prints a single JSON result line prefixed RESULT: for the driver to parse.
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
+use clyra_sync::SyncError;
+use clyra_sync::chat_client::{ChatClient, ChatDocSink, CheckpointFetcher, RowImportOutcome};
 use futures::future::BoxFuture;
 use loro::{ExportMode, LoroDoc, VersionVector};
-use zeron_sync::SyncError;
-use zeron_sync::chat_client::{ChatClient, ChatDocSink, CheckpointFetcher, RowImportOutcome};
 
 struct DocSink {
     doc: Mutex<LoroDoc>,

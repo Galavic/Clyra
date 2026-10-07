@@ -22,13 +22,13 @@ placeholder and uses the existing 2–15 second retry ladder.
 ## Automated checks
 
 ```sh
-cargo test -p zeron-proto -p zeron-doc
-cargo test -p zeron-engine generated_image
-cargo test -p zeron-engine --test e2e --test device_routing --test workspace_sync
-cargo test -p zeron-harness codex
-cargo test -p zeron-harness --test codex
-cargo test -p zeron-ui transcript
-cargo test -p zeron-ui attachments
+cargo test -p clyra-proto -p clyra-doc
+cargo test -p clyra-engine generated_image
+cargo test -p clyra-engine --test e2e --test device_routing --test workspace_sync
+cargo test -p clyra-harness codex
+cargo test -p clyra-harness --test codex
+cargo test -p clyra-ui transcript
+cargo test -p clyra-ui attachments
 cd edge && npm test
 ```
 
@@ -52,8 +52,8 @@ These tests stay ignored in normal runs. They require an authenticated Codex
 installation and a model/account provisioned for image generation.
 
 ```sh
-cargo test -p zeron-harness --test codex real_image_generation_smoke -- --ignored
-cargo test -p zeron-engine --test e2e real_image_generation_profile_smoke -- --ignored
+cargo test -p clyra-harness --test codex real_image_generation_smoke -- --ignored
+cargo test -p clyra-engine --test e2e real_image_generation_profile_smoke -- --ignored
 ```
 
 The harness smoke checks that the real provider returns an existing saved file;
@@ -92,7 +92,7 @@ image Base64. Other user-authored content may legitimately contain those strings
 - `cargo fmt --all -- --check` reports pre-existing formatting differences in
   10 files; each affected file also fails formatting in the original checkout.
 - Strict `cargo clippy --workspace --all-targets -- -D warnings` stops on
-  pre-existing `zeron-theme` lints. A full run with `--cap-lints warn` completes
+  pre-existing `clyra-theme` lints. A full run with `--cap-lints warn` completes
   and preserves the existing warnings for review.
 
 The full workspace command used to continue past the confirmed baseline failure:
@@ -128,10 +128,10 @@ an iPhone. Changed Swift files passed a tree-sitter syntax parse and `git diff
 On a Mac with the project dependencies installed and `SIMULATOR_UDID` set:
 
 ```sh
-xcodebuild test -project apps/ios/Zeron.xcodeproj -scheme Zeron \
+xcodebuild test -project apps/ios/Clyra.xcodeproj -scheme Clyra \
   -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
-  -only-testing:ZeronTests/GeneratedImageTests \
-  -only-testing:ZeronTests/TranscriptLayoutTests
+  -only-testing:ClyraTests/GeneratedImageTests \
+  -only-testing:ClyraTests/TranscriptLayoutTests
 ```
 
 For the device check, generate an image on a desktop host and open its chat on
@@ -142,7 +142,7 @@ and dark appearances and a portrait image whose displayed height reaches the cap
 
 ## Desktop security regressions
 
-`cargo test --locked -p zeron-ui --lib generated_image -- --test-threads=1`
+`cargo test --locked -p clyra-ui --lib generated_image -- --test-threads=1`
 includes policy/alias/load-claim isolation, MIME corrections, actual format
 validation, static-frame downsampling, and a 100-image cache-history budget test.
 Existing transcript tests verify that generated history is not protected from

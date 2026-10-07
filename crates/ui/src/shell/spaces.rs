@@ -10,9 +10,9 @@
 
 use super::*;
 use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
+use clyra_proto::{ChatIndicator, Device, DriveEntry, DriveListing, FolderListing, Space};
 use gpui::{FocusHandle, Window};
 use std::collections::HashSet;
-use zeron_proto::{ChatIndicator, Device, DriveEntry, DriveListing, FolderListing, Space};
 
 /// Promote the user's ordered pins above the untouched activity projection.
 /// Every unpinned id keeps exactly the relative order supplied by recency.
@@ -192,8 +192,8 @@ pub(super) fn pinned_drag_scroll_delta(
 
 #[cfg(test)]
 mod pinned_session_tests {
-    fn pin_change(id: &str) -> zeron_proto::SidebarPinChange {
-        zeron_proto::SidebarPinChange::Pin {
+    fn pin_change(id: &str) -> clyra_proto::SidebarPinChange {
+        clyra_proto::SidebarPinChange::Pin {
             session_id: id.into(),
             after: None,
             before: None,
@@ -238,7 +238,7 @@ mod pinned_session_tests {
                     edge_token: None,
                     org_id: None,
                     workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
+                    default_harness: clyra_proto::HarnessId::Mock,
                 },
                 cx,
             )
@@ -246,9 +246,9 @@ mod pinned_session_tests {
     }
 
     fn remote_pin_state(state: &mut super::AppState, synced: bool, initialized: bool) {
-        state.workspace_scope = Some(zeron_proto::WorkspaceScope::Synced);
-        state.auth = Some(zeron_proto::AuthState::SignedIn {
-            user: zeron_proto::UserProfile {
+        state.workspace_scope = Some(clyra_proto::WorkspaceScope::Synced);
+        state.auth = Some(clyra_proto::AuthState::SignedIn {
+            user: clyra_proto::UserProfile {
                 id: "user".into(),
                 email: "test@example.com".into(),
                 name: None,
@@ -259,7 +259,7 @@ mod pinned_session_tests {
         state.sidebar_preferences.initialized = initialized;
     }
 
-    fn pin_test_chat(id: &str) -> zeron_proto::Chat {
+    fn pin_test_chat(id: &str) -> clyra_proto::Chat {
         serde_json::from_value(serde_json::json!({
             "id": id, "title": id, "deviceId": "local", "archived": false,
             "createdAt": chrono::Utc::now(),
@@ -275,14 +275,14 @@ mod pinned_session_tests {
         let (out, requests) = tokio::sync::mpsc::channel(16);
         let (replies, inbound) = tokio::sync::mpsc::channel(16);
         (
-            crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound)),
+            crate::state::EngineHandle::from_test_client(clyra_rpc::RpcClient::new(out, inbound)),
             requests,
             replies,
         )
     }
 
-    fn pin_snapshot(revision: u64, pins: &[&str]) -> zeron_proto::SidebarPreferencesState {
-        zeron_proto::SidebarPreferencesState {
+    fn pin_snapshot(revision: u64, pins: &[&str]) -> clyra_proto::SidebarPreferencesState {
+        clyra_proto::SidebarPreferencesState {
             sections: vec![],
             revision,
             synced: true,
@@ -640,7 +640,7 @@ mod pinned_session_tests {
                     let id = shell.sidebar_pin_write.as_ref().unwrap().id;
                     shell.state.update(cx, |state, _| {
                         if change_profile {
-                            state.workspace_scope = Some(zeron_proto::WorkspaceScope::Local);
+                            state.workspace_scope = Some(clyra_proto::WorkspaceScope::Local);
                         } else {
                             state.set_test_engine(replacement);
                         }
@@ -745,7 +745,7 @@ mod pinned_session_tests {
         let window = pin_test_shell(cx, dir.path());
         window
             .update(cx, |shell, window, cx| {
-                let saved: Vec<String> = (0..zeron_proto::MAX_SIDEBAR_PINS)
+                let saved: Vec<String> = (0..clyra_proto::MAX_SIDEBAR_PINS)
                     .map(|n| format!("hidden-{n}"))
                     .collect();
                 for remote in [false, true] {
@@ -818,7 +818,7 @@ mod pinned_session_tests {
                     cx
                 ));
                 assert!(!shell.validate_sidebar_pin_change(&key, &ids(&[""]), cx));
-                let saved: Vec<_> = (0..zeron_proto::MAX_SIDEBAR_PINS)
+                let saved: Vec<_> = (0..clyra_proto::MAX_SIDEBAR_PINS)
                     .map(|n| format!("pin-{n}"))
                     .collect();
                 let reordered = super::sidebar_session_drop_pins(
@@ -1021,7 +1021,7 @@ mod pinned_session_tests {
                         edge_token: None,
                         org_id: None,
                         workos_client_id: None,
-                        default_harness: zeron_proto::HarnessId::Mock,
+                        default_harness: clyra_proto::HarnessId::Mock,
                     },
                     cx,
                 );
@@ -1141,7 +1141,7 @@ mod pinned_session_tests {
                         edge_token: None,
                         org_id: None,
                         workos_client_id: None,
-                        default_harness: zeron_proto::HarnessId::Mock,
+                        default_harness: clyra_proto::HarnessId::Mock,
                     },
                     cx,
                 );
@@ -1158,6 +1158,12 @@ mod pinned_session_tests {
                         .map(|(ix, id)| {
                             serde_json::from_value(serde_json::json!({
                                 "id": id, "title": id, "deviceId": "local", "archived": false,
+                                // `newer` carries a config, so it owns an identity
+                                // line even with the project label off.
+                                "config": {
+                                    "harness": "claude-code", "model": "Opus 5.5",
+                                    "sandbox": "workspace-write",
+                                },
                                 "sourceContext": {
                                     "checkoutId": "checkout", "repoRoot": "/project", "cwd": "/project",
                                     "branch": "feature/sidebar-drag", "observedAt": Utc::now(),
@@ -1170,6 +1176,9 @@ mod pinned_session_tests {
                     let mut archived = state.chats[0].clone();
                     archived.id = "archived".into();
                     archived.archived = true;
+                    // No agent to name: this row covers the project-name
+                    // fallback, where the label setting alone decides the line.
+                    archived.config = None;
                     state.chats.push(archived);
                 });
                 shell
@@ -1182,8 +1191,17 @@ mod pinned_session_tests {
         let archived = cx.debug_bounds("chat-archived").unwrap();
         assert_eq!(active.size, archived.size);
         assert_eq!(cx.debug_bounds("chat-branch-archived").is_some(), !compact);
+        // The identity line carries the agent when the session has one and the
+        // project name otherwise: `newer` has a config, so it keeps the line even
+        // with the project label off, and the archived copy of `older` follows
+        // the label setting because it has no config.
         assert_eq!(
-            cx.debug_bounds("chat-device-archived").is_some(),
+            cx.debug_bounds("chat-agent-newer").is_some(),
+            !compact,
+            "a session with a model always gets an identity line"
+        );
+        assert_eq!(
+            cx.debug_bounds("chat-agent-archived").is_some(),
             !compact && show_label
         );
         if compact {
@@ -1545,7 +1563,7 @@ mod pinned_session_tests {
             for id in shell.active_sidebar_pins(cx) {
                 shell.apply_sidebar_pin_change(
                     key.clone(),
-                    zeron_proto::SidebarPinChange::Unpin { session_id: id },
+                    clyra_proto::SidebarPinChange::Unpin { session_id: id },
                     cx,
                 );
             }
@@ -1807,17 +1825,17 @@ pub(super) fn pinned_drag_snapshot_is_valid(
 
 struct ActiveChatRow {
     status: ChatIndicator,
-    chat: zeron_proto::Chat,
+    chat: clyra_proto::Chat,
     folder: String,
     branch: Option<String>,
-    change_request: Option<zeron_proto::ChangeRequestSummary>,
+    change_request: Option<clyra_proto::ChangeRequestSummary>,
     group: Option<(String, String)>,
 }
 
 pub(super) fn compare_sidebar_chats(
     sort: SidebarSort,
-    left: &zeron_proto::Chat,
-    right: &zeron_proto::Chat,
+    left: &clyra_proto::Chat,
+    right: &clyra_proto::Chat,
 ) -> std::cmp::Ordering {
     let primary = match sort {
         SidebarSort::Created => right.created_at.cmp(&left.created_at),
@@ -2624,20 +2642,20 @@ impl Shell {
             let after = index.checked_sub(1).and_then(|i| next.get(i)).cloned();
             let before = next.get(index + 1).cloned();
             if saved.contains(&payload.chat_id) {
-                zeron_proto::SidebarPinChange::Move {
+                clyra_proto::SidebarPinChange::Move {
                     session_id: payload.chat_id.clone(),
                     after,
                     before,
                 }
             } else {
-                zeron_proto::SidebarPinChange::Pin {
+                clyra_proto::SidebarPinChange::Pin {
                     session_id: payload.chat_id.clone(),
                     after,
                     before,
                 }
             }
         } else {
-            zeron_proto::SidebarPinChange::Unpin {
+            clyra_proto::SidebarPinChange::Unpin {
                 session_id: payload.chat_id.clone(),
             }
         };
@@ -2645,7 +2663,7 @@ impl Shell {
             && !matches!(target, SidebarSessionDrop::Pinned(_))
         {
             if !self.change_sidebar_section(
-                zeron_proto::SidebarSectionChange::Assign {
+                clyra_proto::SidebarSectionChange::Assign {
                     session_id: payload.chat_id.clone(),
                     section_id: target_section.map(str::to_owned),
                 },
@@ -4031,7 +4049,7 @@ impl Shell {
             .as_ref()
             .map_or(saved_pins.as_slice(), |ids| ids.as_slice());
         let state = self.state.read(cx);
-        let mut chats: Vec<zeron_proto::Chat> = state
+        let mut chats: Vec<clyra_proto::Chat> = state
             .sidebar_chats(Utc::now(), filter.as_deref())
             .into_iter()
             .map(|(_, chat)| chat.clone())
@@ -4061,7 +4079,7 @@ impl Shell {
             })
             .collect();
         let ordered = if self.settings.sidebar_organization != SidebarOrganization::InOneList {
-            let mut groups: Vec<(Option<(String, String)>, Vec<zeron_proto::Chat>)> = Vec::new();
+            let mut groups: Vec<(Option<(String, String)>, Vec<clyra_proto::Chat>)> = Vec::new();
             for chat in chats {
                 let key = Some((
                     if self.settings.sidebar_organization == SidebarOrganization::ByProject {
@@ -4113,7 +4131,7 @@ impl Shell {
     fn sidebar_chat_data(
         &self,
         status: ChatIndicator,
-        chat: zeron_proto::Chat,
+        chat: clyra_proto::Chat,
         state: &AppState,
     ) -> ActiveChatRow {
         // Line 1 is "project @ device" (t3code's project row);
@@ -4223,7 +4241,7 @@ impl Shell {
             .map(|row| {
                 sidebar_row_height(
                     self.settings.sidebar_compact,
-                    self.settings.sidebar_show_project_label,
+                    self.sidebar_row_identity_line(&row.chat),
                     row.branch.is_some(),
                     row.change_request.is_some(),
                 )
@@ -4281,6 +4299,17 @@ impl Shell {
         sections.extend(regular_groups);
 
         let returning = self.sidebar_session_transfer.is_none();
+        // The transfer borrows `self` mutably for the rest of the block, and a
+        // drag records each row's height — so every row's identity line has to be
+        // resolved before that borrow opens.
+        let identity_lines: Vec<Vec<bool>> = sections
+            .iter()
+            .map(|(_, rows)| {
+                rows.iter()
+                    .map(|row| self.sidebar_row_identity_line(&row.chat))
+                    .collect()
+            })
+            .collect();
         let transfer = self.sidebar_session_transfer.as_mut().or_else(|| {
             self.sidebar_session_return
                 .as_mut()
@@ -4294,6 +4323,8 @@ impl Shell {
                 else {
                     continue;
                 };
+                let identity_line = identity_lines[section_index][index];
+                let compact_rows = self.settings.sidebar_compact;
                 drag.source_group = if section_index == 0 && pinned_count > 0 {
                     "pinned".into()
                 } else {
@@ -4303,8 +4334,8 @@ impl Shell {
                 };
                 drag.source_index = index;
                 drag.row_height = sidebar_row_height(
-                    self.settings.sidebar_compact,
-                    self.settings.sidebar_show_project_label,
+                    compact_rows,
+                    identity_line,
                     rows[index].branch.is_some(),
                     rows[index].change_request.is_some(),
                 );
@@ -4419,7 +4450,7 @@ impl Shell {
                     .flatten();
                 let height = sidebar_row_height(
                     self.settings.sidebar_compact,
-                    self.settings.sidebar_show_project_label,
+                    self.sidebar_row_identity_line(&chat),
                     branch.is_some(),
                     change_request.is_some(),
                 );
@@ -4477,6 +4508,7 @@ impl Shell {
                     branch.map(SharedString::from),
                     change_request,
                     harness,
+                    harness.and_then(|_| chat.config.as_ref().and_then(|c| c.model.clone())),
                     status,
                     is_selected,
                     false,
@@ -4831,7 +4863,7 @@ impl Shell {
         const PAGE: usize = 25;
         let now = Utc::now();
         let filter = self.settings.space_filter.clone();
-        let mut rows: Vec<zeron_proto::Chat> = {
+        let mut rows: Vec<clyra_proto::Chat> = {
             let state = self.state.read(cx);
             state
                 .chats
@@ -4877,7 +4909,7 @@ impl Shell {
                 .map(|row| {
                     sidebar_row_height(
                         self.settings.sidebar_compact,
-                        self.settings.sidebar_show_project_label,
+                        self.sidebar_row_identity_line(&row.chat),
                         row.branch.is_some(),
                         row.change_request.is_some(),
                     )
@@ -4939,6 +4971,7 @@ impl Shell {
                         row.branch.map(SharedString::from),
                         row.change_request,
                         harness,
+                        harness.and_then(|_| chat.config.as_ref().and_then(|c| c.model.clone())),
                         row.status,
                         is_selected,
                         true,
@@ -5202,7 +5235,7 @@ impl Shell {
 
     /// The current listing's folder rows filtered by the search query
     /// (prefix matches first — `popover::filter_indices`).
-    fn add_space_filtered(&self, cx: &App) -> Vec<zeron_proto::FolderEntry> {
+    fn add_space_filtered(&self, cx: &App) -> Vec<clyra_proto::FolderEntry> {
         let Some(flow) = self.add_space.as_ref() else {
             return Vec::new();
         };
@@ -5540,6 +5573,104 @@ impl Shell {
         if let Some(flow) = self.add_space.as_mut() {
             flow.submit_task = Some(task);
         }
+        cx.notify();
+    }
+
+    /// Create a space from an OS-dropped folder (drag & drop onto the app).
+    /// A drop always names a folder on THIS device, so unlike the palette
+    /// flow there is no device step: the local device owns the space.
+    /// Callers route non-directories (files) to the composer instead.
+    pub(super) fn create_space_from_dropped_folder(
+        &mut self,
+        folder: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        if !folder.is_dir() {
+            return;
+        }
+        // Normalize the dropped path: strip trailing separators (keeping
+        // filesystem roots intact) so dedupe matches palette-created rows.
+        let mut path = folder.to_string_lossy().into_owned();
+        while path.len() > 3 && (path.ends_with('\\') || path.ends_with('/')) {
+            path.pop();
+        }
+        let device_id = {
+            let state = self.state.read(cx);
+            state.local_device_id.clone().or_else(|| {
+                if state.devices.len() == 1 {
+                    Some(state.devices[0].id.clone())
+                } else {
+                    None
+                }
+            })
+        };
+        let Some(device_id) = device_id else {
+            return;
+        };
+        // Same (device, folder) already has a space → just switch to it.
+        if let Some(existing) = self
+            .state
+            .read(cx)
+            .spaces
+            .iter()
+            .find(|s| s.device_id == device_id && s.path == path)
+            .map(|s| s.id.clone())
+        {
+            self.land_in_space(existing, cx);
+            return;
+        }
+        // Local .git sniff for the optimistic row; SpacesSync re-verifies
+        // ownership-stamped git state afterwards.
+        let git_detected = folder.join(".git").exists();
+        let space_id = uuid::Uuid::new_v4().to_string();
+        let space = Space {
+            id: space_id.clone(),
+            device_id: device_id.clone(),
+            path: path.clone(),
+            name: None,
+            git_detected,
+            git_checked_at: None,
+            checkout_id: None,
+            created_at: Utc::now(),
+        };
+        self.state.update(cx, |s, cx| {
+            if !s.spaces.iter().any(|existing| existing.id == space.id) {
+                s.spaces.push(space);
+            }
+            cx.notify();
+        });
+        let params = serde_json::json!({
+            "op": "createSpace",
+            "spaceId": space_id,
+            "deviceId": device_id,
+            "path": path,
+            "gitDetected": git_detected,
+        });
+        cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::MUTATE, params).await;
+            this.update(cx, |shell, cx| {
+                match result {
+                    Ok(_) => {
+                        shell.land_in_space(space_id.clone(), cx);
+                    }
+                    Err(err) => {
+                        // Roll the optimistic row back; nothing to show it
+                        // inline (no palette flow owns this drop).
+                        shell.state.update(cx, |s, cx| {
+                            s.spaces.retain(|space| space.id != space_id);
+                            cx.notify();
+                        });
+                        tracing::warn!(error = %err, "drop: createSpace failed");
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
@@ -6325,8 +6456,8 @@ mod tests {
         (Some((device.into(), device.into())), vec![value])
     }
 
-    fn chat(id: &str) -> zeron_proto::Chat {
-        zeron_proto::Chat {
+    fn chat(id: &str) -> clyra_proto::Chat {
+        clyra_proto::Chat {
             id: id.into(),
             device_id: "device".into(),
             title: None,
@@ -6466,7 +6597,7 @@ mod project_flow_tests {
                     edge_token: None,
                     org_id: None,
                     workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
+                    default_harness: clyra_proto::HarnessId::Mock,
                 },
                 cx,
             )

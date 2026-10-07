@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use zeron_proto::{AgentEvent, SUBAGENT_INPUT_KEEP, ToolCall, ToolDiff, UserInputQuestion};
+use clyra_proto::{AgentEvent, SUBAGENT_INPUT_KEEP, ToolCall, ToolDiff, UserInputQuestion};
 
 use crate::constants::MSG_INLINE_MAX;
 
@@ -100,6 +100,178 @@ pub fn diff_stat(diff: &ToolDiff) -> ToolDiffStat {
         additions,
         deletions,
     }
+}
+
+/// Stats read off an edit call's own payload, for harnesses whose results
+/// carry no diff (claude, opencode): an edit's old/new strings diff exactly;
+/// a write counts its content as added lines. The payload itself never
+/// reaches the doc ([`sanitize_tool_call`]) — only these counts do.
+pub fn call_diff_stat(call: &ToolCall) -> Option<ToolDiffStat> {
+    let diff = match call {
+        ToolCall::EditFile {
+            path,
+            old_string: Some(old),
+            new_string: Some(new),
+        } => ToolDiff {
+            path: path.clone(),
+            old_text: Some(old.clone()),
+            new_text: new.clone(),
+        },
+        ToolCall::WriteFile {
+            path,
+            content: Some(content),
+        } => ToolDiff {
+            path: path.clone(),
+            old_text: None,
+            new_text: content.clone(),
+        },
+        _ => return None,
+    };
+    Some(diff_stat(&diff))
+}
+
+/// `(entry id, part id)` of every settled, successful edit part that carries
+/// no `diffStats` — the parts [`diff_stats_from_journal`] can fill.
+fn diff_stats_candidates(
+    entries: &[crate::schema::SessionMessageEntry],
+) -> Vec<(&crate::schema::SessionMessageEntry, &str)> {
+    entries
+        .iter()
+        .filter(|entry| {
+            entry.role == crate::schema::MessageRole::Assistant
+                && entry.status != Some(MessageStatus::Streaming)
+        })
+        .flat_map(|entry| {
+            entry.parts.iter().filter_map(move |part| match part {
+                MessagePart::Tool {
+                    id,
+                    call:
+                        ToolCall::WriteFile { .. }
+                        | ToolCall::EditFile { .. }
+                        | ToolCall::ApplyPatch { .. },
+                    is_error: false,
+                    resolved: true,
+                    diff_stats: None,
+                    ..
+                } => Some((entry, id.as_str())),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+/// Whether any entry has an edit part [`diff_stats_from_journal`] could fill.
+pub fn needs_diff_stats_backfill(entries: &[crate::schema::SessionMessageEntry]) -> bool {
+    !diff_stats_candidates(entries).is_empty()
+}
+
+/// Line counts for edit parts folded before stats were derived from the call
+/// payload, recovered from the chat's run journal (JSONL `{"seq", "event"}`
+/// lines holding the UNSANITIZED events). A result's diff wins, then the
+/// call's own payload ([`call_diff_stat`]); a part the journal cannot count
+/// maps to an empty list so the sweep never revisits it. Tool ids are matched
+/// within their turn (`sessionStarted.assistantMessageId`), falling back to a
+/// journal-unique id.
+pub fn diff_stats_from_journal(
+    entries: &[crate::schema::SessionMessageEntry],
+    journal: &str,
+) -> std::collections::HashMap<(String, String), Vec<ToolDiffStat>> {
+    use std::collections::{HashMap, HashSet};
+    #[derive(Default)]
+    struct Seen {
+        message: Option<String>,
+        call: Option<ToolCall>,
+        diff: Option<ToolDiff>,
+    }
+    let candidates = diff_stats_candidates(entries);
+    if candidates.is_empty() {
+        return HashMap::new();
+    }
+    let wanted: HashSet<&str> = candidates.iter().map(|(_, id)| *id).collect();
+    let mut seen: HashMap<String, Vec<Seen>> = HashMap::new();
+    let mut message: Option<String> = None;
+    // The record for `id` in the current turn (a new one when the turn
+    // changed), or `None` for ids no candidate wants.
+    fn record<'a>(
+        seen: &'a mut HashMap<String, Vec<Seen>>,
+        wanted: &HashSet<&str>,
+        id: &str,
+        message: &Option<String>,
+    ) -> Option<&'a mut Seen> {
+        if !wanted.contains(id) {
+            return None;
+        }
+        let list = seen.entry(id.to_string()).or_default();
+        if list.last().is_none_or(|last| &last.message != message) {
+            list.push(Seen {
+                message: message.clone(),
+                ..Seen::default()
+            });
+        }
+        list.last_mut()
+    }
+    for line in journal.lines() {
+        // Cheap prefilter: reasoning/text deltas are most of a journal.
+        if !(line.contains("\"toolCall\"")
+            || line.contains("\"toolResult\"")
+            || line.contains("\"sessionStarted\""))
+        {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(event) = value.get("event") else {
+            continue;
+        };
+        if event.get("type").and_then(|t| t.as_str()) == Some("sessionStarted") {
+            message = event
+                .get("assistantMessageId")
+                .and_then(|id| id.as_str())
+                .map(str::to_string);
+            continue;
+        }
+        match serde_json::from_value::<AgentEvent>(event.clone()) {
+            Ok(AgentEvent::ToolCall { id, call }) => {
+                if let Some(seen) = record(&mut seen, &wanted, &id, &message) {
+                    seen.call = Some(call);
+                }
+            }
+            Ok(AgentEvent::ToolResult {
+                id, diff: Some(diff), ..
+            }) => {
+                if let Some(seen) = record(&mut seen, &wanted, &id, &message) {
+                    seen.diff = Some(diff);
+                }
+            }
+            _ => {}
+        }
+    }
+    candidates
+        .into_iter()
+        .map(|(entry, part_id)| {
+            let records = seen.get(part_id).map(Vec::as_slice).unwrap_or_default();
+            let turn = records.iter().find(|seen| {
+                seen.message.as_deref() == Some(entry.id.as_str())
+                    || (seen.message.is_some()
+                        && seen.message.as_deref() == entry.continuation_of.as_deref())
+            });
+            let found = turn.or_else(|| match records {
+                [only] => Some(only),
+                _ => None,
+            });
+            let stats = found
+                .and_then(|seen| {
+                    seen.diff
+                        .as_ref()
+                        .map(diff_stat)
+                        .or_else(|| seen.call.as_ref().and_then(call_diff_stat))
+                })
+                .map(|stat| vec![stat])
+                .unwrap_or_default();
+            ((entry.id.clone(), part_id.to_string()), stats)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,7 +428,7 @@ impl MessagePart {
 /// In place because the fold runs once per streamed event: rebuilding the
 /// accumulator each time made long turns O(n²) in allocations.
 ///
-/// Semantics from zeron `foldEventIntoParts`:
+/// Semantics from clyra `foldEventIntoParts`:
 /// - `SessionStarted` / `Steered` reset the accumulator (turn boundary — makes replay safe).
 /// - `TextDelta` appends to the trailing text part, or starts a new one if the trail is not text
 ///   (a tool call in between breaks the text block).
@@ -349,6 +521,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
             for p in out.iter_mut() {
                 if let MessagePart::Tool {
                     id: pid,
+                    call,
                     is_error: e,
                     resolved,
                     output: out_slot,
@@ -372,7 +545,12 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     *out_slot = None;
                     *output_bytes = None;
                     *diff_slot = None;
-                    *diff_stats = diff.as_ref().map(|d| vec![diff_stat(d)]);
+                    // Harness diff first; otherwise the edit call's own
+                    // payload (still unsanitized in the fold) — failed
+                    // edits changed nothing.
+                    *diff_stats = diff.as_ref().map(diff_stat).or_else(|| {
+                        (!*is_error).then(|| call_diff_stat(call)).flatten()
+                    }).map(|stat| vec![stat]);
                 }
             }
         }
@@ -432,7 +610,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         } => {
             let status = match event.as_ref() {
                 AgentEvent::Done { status, .. } => Some(match status {
-                    zeron_proto::DoneStatus::Errored => SubagentStatus::Failed,
+                    clyra_proto::DoneStatus::Errored => SubagentStatus::Failed,
                     _ => SubagentStatus::Done,
                 }),
                 // A new assignment reopens a settled chip. Providers may
@@ -610,7 +788,7 @@ pub fn continuation_id(root: &str, index: usize) -> String {
 ///
 /// Splitting happens at part boundaries; an oversized text part is itself chunked at char
 /// boundaries. Returns one Vec per resulting entry — the first keeps the root id, the rest are
-/// continuations (`continuation_id(root, i)`), matching `splitMessageEntry` in zeron.
+/// continuations (`continuation_id(root, i)`), matching `splitMessageEntry` in clyra.
 pub fn split_parts(parts: &[MessagePart]) -> Vec<Vec<MessagePart>> {
     let mut chunks: Vec<Vec<MessagePart>> = vec![Vec::new()];
     let mut current_bytes = 0usize;
@@ -802,7 +980,7 @@ mod tests {
         fold_event_into_parts(
             &mut parts,
             &AgentEvent::SessionStarted {
-                harness: zeron_proto::HarnessId::Mock,
+                harness: clyra_proto::HarnessId::Mock,
                 model: "m".into(),
                 tools: vec![],
                 cwd: "/".into(),
@@ -858,6 +1036,147 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn journal_backfill_counts_old_edits_per_turn() {
+        use crate::schema::{MessageRole, SessionMessageEntry};
+        let tool = |id: &str, call: ToolCall, diff_stats: Option<Vec<ToolDiffStat>>| {
+            MessagePart::Tool {
+                id: id.into(),
+                call,
+                is_error: false,
+                resolved: true,
+                output: None,
+                diff: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                diff_stats,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
+            }
+        };
+        let sanitized_edit = || ToolCall::EditFile {
+            path: "/a.rs".into(),
+            old_string: None,
+            new_string: None,
+        };
+        let entry = |id: &str, parts| SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::Assistant,
+            parts,
+            created_at: 0,
+            device_id: "d".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        };
+        let already = vec![ToolDiffStat {
+            path: "/a.rs".into(),
+            additions: 9,
+            deletions: 9,
+        }];
+        let entries = vec![
+            entry("m1", vec![tool("t1", sanitized_edit(), None)]),
+            // Same tool id reused by the next turn; plus a part that already
+            // has stats and one the journal never saw.
+            entry(
+                "m2",
+                vec![
+                    tool("t1", sanitized_edit(), None),
+                    tool("t2", sanitized_edit(), Some(already)),
+                    tool("t3", sanitized_edit(), None),
+                ],
+            ),
+        ];
+        let journal = [
+            r#"{"seq":1,"event":{"type":"sessionStarted","harness":"opencode","assistantMessageId":"m1"}}"#,
+            r#"{"seq":2,"event":{"type":"toolCall","id":"t1","call":{"kind":"editFile","path":"/a.rs","old_string":"a\n","new_string":"b\nc\n"}}}"#,
+            r#"{"seq":3,"event":{"type":"toolResult","id":"t1","isError":false}}"#,
+            r#"{"seq":4,"event":{"type":"reasoningDelta","text":"toolCall"}}"#,
+            r#"{"seq":5,"event":{"type":"sessionStarted","harness":"opencode","assistantMessageId":"m2"}}"#,
+            r#"{"seq":6,"event":{"type":"toolCall","id":"t1","call":{"kind":"writeFile","path":"/a.rs","content":"x\ny\nz\n"}}}"#,
+            r#"{"seq":7,"event":{"type":"toolResult","id":"t1","isError":false}}"#,
+        ]
+        .join("\n");
+        let stats = diff_stats_from_journal(&entries, &journal);
+        let stat = |additions, deletions| {
+            vec![ToolDiffStat {
+                path: "/a.rs".into(),
+                additions,
+                deletions,
+            }]
+        };
+        let key = |entry: &str, part: &str| (entry.to_string(), part.to_string());
+        assert_eq!(stats.get(&key("m1", "t1")), Some(&stat(2, 1)));
+        assert_eq!(stats.get(&key("m2", "t1")), Some(&stat(3, 0)));
+        assert_eq!(stats.get(&key("m2", "t2")), None, "existing stats stay");
+        assert_eq!(stats.get(&key("m2", "t3")), Some(&Vec::new()), "unseen → marker");
+        assert!(needs_diff_stats_backfill(&entries));
+    }
+
+    #[test]
+    fn diffless_edit_results_take_stats_from_the_call() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "e".into(),
+                call: ToolCall::EditFile {
+                    path: "/a.rs".into(),
+                    old_string: Some("one\ntwo\n".into()),
+                    new_string: Some("one\n2\nthree\n".into()),
+                },
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "w".into(),
+                call: ToolCall::WriteFile {
+                    path: "/b.rs".into(),
+                    content: Some("x\ny\n".into()),
+                },
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "f".into(),
+                call: ToolCall::WriteFile {
+                    path: "/c.rs".into(),
+                    content: Some("x\n".into()),
+                },
+            },
+        );
+        for (id, is_error) in [("e", false), ("w", false), ("f", true)] {
+            fold_event_into_parts(
+                &mut parts,
+                &AgentEvent::ToolResult {
+                    id: id.into(),
+                    is_error,
+                    output: None,
+                    diff: None,
+                },
+            );
+        }
+        let stats: Vec<_> = parts
+            .iter()
+            .map(|part| match part {
+                MessagePart::Tool { diff_stats, .. } => diff_stats.clone(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        let stat = |path: &str, additions, deletions| {
+            Some(vec![ToolDiffStat {
+                path: path.into(),
+                additions,
+                deletions,
+            }])
+        };
+        assert_eq!(stats, vec![stat("/a.rs", 2, 1), stat("/b.rs", 2, 0), None]);
     }
 
     #[test]
@@ -1152,7 +1471,7 @@ mod tests {
 
     #[test]
     fn subagent_events_refresh_the_spawn_chip_in_place() {
-        use zeron_proto::DoneStatus;
+        use clyra_proto::DoneStatus;
         let mut parts = Vec::new();
         fold_event_into_parts(
             &mut parts,
@@ -1241,7 +1560,7 @@ mod tests {
         // Mis-keyed tagged traffic (claude's background shells settled
         // through the subagent subtype, 2026-08-20) must not stamp lifecycle
         // onto an ordinary tool chip — the genus gate is the CALL.
-        use zeron_proto::DoneStatus;
+        use clyra_proto::DoneStatus;
         let mut parts = Vec::new();
         fold_event_into_parts(
             &mut parts,

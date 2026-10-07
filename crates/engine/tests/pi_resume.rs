@@ -1,8 +1,8 @@
 //! Pi's native session id survives an idle adapter crash through dispatch.
+use clyra_engine::{EngineCore, HarnessRegistry};
+use clyra_harness::AcpHarness;
+use clyra_proto::{HarnessId, RunRequest, SandboxLevel};
 use std::{sync::Arc, time::Duration};
-use zeron_engine::{EngineCore, HarnessRegistry};
-use zeron_harness::AcpHarness;
-use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
 
 #[tokio::test]
 async fn pi_idle_crash_next_dispatch_loads_stored_session() {
@@ -40,7 +40,7 @@ async fn pi_idle_crash_next_dispatch_loads_stored_session() {
             loop {
                 let entries = handle.doc().read_entries().unwrap();
                 if entries.iter().any(|entry| entry.parts.iter().any(|part|
-                    matches!(part, zeron_doc::MessagePart::Text { text, .. } if text == &format!("reply:{prompt}"))
+                    matches!(part, clyra_doc::MessagePart::Text { text, .. } if text == &format!("reply:{prompt}"))
                 )) { break; }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

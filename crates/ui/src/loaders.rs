@@ -1,4 +1,4 @@
-//! Loaders: the zeron pulse loader, the gradient matrix spinner, and the boot
+//! Loaders: the clyra pulse loader, the gradient matrix spinner, and the boot
 //! splash content. All motion routes through `crate::motion` pure helpers, so
 //! the math is unit-tested and these elements are testable-by-compile.
 //!
@@ -13,21 +13,20 @@ use gpui::{
     PathBuilder, Render, RenderOnce, SharedString, Styled, Window, canvas, div, point, px,
 };
 
+use crate::icons;
 use crate::motion::{self, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT, ZERON_PULSE};
 use crate::theme::{GlyphPalette, Theme};
 
-// Shared with the terminal viewport (`zeron_proto::motion`) so both animate the
+// Shared with the terminal viewport (`clyra_proto::motion`) so both animate the
 // same loaders from the same numbers.
-pub use zeron_proto::motion::{
-    MARK_CELLS, MARK_SPREAD, MATRIX_SIDE, ZERON_CELLS, mark_cell_stagger,
-};
+pub use clyra_proto::motion::{MARK_CELLS, MARK_SPREAD, ZERON_CELLS, mark_cell_stagger};
 
-/// The animated zeron mark (zeron-loader.tsx `ZeronLoader`): the full logo
+/// The animated clyra mark (ported from upstream `clyra-loader.tsx`): the full logo
 /// pixel grid with a light wave sweeping tail→head. Each cell rests dim
 /// (opacity 0.08, scale 0.9) and flares to full as the crest passes; per-cell
 /// stagger follows the flight axis. `height_px` sets the mark's height (width
 /// follows the 820:940 canvas).
-pub fn zeron_mark_loader(
+pub fn clyra_mark_loader(
     _id: &'static str,
     theme: &Theme,
     height_px: f32,
@@ -55,7 +54,7 @@ pub fn zeron_mark_loader(
                 .justify_center()
                 .child({
                     // Negative CSS delay ⇒ the cell starts mid-cycle:
-                    // the stagger ADDS phase (zeron-loader.tsx delayFor).
+                    // the stagger ADDS phase (clyra-loader.tsx delayFor).
                     let phase = (delta + stagger).rem_euclid(1.0);
                     div()
                         .rounded(px(16.0 * scale))
@@ -66,12 +65,12 @@ pub fn zeron_mark_loader(
         }))
 }
 
-/// The zeron wave loader: a row of cells pulsing opacity 0.08→1 / scale 0.9→1
+/// The clyra wave loader: a row of cells pulsing opacity 0.08→1 / scale 0.9→1
 /// over 2.4s with a 0.15s stagger per cell.
 ///
 /// `id` scopes the per-cell animation state — give each loader instance a
 /// distinct id.
-pub fn zeron_loader(
+pub fn clyra_loader(
     _id: &'static str,
     theme: &Theme,
     cell_px: f32,
@@ -104,46 +103,62 @@ pub fn zeron_loader(
         }))
 }
 
-pub use zeron_proto::motion::{GSPIN_DIM, GSPIN_ROW_TINTS};
-
-/// The gradient matrix spinner (WorkingIndicator), ported from zeron's
-/// gradient-spin.tsx: a 3×3 grid of round cells tinted per row from the
-/// sunrise gradient. Each cell pulses opacity once per 750ms period; the
-/// per-cell phase follows the "arrow-up" pattern (the pulse enters at the
-/// bottom edge and converges toward the top-center cell), so the wave reads
-/// as travelling upward.
-pub fn gradient_spinner(
+/// Dot-matrix helix loader (dotm-square-15): a 5×5 grid of square dots in
+/// the theme accent. Two mirrored strands roam columns 0–2/4–2 down the
+/// rows at two full sine periods per 1280ms cycle, with periodic bridges
+/// between them — a compact DNA helix. Opacities follow the reference:
+/// strand 1.0, bridge 0.58, near-strand 0.24, base 0.08. Reduced motion
+/// (or a static phase) holds the u=0 pattern.
+pub fn dotm_helix(
     _id: &'static str,
-    _theme: &Theme,
-    cell_px: f32,
+    theme: &Theme,
+    dot_px: f32,
     view: EntityId,
     cx: &mut App,
 ) -> impl IntoElement {
-    let center = (MATRIX_SIDE as f32 - 1.0) / 2.0;
-    let max = MATRIX_SIDE as f32 - 1.0 + center;
-    let delta = motion::pulse_delta_slow(&GRADIENT_SPIN, view, cx);
+    const SIDE: usize = 5;
+    let gap = (dot_px * 0.4).max(1.0);
+    let color = theme.accent;
+    // Phase [0,1) of the 1280ms cycle; reduced motion parks at 0 with no
+    // frame lease, matching the reference's static pattern.
+    let u = motion::pulse_delta(&motion::DOTM_HELIX, view, cx);
     div()
         .flex()
         .flex_col()
-        .gap(px(cell_px / 2.0))
-        .children((0..MATRIX_SIDE).map(move |row| {
-            let tint: gpui::Hsla = gpui::rgb(GSPIN_ROW_TINTS[row]).into();
+        .gap(px(gap))
+        .children((0..SIDE).map(move |row| {
             div()
                 .flex()
                 .flex_row()
-                .gap(px(cell_px / 2.0))
-                .children((0..MATRIX_SIDE).map(move |col| {
-                    // Distance of this cell from the wave origin, normalized
-                    // into a phase offset (gradient-spin's `--gspin-phase`).
-                    let d = MATRIX_SIDE as f32 - 1.0 - row as f32 + (col as f32 - center).abs();
-                    let phase = if max == 0.0 { 0.0 } else { d / (max + 1.0) };
+                .gap(px(gap))
+                .children((0..SIDE).map(move |col| {
                     div()
-                        .size(px(cell_px))
-                        .rounded(px(cell_px / 2.0))
-                        .bg(tint)
-                        .opacity(motion::gspin_opacity(delta + phase, GSPIN_DIM))
+                        .size(px(dot_px))
+                        .rounded(px(1.0))
+                        .bg(color)
+                        .opacity(dotm_opacity(row, col, u))
                 }))
         }))
+}
+
+/// Pure dotm-square-15 resolver: opacity of the `(row, col)` dot at cycle
+/// phase `u` (0..1). Strand columns roam `round(1 + sin)` per row with a
+/// 1.24-rad row stagger; bridges light when `cos(2·rowPhase) > 0.82`.
+pub fn dotm_opacity(row: usize, col: usize, u: f32) -> f32 {
+    let row_phase = u * 2.0 * std::f32::consts::PI * 2.0 + row as f32 * 1.24;
+    let left = (1.0 + row_phase.sin()).round() as i32;
+    let right = 4 - left;
+    let col = col as i32;
+    if col == left || col == right {
+        return 1.0;
+    }
+    if (row_phase * 2.0).cos() > 0.82 && col > left.min(right) && col < left.max(right) {
+        return 0.58;
+    }
+    if (col - left).abs() == 1 || (col - right).abs() == 1 {
+        return 0.24;
+    }
+    0.08
 }
 
 /// A 2×3 activity glyph sized for compact status slots. Its color is an
@@ -263,7 +278,10 @@ fn mini_spinner_cells(
                         .size(px(cell_px))
                         .rounded(px(cell_px / 2.0))
                         .bg(tint)
-                        .opacity(motion::gspin_opacity(delta + phase, GSPIN_DIM))
+                        .opacity(motion::gspin_opacity(
+                            delta + phase,
+                            clyra_proto::motion::GSPIN_DIM,
+                        ))
                 }))
         }))
 }
@@ -333,7 +351,7 @@ pub fn upload_progress_ring(percent: u8, diameter: f32) -> AnyElement {
         .into_any_element()
 }
 
-/// Full-window boot splash: the app's dot loader (the same [`gradient_spinner`]
+/// Full-window boot splash: the app's dot loader (the same [`dotm_helix`]
 /// the session list and the reconnecting line pulse — user request, replacing
 /// the hero ascii) over the app background with a quiet status line. While
 /// `fading` it plays `splash-out` (150ms hold, then 0.5s fade + 6px lift); the
@@ -354,18 +372,18 @@ pub fn splash_overlay(theme: &Theme, fading: bool, view: EntityId, cx: &mut App)
         .gap(px(12.0))
         // Cell 2.5 — the size every other surface runs this spinner at (the
         // "Sending…" strip, the transcript working trailer).
-        .child(gradient_spinner(
-            "boot-splash-spinner",
-            theme,
-            2.5,
-            view,
-            cx,
-        ))
+        .child(
+            icons::icon(icons::CLYRA_WORDMARK)
+                .w(px(168.0))
+                .h(px(36.0))
+                .text_color(theme.text),
+        )
+        .child(dotm_helix("boot-splash-spinner", theme, 2.5, view, cx))
         .child(
             div()
                 .text_size(crate::typography::ui_rems(12.0))
                 .text_color(theme.text_muted.opacity(0.7))
-                .child(SharedString::from("Setting up Zeron environment")),
+                .child(SharedString::from("Setting up Clyra environment")),
         );
     if fading {
         motion::splash_out("boot-splash-out", content).into_any_element()
@@ -379,6 +397,7 @@ const _: () = {
     assert!(SPLASH_OUT.delay_ms == 150);
     assert!(ZERON_PULSE.duration_ms == 2400);
     assert!(GRADIENT_SPIN.duration_ms == 750);
+    assert!(motion::DOTM_HELIX.duration_ms == 1280);
 };
 
 #[cfg(test)]
@@ -401,6 +420,39 @@ mod tests {
                 (0.0..=MARK_SPREAD + 1e-6).contains(&s),
                 "cell ({x},{y}) stagger {s}"
             );
+        }
+    }
+
+    #[test]
+    fn dotm_helix_strands_roam_and_bridge() {
+        // u=0, row 0 (rowPhase 0): strands at 1 and 3, bridge at 2.
+        let row0 = [0.24, 1.0, 0.58, 1.0, 0.24];
+        for (col, want) in row0.into_iter().enumerate() {
+            assert_eq!(dotm_opacity(0, col, 0.0), want, "row 0 col {col}");
+        }
+        // u=0, row 1 (rowPhase 1.24): strands meet at 2.
+        let row1 = [0.08, 0.24, 1.0, 0.24, 0.08];
+        for (col, want) in row1.into_iter().enumerate() {
+            assert_eq!(dotm_opacity(1, col, 0.0), want, "row 1 col {col}");
+        }
+        // u=0, row 3 (rowPhase 3.72): strands spread to 0 and 4, no bridge
+        // (cos(2*3.72) < 0.82).
+        let row3 = [1.0, 0.24, 0.08, 0.24, 1.0];
+        for (col, want) in row3.into_iter().enumerate() {
+            assert_eq!(dotm_opacity(3, col, 0.0), want, "row 3 col {col}");
+        }
+        // The helix moves: row 0 disagrees with its u=0 pattern at u=0.3.
+        let moved = (0..5).any(|col| dotm_opacity(0, col, 0.3) != row0[col]);
+        assert!(moved, "strands never roam");
+        // Outputs stay in range across the whole cycle.
+        for step in 0..=40 {
+            let u = step as f32 / 40.0;
+            for row in 0..5 {
+                for col in 0..5 {
+                    let o = dotm_opacity(row, col, u);
+                    assert!((0.0..=1.0).contains(&o), "row {row} col {col} u {u}: {o}");
+                }
+            }
         }
     }
 }

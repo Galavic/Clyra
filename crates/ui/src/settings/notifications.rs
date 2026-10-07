@@ -326,7 +326,7 @@ impl Render for NotificationsPage {
                                     div()
                                         .child(SharedString::from(
                                             "Show a system banner on the same events, so pings \
-                                             reach you while Zeron is in the background.",
+                                             reach you while Clyra is in the background.",
                                         ))
                                         .into_any_element(),
                                 ],
@@ -364,7 +364,7 @@ impl Render for NotificationsPage {
                                 vec![
                                     div()
                                         .child(SharedString::from(
-                                            "Skip the banner while a Zeron window is focused.",
+                                            "Skip the banner while a Clyra window is focused.",
                                         ))
                                         .into_any_element(),
                                 ],
@@ -373,7 +373,7 @@ impl Render for NotificationsPage {
                     .child(
                         toggle(
                             "notifications-background-toggle",
-                            "Only notify when Zeron is in the background",
+                            "Only notify when Clyra is in the background",
                             background_only,
                             desktop,
                         )
@@ -402,7 +402,7 @@ impl Render for NotificationsPage {
                     .track_scroll(&self.scroll.scroll)
                     .child(
                         widgets::page_column()
-                            .child(widgets::page_header(&theme, "Notifications", None))
+                            .child(widgets::page_header(&theme, crate::shell::SettingsSection::Notifications.icon(), "Notifications", None))
                             .child(
                                 widgets::page_subtitle(
                                     &theme,

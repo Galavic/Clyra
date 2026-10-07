@@ -64,5 +64,5 @@ scratch directory before running it with `--ignored --nocapture`.
 
 The iOS app adds no Install action. `HarnessDescriptor.can_install` already has
 `#[serde(default)]` (`crates/engine/src/registry.rs`); iOS's `WireHarness: Decodable`
-in `apps/ios/Zeron/Sync/WorkspaceStore.swift` ignores unrecognized keys, including
+in `apps/ios/Clyra/Sync/WorkspaceStore.swift` ignores unrecognized keys, including
 `canInstall`. `HarnessCatalog` continues consuming the existing mapped fields.

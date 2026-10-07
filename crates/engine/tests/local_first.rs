@@ -5,14 +5,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
+use clyra_engine::{AuthState, Engine, EngineConfig, EngineInfo, HarnessId, WorkspaceScope};
+use clyra_rpc::{connect_ws, memory_client, methods};
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::handshake::server::{
     Request as WsRequest, Response as WsResponse,
 };
-use zeron_engine::{AuthState, Engine, EngineConfig, EngineInfo, HarnessId, WorkspaceScope};
-use zeron_rpc::{connect_ws, memory_client, methods};
 
 fn config(
     data_dir: &std::path::Path,
@@ -442,7 +442,7 @@ async fn workspace_recovers_from_an_unreachable_edge_without_restarting() {
     let refresh_loop = auth.spawn_refresh_loop();
     assert!(matches!(
         auth.access_token().await,
-        Err(zeron_rpc::TokenError::TemporarilyUnavailable(_))
+        Err(clyra_rpc::TokenError::TemporarilyUnavailable(_))
     ));
     wait_until(
         || runtime.core().workspace.sync_status().is_some(),

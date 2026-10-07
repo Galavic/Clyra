@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use zeron_proto::{ChangeRequestState, ChangeRequestSummary};
+use clyra_proto::{ChangeRequestState, ChangeRequestSummary};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 const GITHUB_TIMEOUT: Duration = Duration::from_secs(20);
@@ -22,6 +22,30 @@ const GIT_OUTPUT_LIMIT: usize = 64 * 1024;
 const GITHUB_OUTPUT_LIMIT: usize = 1024 * 1024;
 const GITHUB_RESULT_LIMIT: &str = "20";
 const GITHUB_JSON_FIELDS: &str = "number,title,url,state,baseRefName,headRefName,updatedAt,isCrossRepository,headRepositoryOwner";
+/// Wider than [`GITHUB_RESULT_LIMIT`]: an event trigger compares the whole
+/// open set against what it has already seen, and a truncated tail would look
+/// like a burst of brand-new pull requests.
+const GITHUB_PR_LIST_LIMIT: &str = "100";
+const GITHUB_PR_LIST_FIELDS: &str = "number,title,url,updatedAt";
+
+/// One open pull request, as an automation trigger sees it: identity plus the
+/// activity stamp it compares across polls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestActivity {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhListedPullRequest {
+    number: u64,
+    title: String,
+    url: String,
+    updated_at: DateTime<Utc>,
+}
 
 /// Repository identity extracted from a Git remote URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +179,21 @@ impl ChangeRequestResolver {
         }
         self.github.find_for_branch(source).await
     }
+
+    /// Open pull requests in the checkout's repository — the trigger-side
+    /// lookup (see [`GitHubCli::list_pull_requests`]).
+    pub async fn list_github_pull_requests(
+        &self,
+        source: &CheckoutSourceContext,
+    ) -> Result<Vec<PullRequestActivity>, ChangeRequestError> {
+        if source.branch.host.is_none()
+            || source.branch.owner.is_none()
+            || source.branch.repository.is_none()
+        {
+            return Err(ChangeRequestError::UnsupportedRepository);
+        }
+        self.github.list_pull_requests(source).await
+    }
 }
 
 impl Default for ChangeRequestResolver {
@@ -227,6 +266,57 @@ impl GitHubCli {
             return Err(ChangeRequestError::Decode);
         }
         serde_json::from_slice(&output.stdout).map_err(|_| ChangeRequestError::Decode)
+    }
+
+    /// Every pull request in the checkout's repository, newest activity
+    /// first. The event-trigger counterpart to [`Self::find_for_branch`]:
+    /// automation triggers need the whole set to tell "a PR appeared" from "the
+    /// PR I already fired on moved".
+    ///
+    /// Open PRs only by default — a merged-then-closed PR is not new work,
+    /// and re-listing closed ones would make every trigger fire on history the
+    /// first time it polls.
+    pub async fn list_pull_requests(
+        &self,
+        source: &CheckoutSourceContext,
+    ) -> Result<Vec<PullRequestActivity>, ChangeRequestError> {
+        let request = ProcessRequest {
+            program: "gh".into(),
+            args: vec![
+                "pr".into(),
+                "list".into(),
+                "--state".into(),
+                "open".into(),
+                "--limit".into(),
+                GITHUB_PR_LIST_LIMIT.into(),
+                "--json".into(),
+                GITHUB_PR_LIST_FIELDS.into(),
+            ],
+            cwd: source.checkout_root.clone(),
+            env: vec![("GH_PROMPT_DISABLED".into(), "1".into())],
+            timeout: GITHUB_TIMEOUT,
+            output_limit: GITHUB_OUTPUT_LIMIT,
+        };
+        let output = self.runner.run(request).await.map_err(classify_run_error)?;
+        if !output.success {
+            return Err(classify_github_failure(&output.stderr));
+        }
+        if output.stdout_truncated {
+            return Err(ChangeRequestError::Decode);
+        }
+        let raw: Vec<GhListedPullRequest> =
+            serde_json::from_slice(&output.stdout).map_err(|_| ChangeRequestError::Decode)?;
+        Ok(raw
+            .into_iter()
+            .filter_map(|pr| {
+                Some(PullRequestActivity {
+                    number: pr.number,
+                    title: pr.title,
+                    url: pr.url,
+                    updated_at: pr.updated_at,
+                })
+            })
+            .collect())
     }
 
     /// Resolve the remote's default branch through the provider API.
@@ -787,7 +877,7 @@ impl ProcessRunner for SystemProcessRunner {
     async fn run(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessRunError> {
         let mut command = tokio::process::Command::new(&request.program);
         if request.program == "gh" {
-            zeron_harness::compose_login_shell_path(&mut command);
+            clyra_harness::compose_login_shell_path(&mut command);
         }
         #[cfg(windows)]
         {
@@ -967,7 +1057,7 @@ mod tests {
                 branch,
                 Some(&format!("origin/{branch}")),
                 Some("origin"),
-                Some(&format!("https://github.com/{owner}/zeron.git")),
+                Some(&format!("https://github.com/{owner}/clyra.git")),
             ),
             default_branch: default_branch.map(str::to_owned),
         }
@@ -983,7 +1073,7 @@ mod tests {
         serde_json::json!({
             "number": number,
             "title": format!("Pull request {number}"),
-            "url": format!("https://github.com/acme/zeron/pull/{number}"),
+            "url": format!("https://github.com/acme/clyra/pull/{number}"),
             "state": state,
             "baseRefName": "main",
             "headRefName": branch,
@@ -1060,7 +1150,7 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "https://github.com/acme/zeron.git",
+                "https://github.com/acme/clyra.git",
             ],
         );
 
@@ -1074,14 +1164,14 @@ if [ "$GH_PROMPT_DISABLED" != "1" ]; then
   echo "interactive auth was not disabled" >&2
   exit 2
 fi
-printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https://github.com/acme/zeron/pull/90","state":"OPEN","baseRefName":"main","headRefName":"feature/status","updatedAt":"2026-08-15T12:00:00Z","isCrossRepository":false,"headRepositoryOwner":{"login":"acme"}}]'
+printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https://github.com/acme/clyra/pull/90","state":"OPEN","baseRefName":"main","headRefName":"feature/status","updatedAt":"2026-08-15T12:00:00Z","isCrossRepository":false,"headRepositoryOwner":{"login":"acme"}}]'
 "##;
         #[cfg(windows)]
         let fake_gh_contents = r##"if ($env:GH_PROMPT_DISABLED -ne '1') {
   [Console]::Error.WriteLine('interactive auth was not disabled')
   exit 2
 }
-[Console]::Out.WriteLine('[{"number":90,"title":"Host-resolved pull request","url":"https://github.com/acme/zeron/pull/90","state":"OPEN","baseRefName":"main","headRefName":"feature/status","updatedAt":"2026-08-15T12:00:00Z","isCrossRepository":false,"headRepositoryOwner":{"login":"acme"}}]')
+[Console]::Out.WriteLine('[{"number":90,"title":"Host-resolved pull request","url":"https://github.com/acme/clyra/pull/90","state":"OPEN","baseRefName":"main","headRefName":"feature/status","updatedAt":"2026-08-15T12:00:00Z","isCrossRepository":false,"headRepositoryOwner":{"login":"acme"}}]')
 "##;
         std::fs::write(&fake_gh, fake_gh_contents).expect("write fake gh");
         #[cfg(unix)]
@@ -1131,7 +1221,7 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
                 "remote",
                 "add",
                 "origin",
-                "git@github.com:contributor/zeron.git",
+                "git@github.com:contributor/clyra.git",
             ],
         );
         run_git(
@@ -1140,7 +1230,7 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
                 "remote",
                 "add",
                 "upstream",
-                "https://github.com/acme/zeron.git",
+                "https://github.com/acme/clyra.git",
             ],
         );
 
@@ -1153,7 +1243,7 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
         assert_eq!(source.branch.remote_name.as_deref(), Some("origin"));
         assert_eq!(
             source.branch.remote_url.as_deref(),
-            Some("git@github.com:contributor/zeron.git")
+            Some("git@github.com:contributor/clyra.git")
         );
         assert_eq!(source.branch.owner.as_deref(), Some("contributor"));
         assert_eq!(
@@ -1183,7 +1273,7 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
         );
         run_git(
             &checkout,
-            &["remote", "add", "origin", "git@github.com:acme/zeron.git"],
+            &["remote", "add", "origin", "git@github.com:acme/clyra.git"],
         );
         // A repository-controlled transport command: any Git subcommand that
         // touches the remote (such as the former `ls-remote` default-branch
@@ -1462,7 +1552,7 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
             [
                 "repo",
                 "view",
-                "github.com/acme/zeron",
+                "github.com/acme/clyra",
                 "--json",
                 "defaultBranchRef"
             ]
@@ -1517,7 +1607,7 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
             command_success("feature/status\n"),
             command_success("fork/published-status\n"),
             command_success("fork\n"),
-            command_success("git@github.com:contributor/zeron.git\n"),
+            command_success("git@github.com:contributor/clyra.git\n"),
             command_success("fork/main\n"),
         ]);
         let inspector = GitCheckoutInspector::new(runner.clone());
@@ -1595,12 +1685,12 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
             "local-name",
             Some("fork/published-name"),
             Some("fork"),
-            Some("git@github.com:contributor/zeron.git"),
+            Some("git@github.com:contributor/clyra.git"),
         );
 
         assert_eq!(context.host.as_deref(), Some("github.com"));
         assert_eq!(context.owner.as_deref(), Some("contributor"));
-        assert_eq!(context.repository.as_deref(), Some("zeron"));
+        assert_eq!(context.repository.as_deref(), Some("clyra"));
         assert_eq!(context.head_branch, "published-name");
         assert_eq!(
             context.head_selectors,
@@ -1614,7 +1704,7 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
             "feature/local",
             None,
             Some("origin"),
-            Some("https://github.com/acme/zeron.git"),
+            Some("https://github.com/acme/clyra.git"),
         );
 
         assert_eq!(context.head_branch, "feature/local");
@@ -1630,7 +1720,7 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
             "feature/shared",
             Some("refs/remotes/origin/feature/shared"),
             Some("origin"),
-            Some("https://github.com/acme/zeron"),
+            Some("https://github.com/acme/clyra"),
         );
 
         assert_eq!(context.remote_name.as_deref(), Some("origin"));

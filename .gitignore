@@ -1,4 +1,6 @@
 /target
+/.clyra/tools/
+/.clyra/installer-check/
 **/*.rs.bk
 # Local-only scratch space — holds signing/notary credentials, never commit.
 /ignore/

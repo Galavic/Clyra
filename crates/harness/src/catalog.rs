@@ -1,11 +1,11 @@
 //! A failed refresh is not a new catalog. Keep the last successful response
 //! for the same credential context, coalesce callers, and respect rate limits.
 use crate::{CatalogFailure, CatalogFailureCode, HarnessError, ModelCatalog};
+use clyra_proto::Model;
 use std::{
     future::Future,
     time::{Duration, Instant},
 };
-use zeron_proto::Model;
 
 #[derive(Default)]
 pub(crate) struct Catalog {

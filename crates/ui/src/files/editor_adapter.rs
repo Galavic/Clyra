@@ -1,12 +1,12 @@
-//! Zeron-owned styling and highlighting adapters for `gpui-base`.
+//! Clyra-owned styling and highlighting adapters for `gpui-base`.
 
 use std::{ops::Range, rc::Rc, sync::Arc};
 
+use clyra_syntax::{HighlightKind, HighlightedDocument};
 use gpui::{Context, HighlightStyle, SharedString, Window};
 use gpui_base::input::{
     FoldRange, HighlightStyleResolver, InputEdit, InputEditorStyle, InputHighlighter, Rope,
 };
-use zeron_syntax::{HighlightKind, HighlightedDocument};
 
 use super::editor::FileEditorState;
 use crate::theme::{SyntaxPalette, Theme};
@@ -268,7 +268,7 @@ fn kind_for_name(name: &str) -> Option<HighlightKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeron_syntax::{HighlightSpan, LanguageId};
+    use clyra_syntax::{HighlightSpan, LanguageId};
 
     fn highlighted(source: &str, spans: Vec<HighlightSpan>) -> HighlightedDocument {
         HighlightedDocument::from_absolute_spans(LanguageId::Rust, source, spans).unwrap()

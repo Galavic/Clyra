@@ -193,7 +193,7 @@ impl Shell {
         match entry {
             Entry::NewChat => self.open_new_session(cx),
             Entry::NewProject => self.open_add_space(cx),
-            Entry::Settings => self.open_settings(SettingsSection::Devices, cx),
+            Entry::Settings => self.open_settings(SettingsSection::DEFAULT, cx),
             Entry::Theme(_) => unreachable!(),
             Entry::Chat(id) => self.open_chat(id, cx),
         }
@@ -314,6 +314,8 @@ impl Shell {
                     branch,
                     pr,
                     harness,
+                    harness
+                        .and_then(|_| chat.config.as_ref().and_then(|config| config.model.clone())),
                     state.display_status_for(chat, Utc::now()),
                     ix == active,
                     chat.archived,
@@ -581,9 +583,9 @@ mod tests {
     fn search_matches_words_across_chat_metadata() {
         assert!(matches_query(
             "mac auth",
-            "Fix authentication Zeron @ MacBook main"
+            "Fix authentication Clyra @ MacBook main"
         ));
         assert!(matches_query("  ", "Any chat"));
-        assert!(!matches_query("mac windows", "Zeron @ MacBook"));
+        assert!(!matches_query("mac windows", "Clyra @ MacBook"));
     }
 }

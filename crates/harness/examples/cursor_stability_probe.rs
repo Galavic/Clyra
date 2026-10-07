@@ -1,14 +1,14 @@
 //! Opt-in live test. Uses real Cursor quota in a disposable workspace.
-//! ZERON_CURSOR_STATE_DIR=$(mktemp -d) cargo run -p zeron-harness --example cursor_stability_probe -- sessions 20
-//! cargo run -p zeron-harness --example cursor_stability_probe -- models 1000
+//! ZERON_CURSOR_STATE_DIR=$(mktemp -d) cargo run -p clyra-harness --example cursor_stability_probe -- sessions 20
+//! cargo run -p clyra-harness --example cursor_stability_probe -- models 1000
+use clyra_harness::{CancellationToken, CursorHarness, Harness, RunControls};
+use clyra_proto::{AgentEvent, DoneStatus, RunRequest, SandboxLevel};
 use futures::StreamExt;
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
-use zeron_harness::{CancellationToken, CursorHarness, Harness, RunControls};
-use zeron_proto::{AgentEvent, DoneStatus, RunRequest, SandboxLevel};
 
 async fn turn(
     harness: &CursorHarness,
@@ -88,7 +88,7 @@ async fn turn(
                             let dir =
                                 std::fs::read_to_string(root.join("by-agent").join(&id)).unwrap();
                             let owner: serde_json::Value = serde_json::from_slice(
-                                &std::fs::read(PathBuf::from(dir.trim()).join(".zeron-owner.json"))
+                                &std::fs::read(PathBuf::from(dir.trim()).join(".clyra-owner.json"))
                                     .unwrap(),
                             )
                             .unwrap();
@@ -198,7 +198,7 @@ async fn parked(harness: &CursorHarness, count: usize) {
                             println!("auth_clock_advanced_ms={offset} exchanges_before={}",exchanges.lines().count());
                         }
                     }
-                    tx.send(zeron_harness::SteerMessage{prompt:"Repeat the exact PARKED-STABILITY token from earlier. Reply only the token. Do not use tools or files.".into(),message_id:None}).await.unwrap();
+                    tx.send(clyra_harness::SteerMessage{prompt:"Repeat the exact PARKED-STABILITY token from earlier. Reply only the token. Do not use tools or files.".into(),message_id:None}).await.unwrap();
                 }
                 _=>{}
             }
@@ -286,7 +286,7 @@ async fn burst(harness: &CursorHarness, count: usize, cancel: bool) {
                 )
             };
             if tx
-                .send(zeron_harness::SteerMessage {
+                .send(clyra_harness::SteerMessage {
                     prompt,
                     message_id: None,
                 })
@@ -414,7 +414,7 @@ async fn history(harness: &CursorHarness, count: usize) {
     let producer = tokio::spawn(async move {
         start_rx.await.unwrap();
         for token in sent.iter().skip(1) {
-            tx.send(zeron_harness::SteerMessage{prompt:format!("Add token {token} to your remembered conversation history. Reply with the token from the immediately previous user message, followed by this new token. Do not use tools."),message_id:Some(uuid::Uuid::new_v4().to_string())}).await.unwrap();
+            tx.send(clyra_harness::SteerMessage{prompt:format!("Add token {token} to your remembered conversation history. Reply with the token from the immediately previous user message, followed by this new token. Do not use tools."),message_id:Some(uuid::Uuid::new_v4().to_string())}).await.unwrap();
         }
     });
     let mut id = String::new();

@@ -1,6 +1,6 @@
 //! Synced entity rows (workspace doc) and local projections.
 //!
-//! In zeron these were synced Postgres rows; in zeron they live in the per-org
+//! In clyra these were synced Postgres rows; in clyra they live in the per-org
 //! workspace Loro doc (see ARCHITECTURE.md §2.2) with the same field surface.
 
 use chrono::{DateTime, Utc};
@@ -79,7 +79,7 @@ pub struct Device {
     pub name: String,
     pub platform: String,
     pub last_seen_at: Option<DateTime<Utc>>,
-    /// First registration time (zeron devices.created_at — the Devices page
+    /// First registration time (clyra devices.created_at — the Devices page
     /// "Added …" fragment). Optional so pre-existing docs stay readable.
     #[serde(default)]
     pub created_at: Option<DateTime<Utc>>,
@@ -199,7 +199,7 @@ pub struct Chat {
     pub last_message_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     /// Harness-native session id of the chat's latest run — engine-owned resume
-    /// continuity across engine restarts (zeron's `chats.harness_session_id`).
+    /// continuity across engine restarts (clyra's `chats.harness_session_id`).
     /// Empty string = explicit
     /// "do not resume" tombstone after a rejected resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -225,7 +225,7 @@ pub struct Chat {
     /// dials the room the registry names. Per-chat and instantly revertible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_gen: Option<u32>,
-    /// The chat whose agent created this one (via the Zeron MCP server):
+    /// The chat whose agent created this one (via the Clyra MCP server):
     /// a parent → child link for orchestration trees. Absent for chats a
     /// human started; a dangling id (parent deleted) is tolerated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -397,7 +397,7 @@ pub struct Worktree {
     pub repo_path: String,
     pub path: String,
     pub branch: String,
-    /// Generated worktree folder name (`zeron/<name>` is its branch).
+    /// Generated worktree folder name (`clyra/<name>` is its branch).
     #[serde(default)]
     pub name: String,
     /// Canonical checkout identity (device-scoped hash of the git dir).
@@ -821,6 +821,33 @@ pub struct CheckoutChangeRequestStatus {
     pub updated_at: DateTime<Utc>,
 }
 
+/// One prompt the user sent, for Settings → Analytics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsagePrompt {
+    /// Epoch milliseconds.
+    pub at: i64,
+    pub harness: HarnessId,
+}
+
+/// Sessions (chats) per agent, for Settings → Analytics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSessionCount {
+    pub harness: HarnessId,
+    pub count: u32,
+}
+
+/// `GetUsageAnalytics` reply: this device's chats — every prompt sent with
+/// its agent, and the session count per agent. Aggregation (days, weeks,
+/// hours) happens in the viewer's timezone on the client.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageAnalytics {
+    pub prompts: Vec<UsagePrompt>,
+    pub sessions: Vec<UsageSessionCount>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetCheckoutFileDiffTextRequest {
@@ -1027,6 +1054,163 @@ pub struct ProjectActionRun {
     pub terminal: TerminalSession,
 }
 
+/// How often a scheduled automation fires. The names are the ones the UI
+/// shows; they deliberately mirror what the user reads on a calendar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutomationCadence {
+    /// Every hour, on the hour.
+    Hourly,
+    /// Once a day at `minute` past `hour` (UTC).
+    Daily,
+    /// Once a day on weekdays (Mon–Fri) at `minute` past `hour` (UTC). A day
+    /// that is not a weekday simply does not fire — there is no catch-up.
+    Weekdays,
+    /// Once a week on `weekday` at `minute` past `hour` (UTC).
+    Weekly,
+}
+
+/// A wall-clock schedule. `hour`/`minute` are UTC — the engine owns the clock
+/// and a device-local schedule would silently mean different instants on two
+/// machines running the same automation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationSchedule {
+    pub every: AutomationCadence,
+    /// Minute past the hour, 0–59.
+    pub minute: u8,
+    /// Hour of day in UTC, 0–23. Ignored by [`AutomationCadence::Hourly`].
+    pub hour: u8,
+    /// ISO weekday (Mon = 1 … Sun = 7) for [`AutomationCadence::Weekly`].
+    #[serde(default)]
+    pub weekday: u8,
+}
+
+/// Which pull-request activity starts a GitHub-triggered automation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PullRequestEvent {
+    /// A PR number this automation has not seen before.
+    Opened,
+    /// A PR it has seen moved (new commits, a comment, a review): GitHub
+    /// reports one `updatedAt` for all of them, so this is a proxy, not a
+    /// per-event feed.
+    Updated,
+}
+
+/// A GitHub pull-request trigger. `repo` is `owner/name`; empty means the
+/// repository of the automation's project checkout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestTrigger {
+    #[serde(default)]
+    pub repo: String,
+    pub events: Vec<PullRequestEvent>,
+}
+
+/// What starts an automation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum AutomationTrigger {
+    Schedule(AutomationSchedule),
+    PullRequest(PullRequestTrigger),
+}
+
+impl AutomationTrigger {
+    /// The schedule, when this one is time-based. Pure.
+    pub fn schedule(&self) -> Option<&AutomationSchedule> {
+        match self {
+            AutomationTrigger::Schedule(schedule) => Some(schedule),
+            AutomationTrigger::PullRequest(_) => None,
+        }
+    }
+}
+
+/// One automation: a prompt that runs on its own, in one project, on one
+/// provider. Stored host-locally by the engine that owns the project.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Automation {
+    pub id: String,
+    pub name: String,
+    /// The project it runs against (`Space` id). An automation always has one:
+    /// the run needs a checkout to work in.
+    pub space_id: String,
+    /// Denormalized for the list surface so a row can name its project
+    /// without a second lookup (`Space::name` at write time).
+    pub project_label: String,
+    /// The path the run works in, pinned at creation. A renamed or removed
+    /// project leaves the automation visible but unable to fire.
+    pub project_path: String,
+    pub trigger: AutomationTrigger,
+    pub prompt: String,
+    /// Provider; `None` follows the engine's default harness.
+    #[serde(default)]
+    pub harness: Option<HarnessId>,
+    /// Model id; `None` lets the provider pick.
+    #[serde(default)]
+    pub model: Option<String>,
+    pub sandbox: SandboxLevel,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// Last time a run was started for this automation (not its outcome).
+    #[serde(default)]
+    pub last_run_at: Option<DateTime<Utc>>,
+    /// Persistent conversation, separate from scheduled work sessions.
+    #[serde(default)]
+    pub conversation_chat_id: Option<String>,
+    /// Recent delegated work, oldest first.
+    #[serde(default)]
+    pub activity_chat_ids: Vec<String>,
+    /// PR numbers this automation has already fired on, so a poll never
+    /// re-fires on a PR it has seen. Bounded by the store.
+    #[serde(default)]
+    pub seen_pull_requests: Vec<u64>,
+    /// When the next scheduled fire is due. `None` for event triggers and
+    /// for a schedule that has never computed one.
+    #[serde(default)]
+    pub next_run_at: Option<DateTime<Utc>>,
+}
+
+/// The editable half of an [`Automation`]. `id` empty means "create".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationDraft {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    pub space_id: String,
+    pub trigger: AutomationTrigger,
+    pub prompt: String,
+    #[serde(default)]
+    pub harness: Option<HarnessId>,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub sandbox: SandboxLevel,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// Everything the Automations surface renders, rebuilt after every mutation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationsSnapshot {
+    pub automations: Vec<Automation>,
+    /// Non-fatal problems worth showing (a project that no longer exists, a
+    /// trigger whose CLI is missing). Never blocks the list.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// Result of starting a run for an automation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationRunAck {
+    /// The session the run opened, so the UI can jump to it.
+    pub chat_id: String,
+}
+
 /// Result of creating a worktree. The worktree remains flattened so this is
 /// wire-compatible with both legacy callers and legacy engine replies.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1151,7 +1335,7 @@ mod tests {
                     provider: "github".into(),
                     number: 90,
                     title: "Model checkout change request status".into(),
-                    url: "https://github.com/acme/zeron/pull/90".into(),
+                    url: "https://github.com/acme/clyra/pull/90".into(),
                     state,
                     base_ref: "main".into(),
                     head_ref: "feature/change".into(),
@@ -1199,7 +1383,7 @@ mod tests {
         let legacy = serde_json::json!({
             "repoPath": "/repo",
             "path": "/worktree",
-            "branch": "zeron/branch",
+            "branch": "clyra/branch",
             "name": "branch",
             "checkoutId": "checkout",
         });

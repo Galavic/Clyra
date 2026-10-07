@@ -1,7 +1,7 @@
-//! Shared scaffolding for the settings pages — the original's page rhythm
-//! (`mx-auto max-w-3xl px-6 pb-16 pt-8`), section cards, row layout, badges
-//! and small buttons, so every page reads as the same product surface
-//! (zeron settings.devices.tsx / settings.agents.tsx / settings.archived.tsx).
+//! Shared scaffolding for the settings pages — page rhythm, the page header
+//! (violet icon tile over the title), section cards on the card plane, row
+//! layout, badges, switches and small buttons, so every page reads as the
+//! same Clyra surface.
 
 use gpui::{AnyElement, Context, Pixels, ScrollHandle, SharedString, div, prelude::*, px};
 
@@ -151,48 +151,80 @@ pub fn rail<V: 'static>(
 pub const ROW_TITLE_SIZE: f32 = 13.0;
 pub const ROW_DESCRIPTION_SIZE: f32 = 12.0;
 
-/// Centered page column: `mx-auto w-full max-w-3xl px-6 pb-16 pt-8`.
+/// Centered page column.
 pub fn page_column() -> gpui::Div {
     div()
         .w_full()
-        .max_w(px(768.0))
+        .max_w(px(720.0))
         .mx_auto()
-        .px(px(24.0))
-        .pt(px(32.0))
-        .pb(px(64.0))
+        .px(px(28.0))
+        .pt(px(40.0))
+        .pb(px(72.0))
         .flex()
         .flex_col()
 }
 
-/// Page headline row: `flex items-baseline gap-2.5` — `text-base font-semibold`
-/// title + `text-[13px]` count sharing a baseline (zeron settings.devices.tsx).
-pub fn page_header(theme: &Theme, title: &str, count: Option<usize>) -> gpui::Div {
+/// Page header: the section's icon on a violet tile, then the title with an
+/// optional count sharing its baseline. The subtitle ([`page_subtitle`])
+/// follows as its own child, left-aligned with the title.
+pub fn page_header(
+    theme: &Theme,
+    icon_path: &'static str,
+    title: &str,
+    count: Option<usize>,
+) -> gpui::Div {
     div()
         .flex()
-        .flex_row()
-        .items_baseline()
-        .gap(px(10.0))
+        .flex_col()
+        .gap(px(14.0))
         .child(
             div()
-                .text_size(crate::typography::ui_rems(16.0))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(theme.text)
-                .child(SharedString::from(title.to_string())),
+                .flex_none()
+                .size(px(40.0))
+                .rounded(px(12.0))
+                .bg(theme.accent_wash)
+                .border_1()
+                .border_color(theme.accent.opacity(0.22))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    crate::icons::icon(icon_path)
+                        .size(px(20.0))
+                        .text_color(theme.accent),
+                ),
         )
-        .when_some(count, |el, count| {
-            el.child(
-                div()
-                    .text_size(crate::typography::ui_rems(13.0))
-                    .text_color(theme.text_muted.opacity(0.7))
-                    .child(SharedString::from(format!("{count}"))),
-            )
-        })
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_baseline()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .text_size(crate::typography::ui_rems(22.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.text)
+                        .child(SharedString::from(title.to_string())),
+                )
+                .when_some(count, |el, count| {
+                    el.child(
+                        div()
+                            .px(px(7.0))
+                            .rounded_full()
+                            .bg(ink(0.06))
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(format!("{count}"))),
+                    )
+                }),
+        )
 }
 
-/// Subtitle under the headline: `mt-1 text-[13px] text-muted-foreground`.
+/// Subtitle under the headline.
 pub fn page_subtitle(theme: &Theme, copy: impl Into<SharedString>) -> gpui::Div {
     div()
-        .mt(px(4.0))
+        .mt(px(6.0))
         .text_size(crate::typography::ui_rems(13.0))
         .text_color(theme.text_muted)
         .child(copy.into())
@@ -226,7 +258,7 @@ pub const OPTION_CARD_HEIGHT: f32 = 148.0;
 /// are axis-aligned rectangles, so `overflow_hidden` on the frame clips to its
 /// bounding box and not to its corner radius — a preview that paints its own
 /// background will square off the corners and cover the frame's border with it.
-pub const OPTION_CARD_RADIUS: f32 = 6.0;
+pub const OPTION_CARD_RADIUS: f32 = 10.0;
 
 /// One card in an [`option_card_row`]: a fixed-height preview frame with a quiet
 /// selected edge and caption underneath. There is deliberately no outer card
@@ -284,13 +316,12 @@ pub fn option_card(
         )
 }
 
-/// Section card: `mt-6 overflow-hidden rounded-xl border border-border bg-card`
-/// — the card tone, thinned to a translucent tint over glass so the card
-/// reads as frost instead of a solid slab ([`Theme::card_glass_bg`]).
+/// Section card on the card plane — one step above the page, thinned to a
+/// translucent tint over glass ([`Theme::card_glass_bg`]).
 pub fn section_card(theme: &Theme) -> gpui::Div {
     div()
-        .mt(px(24.0))
-        .rounded(px(12.0))
+        .mt(px(20.0))
+        .rounded(px(14.0))
         .border_1()
         .border_color(theme.border)
         .bg(theme.card_glass_bg())
@@ -299,30 +330,29 @@ pub fn section_card(theme: &Theme) -> gpui::Div {
         .flex_col()
 }
 
-/// One card row: `border-t border-border px-5 py-3.5 first:border-t-0` with the
-/// quiet hover wash.
-pub fn card_row(theme: &Theme, first: bool) -> gpui::Div {
+/// One card row, divided from the previous by a hairline, with a quiet hover
+/// wash.
+pub fn card_row(_theme: &Theme, first: bool) -> gpui::Div {
     div()
-        .px(px(20.0))
+        .px(px(18.0))
         .py(px(14.0))
-        .when(!first, |el| el.border_t_1().border_color(theme.border))
-        .hover(|s| s.bg(ink(0.015)))
+        .when(!first, |el| {
+            el.border_t_1().border_color(crate::theme::hairline(0.06))
+        })
+        .hover(|s| s.bg(ink(0.025)))
         .flex()
         .flex_row()
         .items_center()
         .gap(px(14.0))
 }
 
-/// The identity tile on a row: `size-9 rounded-[10px] border bg-white/[0.03]`
-/// around a 16px icon.
+/// The identity tile on a row: a soft 34px plate around a 16px icon.
 pub fn row_tile(theme: &Theme, icon_path: &'static str) -> gpui::Div {
     div()
         .flex_none()
-        .size(px(36.0))
-        .rounded(px(10.0))
-        .border_1()
-        .border_color(theme.border)
-        .bg(ink(0.03))
+        .size(px(34.0))
+        .rounded(px(9.0))
+        .bg(ink(0.06))
         .flex()
         .items_center()
         .justify_center()
@@ -403,25 +433,25 @@ pub fn badge_active(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div 
         .child(label.into())
 }
 
-/// Display-only toggle switch (zeron branch-picker.tsx `Toggle`): an 18×32
-/// pill whose knob slides right and track flips white when on. State is owned
-/// by the parent row — the caller adds `.id(..)` and `.on_click(..)`.
+/// Display-only toggle switch: a 20×36 pill whose knob slides right and track
+/// fills Clyra violet ([`Theme::accent_fill`]) when on. State is owned by the
+/// parent row — the caller adds `.id(..)` and `.on_click(..)`.
 pub fn toggle_switch(theme: &Theme, on: bool) -> gpui::Div {
     div()
         .flex_none()
-        .w(px(32.0))
-        .h(px(18.0))
+        .w(px(36.0))
+        .h(px(20.0))
         .rounded_full()
-        .bg(if on { theme.text } else { ink(0.15) })
+        .bg(if on { theme.accent_fill() } else { ink(0.14) })
         .relative()
         .child(
             div()
                 .absolute()
                 .top(px(2.0))
-                .left(px(if on { 16.0 } else { 2.0 }))
-                .size(px(14.0))
+                .left(px(if on { 18.0 } else { 2.0 }))
+                .size(px(16.0))
                 .rounded_full()
-                .bg(if on { theme.on_solid } else { ink(0.7) }),
+                .bg(if on { gpui::white() } else { ink(0.72) }),
         )
 }
 

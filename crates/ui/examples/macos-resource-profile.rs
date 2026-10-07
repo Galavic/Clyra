@@ -1,13 +1,13 @@
 //! UI-only replay with native CoreText/Metal and real animation clocks.
 //! Input is frames.json from scripts/resource-profile.mjs. An offscreen target
 //! replaces the window compositor; this is not a whole-app CPU measurement.
+use clyra_ui::*;
 use gpui::{AppContext, Bounds, WindowBounds, WindowOptions, px, size};
 use std::{
     cell::RefCell,
     rc::Rc,
     time::{Duration, Instant},
 };
-use zeron_ui::*;
 
 #[cfg(target_os = "macos")]
 #[global_allocator]
@@ -16,7 +16,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[derive(serde::Deserialize)]
 struct Frame {
     at: u64,
-    frame: zeron_doc::TranscriptFrame,
+    frame: clyra_doc::TranscriptFrame,
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -58,13 +58,13 @@ fn main() -> anyhow::Result<()> {
             theme_library::init(data.clone(), cx);
             appearance::init(appearance::AppearanceMode::Dark, settings.theme_selection,
                 settings.accent, settings.surface, cx);
-            composer::init(cx, zeron_ui::settings::ComposerSendBehavior::default());
+            composer::init(cx, clyra_ui::settings::ComposerSendBehavior::default());
             terminal::panel::init(cx);
             app_menus::init(cx);
             let state = cx.new(|_| {
                 let mut state = state::AppState::new();
-                state.connection = zeron_proto::view::ConnectionStatus::Ready;
-                state.workspace_scope = Some(zeron_proto::WorkspaceScope::Local);
+                state.connection = clyra_proto::view::ConnectionStatus::Ready;
+                state.workspace_scope = Some(clyra_proto::WorkspaceScope::Local);
                 state.selected_chat = Some("profile".into());
                 state.selected_space = Some("project".into());
                 state.auto_selected = true;
@@ -99,7 +99,7 @@ fn main() -> anyhow::Result<()> {
                         });
                     }
                     for chat in &mut state.chats {
-                        chat.source_context = Some(zeron_proto::ConversationSourceContext {
+                        chat.source_context = Some(clyra_proto::ConversationSourceContext {
                             checkout_id: "layout-checkout".into(), repo_root: "/tmp/resource-profile".into(),
                             cwd: "/tmp/resource-profile".into(), branch: chat.branch.clone().unwrap(),
                             head_sha: None, observed_at: chrono::Utc::now(),
@@ -121,9 +121,11 @@ fn main() -> anyhow::Result<()> {
     let (state, window) = handles.borrow_mut().take().unwrap();
     let notifications = Rc::new(std::cell::Cell::new(0usize));
     let observed = notifications.clone();
-    let _notification_probe = app.update(|cx| cx.observe(&state, move |_, _| {
-        observed.set(observed.get() + 1);
-    }));
+    let _notification_probe = app.update(|cx| {
+        cx.observe(&state, move |_, _| {
+            observed.set(observed.get() + 1);
+        })
+    });
     let dispatcher = executor.dispatcher().as_bench().unwrap();
     let start = Instant::now();
     let first_at = frames[0].at;
@@ -135,7 +137,7 @@ fn main() -> anyhow::Result<()> {
             let elapsed = start.elapsed().as_millis() as u64;
             while frames.peek().is_some_and(|f| f.at - first_at <= elapsed) {
                 let frame = frames.next().unwrap();
-                let text_only = matches!(&frame.frame, zeron_doc::TranscriptFrame::Delta {
+                let text_only = matches!(&frame.frame, clyra_doc::TranscriptFrame::Delta {
                     upsert, append, remove, ..
                 } if upsert.is_empty() && remove.is_empty() && !append.is_empty());
                 let before = notifications.get();
@@ -145,15 +147,15 @@ fn main() -> anyhow::Result<()> {
                         let streaming = state
                             .transcript
                             .iter()
-                            .any(|entry| entry.status == Some(zeron_doc::MessageStatus::Streaming));
-                        state.apply_sessions(vec![zeron_proto::Session {
+                            .any(|entry| entry.status == Some(clyra_doc::MessageStatus::Streaming));
+                        state.apply_sessions(vec![clyra_proto::Session {
                             last_completed_turn: None,
                             chat_id: "profile".into(),
                             device_id: "local".into(),
                             status: if streaming {
-                                zeron_proto::SessionStatus::Working
+                                clyra_proto::SessionStatus::Working
                             } else {
-                                zeron_proto::SessionStatus::Idle
+                                clyra_proto::SessionStatus::Idle
                             },
                             started_at: Some(chrono::Utc::now()),
                             updated_at: chrono::Utc::now(),
@@ -161,8 +163,11 @@ fn main() -> anyhow::Result<()> {
                     })
                 });
                 if text_only {
-                    assert_eq!(notifications.get(), before,
-                        "text growth must not notify unrelated app-state observers");
+                    assert_eq!(
+                        notifications.get(),
+                        before,
+                        "text growth must not notify unrelated app-state observers"
+                    );
                 }
             }
             app.update(|cx| {
@@ -302,11 +307,11 @@ fn main() -> anyhow::Result<()> {
                 let mut painted = 0;
                 for y in 180..800 {
                     let left = cached.get_pixel(20, y).0;
-                    if left[0] >= 30 && left[0] <= 60
-                        && left[0] == left[1] && left[1] == left[2]
-                    {
-                        anyhow::ensure!(cached.get_pixel(491, y).0 == left,
-                            "Sidebar row does not fill its width at y={y}: {scenario}");
+                    if left[0] >= 30 && left[0] <= 60 && left[0] == left[1] && left[1] == left[2] {
+                        anyhow::ensure!(
+                            cached.get_pixel(491, y).0 == left,
+                            "Sidebar row does not fill its width at y={y}: {scenario}"
+                        );
                         painted += 1;
                     }
                 }

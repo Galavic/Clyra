@@ -4,6 +4,13 @@
 //! to a backend on the hosting device and compares live tasks and RSS
 //! against the warmed-up baseline.
 use bytes::Bytes;
+use clyra_preview::{
+    catalog::Catalog,
+    discovery::Listener,
+    mux::{self, BoxIo, Connector},
+    peer::Peers,
+    proxy::{self, Router},
+};
 use futures::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Full, StreamBody, combinators::UnsyncBoxBody};
 use hyper::{
@@ -25,13 +32,6 @@ use tokio_tungstenite::{
     tungstenite::{Message, client::IntoClientRequest, protocol::Role},
 };
 use tokio_util::sync::CancellationToken;
-use zeron_preview::{
-    catalog::Catalog,
-    discovery::Listener,
-    mux::{self, BoxIo, Connector},
-    peer::Peers,
-    proxy::{self, Router},
-};
 type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 fn full(value: impl Into<Bytes>) -> Body {
     Full::new(value.into())
@@ -173,7 +173,7 @@ async fn remote_preview_churn_does_not_accumulate_tasks_or_memory() {
                 args: vec!["node".into(), "vite".into()],
                 started_at: 1,
                 address: ([127, 0, 0, 1], backend_port).into(),
-                zeron_owned: true,
+                clyra_owned: true,
             },
         )])
         .unwrap();

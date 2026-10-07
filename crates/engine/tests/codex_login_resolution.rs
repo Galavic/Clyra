@@ -8,8 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
-use zeron_engine::{AgentAccounts, AgentAccountsConfig};
-use zeron_proto::{AgentLoginMode, HarnessId};
+use clyra_engine::{AgentAccounts, AgentAccountsConfig};
+use clyra_proto::{AgentLoginMode, HarnessId};
 
 fn test_accounts(root: &Path) -> AgentAccounts {
     let config = AgentAccountsConfig {
@@ -60,7 +60,7 @@ async fn login_child() {
     let Ok(expected) = std::env::var("CODEX_LOGIN_EXPECTED") else {
         return;
     };
-    let root = std::env::temp_dir().join(format!("zeron-codex-login-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("clyra-codex-login-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let accounts = test_accounts(&root);
     let result = accounts.start_login(HarnessId::Codex).await;

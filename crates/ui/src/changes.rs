@@ -43,8 +43,8 @@ use gpui::{
 };
 use unicode_width::UnicodeWidthChar as _;
 
-use zeron_proto::{Chat, CheckoutDiff, GitHistoryCommit};
-use zeron_rpc::methods;
+use clyra_proto::{Chat, CheckoutDiff, GitHistoryCommit};
+use clyra_rpc::methods;
 
 use crate::comments::{self, CommentSide, ReviewComment};
 use crate::composer::{ComposerInput, ComposerInputEvent};
@@ -57,7 +57,7 @@ use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
 use crate::popover::{self, Popup};
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
-use zeron_syntax::LanguageId as Lang;
+use clyra_syntax::LanguageId as Lang;
 
 // ---------------------------------------------------------------------------
 // Layout numbers (analytic — they drive the fold tween)
@@ -173,8 +173,8 @@ pub struct SourceLineRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DiffHighlights {
-    pub old: Option<Arc<zeron_syntax::HighlightedDocument>>,
-    pub new: Option<Arc<zeron_syntax::HighlightedDocument>>,
+    pub old: Option<Arc<clyra_syntax::HighlightedDocument>>,
+    pub new: Option<Arc<clyra_syntax::HighlightedDocument>>,
 }
 
 impl DiffHighlights {
@@ -205,7 +205,7 @@ impl DiffHighlights {
         }
     }
 
-    pub fn spans(&self, line: &DiffLine) -> &[zeron_syntax::HighlightSpan] {
+    pub fn spans(&self, line: &DiffLine) -> &[clyra_syntax::HighlightSpan] {
         let Some(source_ref) = self.source_ref(line) else {
             return &[];
         };
@@ -840,6 +840,29 @@ pub fn resolve_diff<'a>(diffs: &'a [CheckoutDiff], chat: &Chat) -> Option<&'a Ch
         .or_else(|| diffs.iter().find(|d| d.cwd == cwd))
 }
 
+/// A pane opened from the new-session canvas, where no chat exists yet: it reads
+/// the picked project's checkout, captured at open time. A canvas pane must not
+/// silently retarget when the sidebar selection moves under it — the diff would
+/// swap to another project mid-read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceDiffScope {
+    pub space_id: String,
+    pub cwd: String,
+    pub device_id: String,
+}
+
+/// The canvas pane's diff, on [`resolve_diff`]'s fallback ladder minus the
+/// checkout id (a project row carries a path, not a conversation's checkout).
+pub fn resolve_space_diff<'a>(
+    diffs: &'a [CheckoutDiff],
+    scope: &SpaceDiffScope,
+) -> Option<&'a CheckoutDiff> {
+    diffs
+        .iter()
+        .find(|d| d.device_id == scope.device_id && d.cwd == scope.cwd)
+        .or_else(|| diffs.iter().find(|d| d.cwd == scope.cwd))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffPhase {
     /// No diff for this checkout yet.
@@ -1025,7 +1048,7 @@ fn excerpt_side(
     side: SourceSide,
     language: Lang,
     path: &str,
-) -> Option<Arc<zeron_syntax::HighlightedDocument>> {
+) -> Option<Arc<clyra_syntax::HighlightedDocument>> {
     let max_line = file
         .hunks
         .iter()
@@ -1060,7 +1083,7 @@ fn excerpt_side(
             .map(|(_, text)| *text)
             .collect::<Vec<_>>()
             .join("\n");
-        let document = zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+        let document = clyra_syntax::highlight(clyra_syntax::HighlightRequest {
             source: &source,
             path: Some(path),
             fence_tag: None,
@@ -1070,14 +1093,14 @@ fn excerpt_side(
             lines[number as usize - 1] = spans;
         }
     }
-    Some(Arc::new(zeron_syntax::HighlightedDocument {
+    Some(Arc::new(clyra_syntax::HighlightedDocument {
         language,
         lines,
     }))
 }
 
 fn excerpt_highlights(file: &FileDiff, language: Lang) -> Option<DiffHighlights> {
-    if !zeron_syntax::supports_language(language) {
+    if !clyra_syntax::supports_language(language) {
         return None;
     }
     let old = if file.status == FileStatus::Added {
@@ -1098,7 +1121,7 @@ fn excerpt_highlights(file: &FileDiff, language: Lang) -> Option<DiffHighlights>
     Some(DiffHighlights { old, new })
 }
 
-fn sources_match_patch(file: &FileDiff, response: &zeron_proto::CheckoutFileDiffText) -> bool {
+fn sources_match_patch(file: &FileDiff, response: &clyra_proto::CheckoutFileDiffText) -> bool {
     let old = response
         .old_text
         .as_deref()
@@ -1131,7 +1154,7 @@ fn sources_match_patch(file: &FileDiff, response: &zeron_proto::CheckoutFileDiff
 fn full_highlights(
     file: &FileDiff,
     language: Lang,
-    response: &zeron_proto::CheckoutFileDiffText,
+    response: &clyra_proto::CheckoutFileDiffText,
 ) -> Option<DiffHighlights> {
     if response.stale
         || response.binary
@@ -1141,7 +1164,7 @@ fn full_highlights(
         return None;
     }
     let parse = |source: &str, path: &str| {
-        zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+        clyra_syntax::highlight(clyra_syntax::HighlightRequest {
             source,
             path: Some(path),
             fence_tag: None,
@@ -1160,7 +1183,7 @@ fn full_highlights(
         Some(source) => Some(parse(source, &file.path)?),
         None => None,
     };
-    if old.is_none() && new.is_none() && zeron_syntax::supports_language(language) {
+    if old.is_none() && new.is_none() && clyra_syntax::supports_language(language) {
         return None;
     }
     Some(DiffHighlights { old, new })
@@ -1637,6 +1660,9 @@ struct CommentDraft {
 /// (the shell calls it when the pane first opens).
 pub struct Changes {
     state: Entity<AppState>,
+    /// Set when the pane was opened from the new-session canvas: it resolves
+    /// against a project instead of a chat. See [`SpaceDiffScope`].
+    space_scope: Option<SpaceDiffScope>,
     diffs: Vec<CheckoutDiff>,
     started: bool,
     error: Option<SharedString>,
@@ -1730,6 +1756,7 @@ impl Changes {
         let mode = DiffMode::from_split(settings.diff_split);
         Self {
             state,
+            space_scope: None,
             mode,
             wrap_lines: settings.diff_wrap,
             diffs: Vec::new(),
@@ -1773,6 +1800,25 @@ impl Changes {
         }
     }
 
+    /// The project this pane is pinned to, when it was opened from the
+    /// new-session canvas. `None` for every chat-scoped pane.
+    pub fn space_scope(&self) -> Option<&SpaceDiffScope> {
+        self.space_scope.as_ref()
+    }
+
+    /// A pane opened from the new-session canvas, scoped to the picked project
+    /// instead of a chat. Everything else — the watch, the scope menu, the
+    /// branch list — reads the same path a chat pane would.
+    pub fn for_space(
+        state: Entity<AppState>,
+        scope: SpaceDiffScope,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut changes = Self::new(state, cx);
+        changes.space_scope = Some(scope);
+        changes
+    }
+
     /// A pane pinned to one commit's diff (a History row click) — fetches
     /// `parent vs commit` once and never offers the scope menu.
     pub fn for_commit(
@@ -1783,6 +1829,14 @@ impl Changes {
         let mut changes = Self::new(state, cx);
         changes.scope = DiffScope::Commit;
         changes.commit = Some(commit);
+        changes
+    }
+
+    /// A pane opened on the "Latest turn" scope (a transcript edited-files
+    /// card's Review button). The scope menu stays available.
+    pub fn for_latest_turn(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let mut changes = Self::new(state, cx);
+        changes.scope = DiffScope::LatestTurn;
         changes
     }
 
@@ -1815,10 +1869,14 @@ impl Changes {
     /// engine's own — diffs are produced where the checkout lives, so a
     /// remote chat's watch must relay-forward (`targetDeviceId`) to its host.
     /// Without this the local stream simply never carries the remote checkout
-    /// and the pane sits on "Preparing diff…" forever (user report).
+    /// and the pane sits on "Preparing diff…" forever (user report). A canvas
+    /// pane reads the same ladder against its project's host.
     fn desired_target(&self, cx: &App) -> Option<String> {
         let state = self.state.read(cx);
-        let device = state.selected_chat_row()?.device_id.clone();
+        let device = match &self.space_scope {
+            Some(scope) => scope.device_id.clone(),
+            None => state.selected_chat_row()?.device_id.clone(),
+        };
         (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
     }
 
@@ -1910,16 +1968,23 @@ impl Changes {
     }
 
     fn resolved(&self, cx: &App) -> Option<CheckoutDiff> {
+        if let Some(scope) = &self.space_scope {
+            return resolve_space_diff(&self.diffs, scope).cloned();
+        }
         let state = self.state.read(cx);
         let chat = state.selected_chat_row()?;
         resolve_diff(&self.diffs, chat).cloned()
     }
 
     /// The checkout root the scoped RPCs address: the watch-resolved diff's
-    /// canonical cwd when available, else the chat row's own.
+    /// canonical cwd when available, else the pane's own — a canvas pane's is
+    /// the project path it captured at open time.
     fn scoped_cwd(&self, cx: &App) -> Option<String> {
         if let Some(diff) = self.resolved(cx) {
             return Some(diff.cwd);
+        }
+        if let Some(scope) = &self.space_scope {
+            return Some(scope.cwd.clone());
         }
         self.state.read(cx).selected_chat_row()?.cwd.clone()
     }
@@ -2114,7 +2179,7 @@ impl Changes {
                 changes.scoped_inflight = None;
                 match result.and_then(|value| {
                     serde_json::from_value::<CheckoutDiff>(value)
-                        .map_err(|e| zeron_rpc::RpcError::Failed(e.to_string()))
+                        .map_err(|e| clyra_rpc::RpcError::Failed(e.to_string()))
                 }) {
                     Ok(diff) => {
                         changes.scoped = Some(diff);
@@ -3020,7 +3085,7 @@ impl Changes {
         parsed_key: &str,
         cx: &mut Context<Self>,
     ) -> Option<Arc<DiffHighlights>> {
-        let lang = zeron_syntax::language_for_path(&file.path)?;
+        let lang = clyra_syntax::language_for_path(&file.path)?;
         let fingerprint = hash64(&[parsed_key, &file.path]);
         if let Some(slot) = self.highlights.get(&file.path)
             && slot.fingerprint == fingerprint
@@ -3032,7 +3097,7 @@ impl Changes {
                 DiffHighlightState::Pending | DiffHighlightState::Plain => None,
             };
         }
-        if !zeron_syntax::supports_language(lang) {
+        if !clyra_syntax::supports_language(lang) {
             self.highlights.insert(
                 file.path.clone(),
                 HighlightSlot {
@@ -3084,7 +3149,7 @@ impl Changes {
         let fetch_path = path.clone();
         let fetch_task = match (active, engine) {
             (Some(diff), Some(engine)) => Some(cx.spawn(async move |this, cx| {
-                let request = zeron_proto::GetCheckoutFileDiffTextRequest {
+                let request = clyra_proto::GetCheckoutFileDiffTextRequest {
                     checkout_id: diff.checkout_id,
                     cwd: diff.cwd,
                     path: fetch_path.clone(),
@@ -3110,7 +3175,7 @@ impl Changes {
                     .await
                     .ok()
                     .and_then(|value| {
-                        serde_json::from_value::<zeron_proto::CheckoutFileDiffText>(value).ok()
+                        serde_json::from_value::<clyra_proto::CheckoutFileDiffText>(value).ok()
                     });
                 let highlights = match response {
                     Some(response) => {
@@ -3464,7 +3529,7 @@ impl Changes {
             theme.ink(0.05)
         };
 
-        // Chevron (zeron checkout-diff-sidebar): chevron-right closed,
+        // Chevron (clyra checkout-diff-sidebar): chevron-right closed,
         // chevron-down open; gpui divs have no rotation transform at the
         // pinned rev, so the glyph swap crossfades over the same 200 ms.
         let chevron_icon = if collapsed {
@@ -4327,7 +4392,7 @@ fn code_text_viewport(
 /// paint-only syntax runs.
 fn diff_line_row(
     line: &DiffLine,
-    spans: &[zeron_syntax::HighlightSpan],
+    spans: &[clyra_syntax::HighlightSpan],
     theme: &Theme,
     gutter_px: f32,
     code_width: DiffCodeWidth,
@@ -4694,7 +4759,7 @@ fn draft_cite_path(draft: &CommentDraft) -> &str {
 
 /// The expanded body of one file section: notices, hunk headers, +/-/context
 /// lines with a coloured accent bar, dual line-number gutters, a marker
-/// column, and paint-only syntax runs (zeron checkout-diff-sidebar).
+/// column, and paint-only syntax runs (clyra checkout-diff-sidebar).
 /// Shared with the transcript's tool-diff detail blocks — the same component
 /// renders a checkout diff section and an inline ACP tool diff. (The changes
 /// pane itself virtualizes these rows individually; this stacked form serves
@@ -4890,7 +4955,7 @@ impl Render for Changes {
                 } else if message.contains("unknown method") {
                     (
                         SharedString::from(
-                            "This chat's device is running an older Zeron — update it to view branch and turn diffs",
+                            "This chat's device is running an older Clyra — update it to view branch and turn diffs",
                         ),
                         false,
                     )
@@ -4923,7 +4988,7 @@ impl Render for Changes {
                     .items_center()
                     .justify_center()
                     .gap(px(Theme::SPACE_SM))
-                    .child(crate::loaders::gradient_spinner(
+                    .child(crate::loaders::dotm_helix(
                         "changes-preparing",
                         &theme,
                         3.0,
@@ -4976,7 +5041,7 @@ impl Render for Changes {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(crate::loaders::gradient_spinner(
+                            .child(crate::loaders::dotm_helix(
                                 "changes-parsing",
                                 &theme,
                                 3.0,
@@ -5018,6 +5083,57 @@ impl Render for Changes {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    fn diff_at(checkout_id: &str, device_id: &str, cwd: &str) -> CheckoutDiff {
+        CheckoutDiff {
+            checkout_id: checkout_id.into(),
+            device_id: device_id.into(),
+            cwd: cwd.into(),
+            patch: String::new(),
+            files: Vec::new(),
+            additions: 0,
+            deletions: 0,
+            truncated: false,
+            checksum: String::new(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn space_scope_resolves_on_device_and_cwd_then_cwd_alone() {
+        let diffs = vec![
+            diff_at("other", "local", "/elsewhere"),
+            diff_at("mine", "local", "/project"),
+            diff_at("remote", "remote-device", "/project"),
+        ];
+        let scope = SpaceDiffScope {
+            space_id: "space-1".into(),
+            cwd: "/project".into(),
+            device_id: "local".into(),
+        };
+        // Device + cwd first: the same path on another host is a different
+        // checkout, and reading that one would show someone else's tree.
+        assert_eq!(
+            resolve_space_diff(&diffs, &scope).map(|d| d.checkout_id.as_str()),
+            Some("mine")
+        );
+        // A project whose host is not in the stream yet falls back to the path,
+        // the same last rung `resolve_diff` uses without a checkout id.
+        let remote = SpaceDiffScope {
+            device_id: "not-yet-synced".into(),
+            ..scope.clone()
+        };
+        assert_eq!(
+            resolve_space_diff(&diffs, &remote).map(|d| d.checkout_id.as_str()),
+            Some("mine")
+        );
+        // No path match at all: the pane says "preparing", never another repo.
+        let elsewhere = SpaceDiffScope {
+            cwd: "/unknown".into(),
+            ..scope.clone()
+        };
+        assert!(resolve_space_diff(&diffs, &elsewhere).is_none());
+    }
 
     #[gpui::test]
     fn editing_staged_diff_comments_preserves_identity_and_cancellation(
@@ -5317,7 +5433,7 @@ rename to new_name.rs
 
     #[test]
     fn sticky_header_uses_the_content_theme_in_dark_and_light() {
-        use zeron_theme::{AccentSelection, SurfacePreference};
+        use clyra_theme::{AccentSelection, SurfacePreference};
 
         for (appearance, variant_id) in [
             (crate::theme::Appearance::Dark, "gruvbox-dark"),
@@ -5746,7 +5862,7 @@ rename to new_name.rs
         let highlight = Arc::new(DiffHighlights {
             old: None,
             new: Some(Arc::new(
-                zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+                clyra_syntax::highlight(clyra_syntax::HighlightRequest {
                     source: &source,
                     path: Some("x.ts"),
                     fence_tag: None,
@@ -5970,7 +6086,7 @@ rename to new_name.rs
         assert_eq!(diff_phase(Some(&full)), DiffPhase::List);
         // Engine may report files without patch text (truncation edge).
         let mut summarized = diff("co", "d", "/w", "");
-        summarized.files.push(zeron_proto::DiffFileSummary {
+        summarized.files.push(clyra_proto::DiffFileSummary {
             path: "x".into(),
             old_path: None,
             status: "modified".into(),
@@ -6124,7 +6240,7 @@ rename to new_name.rs
         let new_source = "export function new(value: string) {\n    return value.trim();\n}\n";
         let parse = |source| {
             Arc::new(
-                zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+                clyra_syntax::highlight(clyra_syntax::HighlightRequest {
                     source,
                     path: Some("src/derive.ts"),
                     fence_tag: None,
@@ -6179,13 +6295,13 @@ rename to new_name.rs
             highlights
                 .spans(&deleted)
                 .iter()
-                .any(|span| span.kind == zeron_syntax::HighlightKind::Function)
+                .any(|span| span.kind == clyra_syntax::HighlightKind::Function)
         );
         assert!(
             highlights
                 .spans(&added)
                 .iter()
-                .any(|span| span.kind == zeron_syntax::HighlightKind::Function)
+                .any(|span| span.kind == clyra_syntax::HighlightKind::Function)
         );
     }
 
@@ -6221,21 +6337,21 @@ rename to new_name.rs
             (
                 "src/card.tsx",
                 "const view: JSX.Element = <main id=\"app\" />;",
-                zeron_syntax::HighlightKind::Tag,
+                clyra_syntax::HighlightKind::Tag,
             ),
             (
                 "src/Greeter.kt",
                 "fun greet(name: String) = println(name)",
-                zeron_syntax::HighlightKind::Function,
+                clyra_syntax::HighlightKind::Function,
             ),
             (
                 "Dockerfile",
                 "RUN echo \"hello\"",
-                zeron_syntax::HighlightKind::Function,
+                clyra_syntax::HighlightKind::Function,
             ),
         ] {
             let document = Arc::new(
-                zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+                clyra_syntax::highlight(clyra_syntax::HighlightRequest {
                     source,
                     path: Some(path),
                     fence_tag: None,
@@ -6328,13 +6444,13 @@ rename to new_name.rs
             highlights
                 .spans(deleted)
                 .iter()
-                .any(|span| span.kind == zeron_syntax::HighlightKind::Comment)
+                .any(|span| span.kind == clyra_syntax::HighlightKind::Comment)
         );
         assert!(
             highlights
                 .spans(added)
                 .iter()
-                .any(|span| span.kind == zeron_syntax::HighlightKind::Comment)
+                .any(|span| span.kind == clyra_syntax::HighlightKind::Comment)
         );
     }
 
@@ -6367,7 +6483,7 @@ rename to new_name.rs
             deletions: 1,
             max_line: 1,
         };
-        let response = zeron_proto::CheckoutFileDiffText {
+        let response = clyra_proto::CheckoutFileDiffText {
             diff_checksum: "sum".into(),
             old_text: Some("let old = 1;\n".into()),
             new_text: Some("different snapshot\n".into()),

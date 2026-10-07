@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay text/reasoning from a real Zeron Claude journal at a fixed cadence.
+"""Replay text/reasoning from a real Clyra Claude journal at a fixed cadence.
 
 Set CLAUDE_CODE_EXECUTABLE to this file and ZERON_REPLAY_JOURNAL to the JSONL
 captured by resource-profile.mjs. This is a deterministic adapter replay, not

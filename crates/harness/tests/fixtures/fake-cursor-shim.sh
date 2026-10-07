@@ -1,5 +1,5 @@
 #!/bin/sh
-# Fake zeron cursor shim for zeron-harness tests: speaks the shim's JSONL
+# Fake clyra cursor shim for clyra-harness tests: speaks the shim's JSONL
 # protocol (see crates/harness/src/cursor/shim.mjs) without node or the SDK.
 # Driven by crates/harness/tests/cursor.rs.
 

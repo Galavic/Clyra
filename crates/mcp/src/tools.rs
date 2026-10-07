@@ -1,7 +1,7 @@
 //! The tool catalog and its dispatch.
 //!
 //! Every tool is a thin composition of engine reads/writes from
-//! [`Zeron`]; the only logic that lives here is argument resolution (chat
+//! [`Clyra`]; the only logic that lives here is argument resolution (chat
 //! by prefix, project by path), sender attribution, and the "how do I
 //! deliver a message to a chat in this state" choice the composer makes
 //! for humans.
@@ -9,16 +9,16 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use zeron_doc::SessionCommandPayload;
-use zeron_proto::{
+use clyra_doc::SessionCommandPayload;
+use clyra_proto::{
     Chat, ChatConfig, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, Session, SessionStatus,
     Space, UserInputAnswer,
 };
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
+use crate::clyra::{Clyra, HarnessInfo, TurnOutcome, session_for, short};
 use crate::transcript::{RenderOptions, RenderedMessage, render_entries};
-use crate::zeron::{HarnessInfo, TurnOutcome, Zeron, session_for, short};
 
 /// Default and ceiling for the blocking waits.
 const DEFAULT_WAIT: Duration = Duration::from_secs(600);
@@ -36,7 +36,8 @@ pub struct ToolDef {
 }
 
 pub struct Tools {
-    zeron: Arc<Zeron>,
+    clyra: Arc<Clyra>,
+    delegation_lock: tokio::sync::Mutex<()>,
 }
 
 fn chat_key_schema(extra: Value) -> Value {
@@ -105,6 +106,13 @@ fn catalog() -> Vec<ToolDef> {
             name: "get_chat",
             description: "One chat's metadata, live status, and any question its agent is currently blocked on.",
             input_schema: chat_key_schema(json!({})),
+        },
+        ToolDef {
+            name: "delegate_task",
+            description: "Delegate one independent task to a child agent, running in parallel. Inherits your project, model and permissions. Maximum four active children. Results automatically return to the dot coordinator. Assign disjoint files to agents sharing a checkout. Workers cannot delegate recursively.",
+            input_schema: json!({"type":"object", "properties": {
+                "title":{"type":"string"}, "prompt":{"type":"string"}
+            }, "required":["title","prompt"]}),
         },
         ToolDef {
             name: "create_chat",
@@ -212,6 +220,8 @@ struct ListChatsArgs {
 
 #[derive(Deserialize, Default)]
 struct CreateChatArgs {
+    #[serde(skip)]
+    inherited_config: Option<ChatConfig>,
     project: Option<String>,
     device: Option<String>,
     parent: Option<String>,
@@ -354,8 +364,11 @@ fn last_pending_input(messages: &[RenderedMessage]) -> Option<Value> {
 // ---- dispatch ----------------------------------------------------------------
 
 impl Tools {
-    pub fn new(zeron: Arc<Zeron>) -> Self {
-        Self { zeron }
+    pub fn new(clyra: Arc<Clyra>) -> Self {
+        Self {
+            clyra,
+            delegation_lock: tokio::sync::Mutex::new(()),
+        }
     }
 
     pub fn list(&self) -> Vec<ToolDef> {
@@ -377,6 +390,7 @@ impl Tools {
             "list_models" => self.list_models(parse(args)?).await,
             "list_chats" => self.list_chats(parse(args)?).await,
             "get_chat" => self.get_chat(parse(args)?).await,
+            "delegate_task" => self.delegate_task(args).await,
             "create_chat" => self.create_chat(parse(args)?).await,
             "read_chat" => self.read_chat(parse(args)?).await,
             "send_message" => self.send_message(parse(args)?).await,
@@ -390,14 +404,14 @@ impl Tools {
     }
 
     async fn whoami(&self) -> anyhow::Result<Value> {
-        let origin = self.zeron.origin().clone();
-        let local_device = self.zeron.local_device_id().await?;
-        let engine = self.zeron.engine_info().await.unwrap_or(Value::Null);
+        let origin = self.clyra.origin().clone();
+        let local_device = self.clyra.local_device_id().await?;
+        let engine = self.clyra.engine_info().await.unwrap_or(Value::Null);
         let chat = match origin.chat_id.as_deref() {
-            Some(id) => match self.zeron.resolve_chat(id).await {
+            Some(id) => match self.clyra.resolve_chat(id).await {
                 Ok(chat) => {
                     let (spaces, sessions) =
-                        tokio::try_join!(self.zeron.spaces(), self.zeron.sessions())?;
+                        tokio::try_join!(self.clyra.spaces(), self.clyra.sessions())?;
                     summarize_chat(&chat, &spaces, &sessions)
                 }
                 Err(_) => json!({ "id": id }),
@@ -419,7 +433,7 @@ impl Tools {
 
     async fn list_devices(&self) -> anyhow::Result<Value> {
         let (devices, local) =
-            tokio::try_join!(self.zeron.devices(), self.zeron.local_device_id())?;
+            tokio::try_join!(self.clyra.devices(), self.clyra.local_device_id())?;
         Ok(json!({
             "devices": devices.iter().map(|d| json!({
                 "id": d.id,
@@ -433,7 +447,7 @@ impl Tools {
     }
 
     async fn list_projects(&self) -> anyhow::Result<Value> {
-        let (spaces, devices) = tokio::try_join!(self.zeron.spaces(), self.zeron.devices())?;
+        let (spaces, devices) = tokio::try_join!(self.clyra.spaces(), self.clyra.devices())?;
         let device_name = |id: &str| devices.iter().find(|d| d.id == id).map(|d| d.name.clone());
         Ok(json!({
             "projects": spaces.iter().map(|s| json!({
@@ -448,7 +462,7 @@ impl Tools {
     }
 
     async fn list_harnesses(&self) -> anyhow::Result<Value> {
-        let harnesses = self.zeron.harnesses().await?;
+        let harnesses = self.clyra.harnesses().await?;
         Ok(json!({
             "harnesses": harnesses.iter().map(|h| json!({
                 "id": h.id,
@@ -464,7 +478,7 @@ impl Tools {
     async fn list_models(&self, args: ListModelsArgs) -> anyhow::Result<Value> {
         let harness: HarnessId =
             parse_enum("harness", &args.harness).map_err(anyhow::Error::msg)?;
-        let models = self.zeron.models(harness).await?;
+        let models = self.clyra.models(harness).await?;
         Ok(json!({
             "harness": harness,
             "models": models.iter().map(|m| json!({
@@ -478,23 +492,23 @@ impl Tools {
 
     async fn list_chats(&self, args: ListChatsArgs) -> anyhow::Result<Value> {
         let (mut chats, spaces, sessions) = tokio::try_join!(
-            self.zeron.chats(),
-            self.zeron.spaces(),
-            self.zeron.sessions()
+            self.clyra.chats(),
+            self.clyra.spaces(),
+            self.clyra.sessions()
         )?;
         if let Some(project) = args.project.as_deref() {
-            let space = self.zeron.resolve_space(project).await?;
+            let space = self.clyra.resolve_space(project).await?;
             chats.retain(|c| c.space_id.as_deref() == Some(space.id.as_str()));
         }
         if args.device.is_some() {
-            let device = self.zeron.resolve_device_id(args.device.as_deref()).await?;
+            let device = self.clyra.resolve_device_id(args.device.as_deref()).await?;
             chats.retain(|c| c.device_id == device);
         }
         if !args.include_archived {
             chats.retain(|c| !c.archived);
         }
         if let Some(parent) = args.parent.as_deref() {
-            let parent = self.zeron.resolve_chat(parent).await?;
+            let parent = self.clyra.resolve_chat(parent).await?;
             chats.retain(|c| c.parent_chat_id.as_deref() == Some(parent.id.as_str()));
         }
         chats.sort_by(|a, b| {
@@ -513,11 +527,11 @@ impl Tools {
     }
 
     async fn get_chat(&self, args: ChatArgs) -> anyhow::Result<Value> {
-        let chat = self.zeron.resolve_chat(&args.chat).await?;
+        let chat = self.clyra.resolve_chat(&args.chat).await?;
         let (spaces, sessions, entries) = tokio::try_join!(
-            self.zeron.spaces(),
-            self.zeron.sessions(),
-            self.zeron.transcript(&chat.id)
+            self.clyra.spaces(),
+            self.clyra.sessions(),
+            self.clyra.transcript(&chat.id)
         )?;
         let rendered = render_entries(&entries, RenderOptions::default());
         let mut summary = summarize_chat(&chat, &spaces, &sessions);
@@ -527,8 +541,66 @@ impl Tools {
         Ok(summary)
     }
 
+    async fn delegate_task(&self, args: Value) -> anyhow::Result<Value> {
+        let _guard = self.delegation_lock.lock().await;
+        let origin = self
+            .clyra
+            .origin()
+            .chat_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Delegation requires a chat identity"))?;
+        let parent = self.clyra.resolve_chat(origin).await?;
+        if parent.parent_chat_id.is_some() {
+            anyhow::bail!("Workers cannot delegate recursively");
+        }
+        let title = args["title"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("A task needs a title"))?;
+        let prompt = args["prompt"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("A task needs a prompt"))?;
+        if title.len() > 240 || prompt.len() > 65536 {
+            anyhow::bail!("Task is too large");
+        }
+        let chats = self.clyra.chats().await?;
+        let sessions = self.clyra.sessions().await?;
+        let active = chats
+            .iter()
+            .filter(|c| c.parent_chat_id.as_deref() == Some(origin))
+            .filter(|c| {
+                session_for(&sessions, c).is_none_or(|s| {
+                    matches!(
+                        s.status,
+                        SessionStatus::Working | SessionStatus::AwaitingInput
+                    )
+                })
+            })
+            .count();
+        if active >= 4 {
+            anyhow::bail!(
+                "Four agents already active; wait for a result or reuse an existing agent"
+            );
+        }
+        let config = parent
+            .config
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Coordinator has no run configuration"))?;
+        let options = json!({
+            "project": parent.space_id, "device": parent.device_id, "parent": origin,
+            "harness": config.harness, "model": config.model, "reasoning": config.reasoning,
+            "sandbox": config.sandbox, "cwd": parent.cwd, "title": title,
+            "prompt": format!("<!-- clyra-dot-worker -->\nAssigned task: {title}\n{prompt}\n\nWork only on your assigned scope. You share a checkout with other agents: preserve their changes. Do not spawn agents. Finish with a concise result, changed files and validation. The engine returns your final result to the coordinator automatically."),
+            "wait": false
+        });
+        let mut args: CreateChatArgs = serde_json::from_value(options)?;
+        args.inherited_config = Some(config.clone());
+        self.create_chat(args).await
+    }
+
     async fn create_chat(&self, args: CreateChatArgs) -> anyhow::Result<Value> {
-        let harnesses = self.zeron.harnesses().await?;
+        let harnesses = self.clyra.harnesses().await?;
         let harness = match args.harness.as_deref() {
             Some(raw) => {
                 let id: HarnessId = parse_enum("harness", raw).map_err(anyhow::Error::msg)?;
@@ -544,7 +616,7 @@ impl Tools {
             None => default_harness(&harnesses)?,
         };
         if let Some(model) = args.model.as_deref()
-            && let Ok(models) = self.zeron.models(harness).await
+            && let Ok(models) = self.clyra.models(harness).await
             && !models.is_empty()
             && !models.iter().any(|m| m.id == model)
         {
@@ -565,23 +637,23 @@ impl Tools {
             Some(raw) => parse_enum("sandbox", raw).map_err(anyhow::Error::msg)?,
             None => SandboxLevel::WorkspaceWrite,
         };
-        let config = ChatConfig {
+        let config = args.inherited_config.unwrap_or(ChatConfig {
             harness,
             model: args.model.clone(),
             reasoning,
             model_options: Default::default(),
             sandbox,
-        };
+        });
 
         let (space, device_id) = match args.project.as_deref() {
             Some(project) => {
-                let space = self.zeron.resolve_space(project).await?;
+                let space = self.clyra.resolve_space(project).await?;
                 let device_id = space.device_id.clone();
                 (Some(space), device_id)
             }
             None => (
                 None,
-                self.zeron.resolve_device_id(args.device.as_deref()).await?,
+                self.clyra.resolve_device_id(args.device.as_deref()).await?,
             ),
         };
 
@@ -593,8 +665,8 @@ impl Tools {
             .map(str::trim)
             .filter(|p| !p.is_empty())
         {
-            Some(key) => Some(self.zeron.resolve_chat(key).await?.id),
-            None => self.zeron.origin().chat_id.clone(),
+            Some(key) => Some(self.clyra.resolve_chat(key).await?.id),
+            None => self.clyra.origin().chat_id.clone(),
         };
 
         let chat_id = uuid::Uuid::new_v4().to_string();
@@ -621,14 +693,14 @@ impl Tools {
         if let Some(cwd) = args.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
             mutate["cwd"] = json!(cwd);
         }
-        self.zeron.mutate(mutate).await?;
+        self.clyra.mutate(mutate).await?;
         if let Some(title) = args
             .title
             .as_deref()
             .map(str::trim)
             .filter(|t| !t.is_empty())
         {
-            self.zeron
+            self.clyra
                 .mutate(json!({ "op": "renameChat", "chatId": chat_id, "title": title }))
                 .await?;
         }
@@ -686,8 +758,8 @@ impl Tools {
     }
 
     async fn read_chat(&self, args: ReadChatArgs) -> anyhow::Result<Value> {
-        let chat = self.zeron.resolve_chat(&args.chat).await?;
-        let entries = self.zeron.transcript(&chat.id).await?;
+        let chat = self.clyra.resolve_chat(&args.chat).await?;
+        let entries = self.clyra.transcript(&chat.id).await?;
         let rendered = render_entries(
             &entries,
             RenderOptions {
@@ -717,17 +789,17 @@ impl Tools {
         if text.is_empty() {
             anyhow::bail!("text is empty");
         }
-        let chat = self.zeron.resolve_chat(&args.chat).await?;
-        if self.zeron.origin().chat_id.as_deref() == Some(chat.id.as_str()) {
+        let chat = self.clyra.resolve_chat(&args.chat).await?;
+        if self.clyra.origin().chat_id.as_deref() == Some(chat.id.as_str()) {
             anyhow::bail!(
                 "refusing to send a message to your own chat ({})",
                 short(&chat.id)
             );
         }
         let (spaces, sessions, harnesses) = tokio::try_join!(
-            self.zeron.spaces(),
-            self.zeron.sessions(),
-            self.zeron.harnesses()
+            self.clyra.spaces(),
+            self.clyra.sessions(),
+            self.clyra.harnesses()
         )?;
         let space = chat
             .space_id
@@ -759,7 +831,7 @@ impl Tools {
     }
 
     async fn wait_for_turn(&self, args: WaitArgs) -> anyhow::Result<Value> {
-        let chat = self.zeron.resolve_chat(&args.chat).await?;
+        let chat = self.clyra.resolve_chat(&args.chat).await?;
         let turn = self
             .await_turn(&chat, None, false, wait_duration(args.timeout_secs), 0)
             .await?;
@@ -767,29 +839,29 @@ impl Tools {
     }
 
     async fn archive_chat(&self, args: ArchiveArgs) -> anyhow::Result<Value> {
-        let chat = self.zeron.resolve_chat(&args.chat).await?;
+        let chat = self.clyra.resolve_chat(&args.chat).await?;
         let archived = args.archived.unwrap_or(true);
-        self.zeron
+        self.clyra
             .mutate(json!({ "op": "setChatArchived", "chatId": chat.id, "archived": archived }))
             .await?;
         Ok(json!({ "chatId": chat.id, "title": chat.title, "archived": archived }))
     }
 
     async fn interrupt_chat(&self, args: ChatArgs) -> anyhow::Result<Value> {
-        let chat = self.zeron.resolve_chat(&args.chat).await?;
+        let chat = self.clyra.resolve_chat(&args.chat).await?;
         let command_id = self
-            .zeron
+            .clyra
             .queue_command(&chat.id, &SessionCommandPayload::Interrupt {})
             .await?;
         Ok(json!({ "chatId": chat.id, "commandId": command_id }))
     }
 
     async fn respond_to_input(&self, args: RespondArgs) -> anyhow::Result<Value> {
-        let chat = self.zeron.resolve_chat(&args.chat).await?;
+        let chat = self.clyra.resolve_chat(&args.chat).await?;
         let request_id = match args.request_id {
             Some(id) => id,
             None => {
-                let entries = self.zeron.transcript(&chat.id).await?;
+                let entries = self.clyra.transcript(&chat.id).await?;
                 let rendered = render_entries(&entries, RenderOptions::default());
                 last_pending_input(&rendered)
                     .and_then(|p| {
@@ -814,7 +886,7 @@ impl Tools {
             })
             .collect();
         let command_id = self
-            .zeron
+            .clyra
             .queue_command(
                 &chat.id,
                 &SessionCommandPayload::RespondInput {
@@ -832,13 +904,13 @@ impl Tools {
     /// the receiving agent (and the human reading that transcript) can tell
     /// an agent-to-agent message from a typed one.
     async fn attribute(&self, target: &Chat, text: &str) -> String {
-        let Some(origin_id) = self.zeron.origin().chat_id.as_deref() else {
+        let Some(origin_id) = self.clyra.origin().chat_id.as_deref() else {
             return text.to_owned();
         };
         if origin_id == target.id {
             return text.to_owned();
         }
-        let title = match self.zeron.resolve_chat(origin_id).await {
+        let title = match self.clyra.resolve_chat(origin_id).await {
             Ok(chat) => chat.title,
             Err(_) => None,
         };
@@ -849,7 +921,7 @@ impl Tools {
             _ => short(origin_id).to_owned(),
         };
         format!(
-            "[Message from Zeron chat {label}. Reply to it with the Zeron `send_message` tool, chat {}.]\n\n{text}",
+            "[Message from Clyra chat {label}. Reply to it with the Clyra `send_message` tool, chat {}.]\n\n{text}",
             short(origin_id)
         )
     }
@@ -926,7 +998,7 @@ impl Tools {
                     attachments: Vec::new(),
                     worktree: None,
                 };
-                self.zeron
+                self.clyra
                     .queue_command(
                         &chat.id,
                         &SessionCommandPayload::Run {
@@ -937,7 +1009,7 @@ impl Tools {
                     .await?
             }
             "steer" => {
-                self.zeron
+                self.clyra
                     .queue_command(
                         &chat.id,
                         &SessionCommandPayload::Steer {
@@ -947,7 +1019,7 @@ impl Tools {
                     )
                     .await?
             }
-            _ => self.zeron.queue_message(&chat.id, &text).await?,
+            _ => self.clyra.queue_message(&chat.id, &text).await?,
         };
         Ok(json!({
             "delivery": chosen,
@@ -967,21 +1039,21 @@ impl Tools {
         since_millis: i64,
     ) -> anyhow::Result<Value> {
         let (outcome, session) = self
-            .zeron
+            .clyra
             .wait_for_turn(chat, baseline, expect_turn, timeout)
             .await?;
-        let entries = self.zeron.transcript(&chat.id).await.unwrap_or_default();
+        let entries = self.clyra.transcript(&chat.id).await.unwrap_or_default();
         let rendered = render_entries(&entries, RenderOptions::default());
         let replies: Vec<&RenderedMessage> = rendered
             .iter()
-            .filter(|m| m.role == zeron_doc::MessageRole::Assistant)
+            .filter(|m| m.role == clyra_doc::MessageRole::Assistant)
             .filter(|m| m.created_at >= since_millis.saturating_sub(2_000))
             .collect();
         let replies: Vec<&RenderedMessage> = if replies.is_empty() {
             rendered
                 .iter()
                 .rev()
-                .find(|m| m.role == zeron_doc::MessageRole::Assistant)
+                .find(|m| m.role == clyra_doc::MessageRole::Assistant)
                 .into_iter()
                 .collect()
         } else {
@@ -1020,17 +1092,19 @@ fn default_harness(harnesses: &[HarnessInfo]) -> anyhow::Result<HarnessId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zeron::Origin;
+    use crate::clyra::Origin;
     use async_trait::async_trait;
+    use clyra_rpc::{RpcError, RpcReply, RpcService, memory_client, methods};
     use futures::StreamExt;
     use std::sync::Mutex;
-    use zeron_rpc::{RpcError, RpcReply, RpcService, memory_client, methods};
 
     /// A fixed little workspace: one device, one project, one chat with a
     /// two-message transcript. Writes are recorded for assertions.
     #[derive(Default)]
     struct World {
         writes: Mutex<Vec<(String, Value)>>,
+        chats_override: Mutex<Option<Value>>,
+        sessions_override: Mutex<Option<Value>>,
     }
 
     fn stream(item: Value) -> RpcReply {
@@ -1040,6 +1114,16 @@ mod tests {
     #[async_trait]
     impl RpcService for World {
         async fn handle(&self, method: &str, params: Value) -> Result<RpcReply, RpcError> {
+            if method == methods::WATCH_CHATS
+                && let Some(chats) = self.chats_override.lock().unwrap().clone()
+            {
+                return Ok(stream(chats));
+            }
+            if method == methods::WATCH_SESSIONS
+                && let Some(sessions) = self.sessions_override.lock().unwrap().clone()
+            {
+                return Ok(stream(sessions));
+            }
             Ok(match method {
                 methods::LOCAL_DEVICE => RpcReply::Value(json!({ "deviceId": "dev-local" })),
                 methods::ENGINE_INFO => RpcReply::Value(json!({
@@ -1097,7 +1181,7 @@ mod tests {
 
     fn tools(world: Arc<World>, origin: Origin) -> Tools {
         let client = memory_client(world);
-        Tools::new(Arc::new(Zeron::with_client(client, origin)))
+        Tools::new(Arc::new(Clyra::with_client(client, origin)))
     }
 
     #[tokio::test]
@@ -1171,7 +1255,7 @@ mod tests {
         assert_eq!(params["command"]["kind"], "run");
         let prompt = params["command"]["request"]["prompt"].as_str().unwrap();
         assert!(
-            prompt.starts_with("[Message from Zeron chat Beta (chat-bet)"),
+            prompt.starts_with("[Message from Clyra chat Beta (chat-bet)"),
             "{prompt}"
         );
         assert!(prompt.ends_with("please review"));
@@ -1215,6 +1299,131 @@ mod tests {
         assert_eq!(writes[1].1["op"], "renameChat");
         assert_eq!(writes[2].0, methods::QUEUE_COMMAND);
         assert_eq!(writes[2].1["command"]["request"]["prompt"], "go");
+    }
+
+    #[tokio::test]
+    async fn delegation_inherits_the_coordinator_and_starts_without_waiting() {
+        let world = Arc::new(World::default());
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                device_id: None,
+            },
+        );
+        let created = tools
+            .call(
+                "delegate_task",
+                json!({
+                    "title": "Check backend", "prompt": "Review only server code"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created["parentChatId"], "chat-alpha-1");
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes.len(), 3);
+        assert_eq!(writes[0].1["spaceId"], "space-1");
+        assert_eq!(writes[0].1["config"]["harness"], "claude-code");
+        assert_eq!(writes[0].1["config"]["model"], "opus");
+        assert_eq!(writes[0].1["config"]["sandbox"], "workspace-write");
+        let prompt = writes[2].1["command"]["request"]["prompt"]
+            .as_str()
+            .unwrap();
+        assert!(prompt.starts_with("<!-- clyra-dot-worker -->"));
+        assert!(prompt.contains("Review only server code"));
+        assert!(
+            created.get("turn").is_none(),
+            "delegation must not wait for completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegation_limits_active_workers_and_blocks_recursion() {
+        let world = Arc::new(World::default());
+        let coordinator = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                device_id: None,
+            },
+        );
+        let parent = coordinator
+            .clyra
+            .resolve_chat("chat-alpha-1")
+            .await
+            .unwrap();
+        let mut chats = vec![serde_json::to_value(&parent).unwrap()];
+        let mut sessions = Vec::new();
+        for i in 0..4 {
+            let mut child = parent.clone();
+            child.id = format!("worker-{i}");
+            child.parent_chat_id = Some(parent.id.clone());
+            chats.push(serde_json::to_value(&child).unwrap());
+            sessions.push(json!({"chatId":child.id,"deviceId":child.device_id,
+                "status":"working", "startedAt":null,"updatedAt":chrono::Utc::now()}));
+        }
+        *world.chats_override.lock().unwrap() = Some(json!(chats));
+        *world.sessions_override.lock().unwrap() = Some(json!(sessions));
+        let task = json!({"title":"Extra", "prompt":"Review"});
+        assert!(
+            coordinator
+                .call("delegate_task", task.clone())
+                .await
+                .unwrap_err()
+                .contains("Four agents")
+        );
+        let worker = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("worker-0".into()),
+                device_id: None,
+            },
+        );
+        assert!(
+            worker
+                .call("delegate_task", task.clone())
+                .await
+                .unwrap_err()
+                .contains("recursively")
+        );
+        assert!(world.writes.lock().unwrap().is_empty());
+        sessions[0]["status"] = json!("idle");
+        *world.sessions_override.lock().unwrap() = Some(json!(sessions));
+        coordinator.call("delegate_task", task).await.unwrap();
+        assert_eq!(
+            world.writes.lock().unwrap().len(),
+            3,
+            "completed workers release capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegation_requires_identity_and_a_valid_scope() {
+        let world = Arc::new(World::default());
+        let anonymous = tools(world.clone(), Origin::default());
+        assert!(
+            anonymous
+                .call("delegate_task", json!({"title":"x","prompt":"y"}))
+                .await
+                .unwrap_err()
+                .contains("identity")
+        );
+        let coordinator = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                device_id: None,
+            },
+        );
+        assert!(
+            coordinator
+                .call("delegate_task", json!({"title":"x","prompt":" "}))
+                .await
+                .unwrap_err()
+                .contains("prompt")
+        );
+        assert!(world.writes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1301,7 +1510,7 @@ mod tests {
         )
         .await;
         assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
-        assert_eq!(init["result"]["serverInfo"]["name"], "zeron");
+        assert_eq!(init["result"]["serverInfo"]["name"], "clyra");
         let list =
             crate::jsonrpc::handle_request(&tools, json!(2), "tools/list", Value::Null).await;
         assert!(list["result"]["tools"].as_array().unwrap().len() >= 10);

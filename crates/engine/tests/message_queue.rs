@@ -15,15 +15,15 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use zeron_doc::{
+use clyra_doc::{
     MessagePart, MessageRole, QueueDeliveryGate, SessionCommandPayload, SessionMessageEntry,
 };
-use zeron_engine::doc_host::{
+use clyra_engine::doc_host::{
     BeginQueueEditOutcome, FinishQueueEditAction, FinishQueueEditOutcome,
 };
-use zeron_engine::{EngineCore, HarnessRegistry};
-use zeron_harness::{Harness, HarnessError, RunControls};
-use zeron_proto::{
+use clyra_engine::{EngineCore, HarnessRegistry};
+use clyra_harness::{Harness, HarnessError, RunControls};
+use clyra_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
     UserInputQuestion,
 };
@@ -115,6 +115,14 @@ impl Harness for HeldHarness {
             session_id: "sess-queue".into(),
             assistant_message_id: format!("a-{}", request.prompt),
         })]);
+        let output =
+            futures::stream::iter(if request.prompt.starts_with("<!-- clyra-dot-worker -->") {
+                vec![Ok(AgentEvent::TextDelta {
+                    text: "Assigned scope reviewed successfully".into(),
+                })]
+            } else {
+                Vec::new()
+            });
         let done = futures::stream::once(async move {
             loop {
                 tokio::select! {
@@ -139,7 +147,7 @@ impl Harness for HeldHarness {
                 }
             }
         });
-        Ok(started.chain(done).boxed())
+        Ok(started.chain(output).chain(done).boxed())
     }
 }
 
@@ -240,10 +248,10 @@ fn assemble_at(path: &std::path::Path, harness: Arc<HeldHarness>) -> EngineCore 
 }
 
 async fn create_chat(core: &EngineCore) {
-    let client = zeron_rpc::memory_client(core.rpc_service());
+    let client = clyra_rpc::memory_client(core.rpc_service());
     client
         .call(
-            zeron_rpc::methods::MUTATE,
+            clyra_rpc::methods::MUTATE,
             serde_json::json!({
                 "op": "createChat",
                 "chatId": CHAT,
@@ -256,6 +264,230 @@ async fn create_chat(core: &EngineCore) {
     core.workspace
         .rename_chat(CHAT, "Pre-titled")
         .expect("rename chat");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dot_messages_reuse_the_conversation_and_wait_for_the_current_turn() {
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    let project = tempfile::tempdir().unwrap();
+    core.workspace
+        .create_space(
+            "dot-project",
+            &core.device_id,
+            &project.path().to_string_lossy(),
+            Some("Project".into()),
+            false,
+        )
+        .unwrap();
+    let now = chrono::Utc::now();
+    let dot = core
+        .automations
+        .store()
+        .upsert(
+            clyra_proto::AutomationDraft {
+                id: String::new(),
+                name: "Dot".into(),
+                space_id: "dot-project".into(),
+                trigger: clyra_proto::AutomationTrigger::Schedule(
+                    clyra_proto::AutomationSchedule {
+                        every: clyra_proto::AutomationCadence::Daily,
+                        hour: 9,
+                        minute: 0,
+                        weekday: 1,
+                    },
+                ),
+                prompt: "Keep reviewing this project".into(),
+                harness: Some(HarnessId::Mock),
+                model: None,
+                sandbox: clyra_proto::SandboxLevel::ReadOnly,
+                enabled: false,
+            },
+            "Project".into(),
+            project.path().to_string_lossy().into_owned(),
+            now,
+        )
+        .unwrap();
+    let client = clyra_rpc::memory_client(core.rpc_service());
+    let prepared: clyra_proto::AutomationRunAck = serde_json::from_value(
+        client
+            .call(
+                clyra_rpc::methods::RUN_AUTOMATION_NOW,
+                serde_json::json!({"automationId":dot.id,"prepareOnly":true}),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let prepared_again = core.automations.prepare(&dot.id, now).await.unwrap();
+    assert_eq!(prepared.chat_id, prepared_again.chat_id);
+    // Profile edits must apply to the ordinary dot composer without replacing
+    // its history or starting an unsolicited turn.
+    client
+        .call(
+            clyra_rpc::methods::UPSERT_AUTOMATION,
+            serde_json::json!({"draft": clyra_proto::AutomationDraft {
+                id: dot.id.clone(),
+                name: dot.name.clone(),
+                space_id: dot.space_id.clone(),
+                trigger: dot.trigger.clone(),
+                prompt: dot.prompt.clone(),
+                harness: dot.harness,
+                model: Some("selected-dot-model".into()),
+                sandbox: clyra_proto::SandboxLevel::WorkspaceWrite,
+                enabled: dot.enabled,
+            }}),
+        )
+        .await
+        .unwrap();
+    let updated: clyra_proto::AutomationRunAck = serde_json::from_value(
+        client
+            .call(
+                clyra_rpc::methods::RUN_AUTOMATION_NOW,
+                serde_json::json!({"automationId":dot.id,"prepareOnly":true}),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(prepared.chat_id, updated.chat_id);
+    let config = core
+        .workspace
+        .chat(&updated.chat_id)
+        .unwrap()
+        .unwrap()
+        .config
+        .unwrap();
+    assert_eq!(config.harness, HarnessId::Mock);
+    assert_eq!(config.model.as_deref(), Some("selected-dot-model"));
+    assert_eq!(config.sandbox, clyra_proto::SandboxLevel::WorkspaceWrite);
+    assert!(
+        prompts.lock().unwrap().is_empty(),
+        "preparing a composer must not run an agent"
+    );
+    let first = core
+        .automations
+        .message(&dot.id, "first", now)
+        .await
+        .unwrap();
+    assert_eq!(first.chat_id, prepared.chat_id);
+    wait_for(|| prompts.lock().unwrap().len() == 1, "first dot message").await;
+    let client = clyra_rpc::memory_client(core.rpc_service());
+    let reply = client
+        .call(
+            clyra_rpc::methods::RUN_AUTOMATION_NOW,
+            serde_json::json!({ "automationId": dot.id, "message": "second" }),
+        )
+        .await
+        .unwrap();
+    let second: clyra_proto::AutomationRunAck = serde_json::from_value(reply).unwrap();
+    assert_eq!(first.chat_id, second.chat_id);
+    assert_eq!(prompts.lock().unwrap().len(), 1);
+    let saved = core.automations.store().get(&dot.id).unwrap().unwrap();
+    assert_eq!(saved.prompt, dot.prompt);
+    assert_eq!(saved.last_run_at, None);
+    assert_eq!(
+        saved.conversation_chat_id.as_deref(),
+        Some(first.chat_id.as_str())
+    );
+    assert!(saved.activity_chat_ids.is_empty());
+    harness.finish.send(()).unwrap();
+    wait_for(
+        || prompts.lock().unwrap().len() == 2,
+        "queued dot follow-up",
+    )
+    .await;
+    let recorded = prompts.lock().unwrap();
+    assert!(recorded[0].ends_with("first"));
+    assert!(recorded[1].ends_with("second"));
+    drop(recorded);
+    harness.finish.send(()).unwrap();
+    wait_for(
+        || !core.sessions.turn_in_flight(&first.chat_id),
+        "coordinator idle",
+    )
+    .await;
+    let config = core
+        .workspace
+        .read_chats()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == first.chat_id)
+        .unwrap()
+        .config
+        .unwrap();
+    for child in ["dot-worker-a", "dot-worker-b"] {
+        core.workspace
+            .create_chat_with_parent(
+                child,
+                Some("dot-project"),
+                Some(&core.device_id),
+                Some(config.clone()),
+                Some(project.path().to_string_lossy().into_owned()),
+                Some(first.chat_id.clone()),
+            )
+            .unwrap();
+        core.workspace.rename_chat(child, child).unwrap();
+        core.doc_host
+            .queue_message(
+                child,
+                "<!-- clyra-dot-worker -->\nReview assigned scope",
+                Vec::new(),
+            )
+            .unwrap();
+    }
+    wait_for(
+        || prompts.lock().unwrap().len() == 4,
+        "two parallel workers",
+    )
+    .await;
+    assert!(core.sessions.turn_in_flight("dot-worker-a"));
+    assert!(core.sessions.turn_in_flight("dot-worker-b"));
+    core.automations.tick(now).await;
+    assert_eq!(
+        prompts.lock().unwrap().len(),
+        4,
+        "running workers are not completion reports"
+    );
+    harness.finish.send(()).unwrap();
+    wait_for(
+        || {
+            !core.sessions.turn_in_flight("dot-worker-a")
+                && !core.sessions.turn_in_flight("dot-worker-b")
+        },
+        "worker completion",
+    )
+    .await;
+    core.automations.tick(now).await;
+    wait_for(
+        || prompts.lock().unwrap().len() == 5,
+        "automatic coordinator reactivation",
+    )
+    .await;
+    let root_doc = core.doc_host.open(&first.chat_id).unwrap();
+    assert_eq!(
+        root_doc.doc().read_queue().unwrap().len(),
+        1,
+        "second result waits for first result turn"
+    );
+    core.automations.tick(now).await;
+    assert_eq!(
+        root_doc.doc().read_queue().unwrap().len(),
+        1,
+        "completed turns are reported once"
+    );
+    harness.finish.send(()).unwrap();
+    wait_for(
+        || prompts.lock().unwrap().len() == 6,
+        "second worker result",
+    )
+    .await;
+    assert!(
+        prompts.lock().unwrap()[4..]
+            .iter()
+            .all(|p| p.contains("Assigned scope reviewed successfully"))
+    );
+    harness.finish.send(()).unwrap();
+    core.shutdown().await;
 }
 
 /// Nothing is running, so a queued message is just a message: it goes out at
@@ -575,7 +807,7 @@ async fn batched_remote_steers_preserve_every_message_in_order_exactly_once() {
     for (i, prompt) in expected.iter().enumerate() {
         handle
             .doc()
-            .queue_command(&zeron_doc::SessionCommandEntry {
+            .queue_command(&clyra_doc::SessionCommandEntry {
                 id: format!("remote-command-{i}"),
                 payload: SessionCommandPayload::Steer {
                     prompt: prompt.clone(),
@@ -585,7 +817,7 @@ async fn batched_remote_steers_preserve_every_message_in_order_exactly_once() {
                 issued_at: now + i as i64,
                 based_on: None,
                 expires_at: None,
-                status: zeron_doc::SessionCommandStatus::Pending,
+                status: clyra_doc::SessionCommandStatus::Pending,
                 resolution: None,
             })
             .unwrap();
@@ -601,7 +833,7 @@ async fn batched_remote_steers_preserve_every_message_in_order_exactly_once() {
             .read_commands()
             .unwrap()
             .iter()
-            .all(|c| c.status == zeron_doc::SessionCommandStatus::Applied)
+            .all(|c| c.status == clyra_doc::SessionCommandStatus::Applied)
     );
     for (i, prompt) in expected.iter().enumerate() {
         harness.finish.send(()).unwrap();
@@ -669,7 +901,7 @@ async fn queued_text_waits_for_a_steerable_turn_even_with_legacy_policy() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn held_policy_keeps_a_steerable_message_visible_until_steer_now() {
     let (core, harness, prompts) = setup(SteeringMode::StepBoundary).await;
-    let client = zeron_rpc::memory_client(core.rpc_service());
+    let client = clyra_rpc::memory_client(core.rpc_service());
 
     core.doc_host
         .queue_message(CHAT, "opening", Vec::new())
@@ -682,7 +914,7 @@ async fn held_policy_keeps_a_steerable_message_visible_until_steer_now() {
 
     let reply = client
         .call(
-            zeron_rpc::methods::QUEUE_MESSAGE,
+            clyra_rpc::methods::QUEUE_MESSAGE,
             serde_json::json!({
                 "chatId": CHAT,
                 "text": "hold this",
@@ -698,7 +930,7 @@ async fn held_policy_keeps_a_steerable_message_visible_until_steer_now() {
 
     let reply = client
         .call(
-            zeron_rpc::methods::STEER_QUEUED_MESSAGE_NOW,
+            clyra_rpc::methods::STEER_QUEUED_MESSAGE_NOW,
             serde_json::json!({ "chatId": CHAT, "id": id }),
         )
         .await
@@ -755,10 +987,10 @@ async fn steer_now_starts_the_next_turn_when_the_previous_turn_is_already_idle()
     )
     .await;
 
-    let client = zeron_rpc::memory_client(core.rpc_service());
+    let client = clyra_rpc::memory_client(core.rpc_service());
     let reply = client
         .call(
-            zeron_rpc::methods::QUEUE_MESSAGE,
+            clyra_rpc::methods::QUEUE_MESSAGE,
             serde_json::json!({
                 "chatId": CHAT,
                 "text": "after cancel",
@@ -994,7 +1226,7 @@ async fn acknowledged_removal_cannot_materialize_after_turn_end() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queue_rpc_reorders_and_streams() {
     let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
-    let client = zeron_rpc::memory_client(core.rpc_service());
+    let client = clyra_rpc::memory_client(core.rpc_service());
 
     core.doc_host
         .queue_message(CHAT, "opening", Vec::new())
@@ -1007,7 +1239,7 @@ async fn queue_rpc_reorders_and_streams() {
 
     let mut rx = client
         .subscribe(
-            zeron_rpc::methods::WATCH_QUEUE,
+            clyra_rpc::methods::WATCH_QUEUE,
             serde_json::json!({ "chatId": CHAT }),
         )
         .await
@@ -1025,7 +1257,7 @@ async fn queue_rpc_reorders_and_streams() {
     for text in ["a", "b", "c"] {
         client
             .call(
-                zeron_rpc::methods::QUEUE_MESSAGE,
+                clyra_rpc::methods::QUEUE_MESSAGE,
                 serde_json::json!({ "chatId": CHAT, "text": text }),
             )
             .await
@@ -1046,7 +1278,7 @@ async fn queue_rpc_reorders_and_streams() {
         .clone();
     client
         .call(
-            zeron_rpc::methods::MOVE_QUEUED_MESSAGE,
+            clyra_rpc::methods::MOVE_QUEUED_MESSAGE,
             serde_json::json!({ "chatId": CHAT, "id": last_id, "toIndex": 0 }),
         )
         .await
@@ -1055,7 +1287,7 @@ async fn queue_rpc_reorders_and_streams() {
 
     client
         .call(
-            zeron_rpc::methods::REMOVE_QUEUED_MESSAGE,
+            clyra_rpc::methods::REMOVE_QUEUED_MESSAGE,
             serde_json::json!({ "chatId": CHAT, "id": last_id }),
         )
         .await
@@ -1170,7 +1402,7 @@ async fn a_message_holds_while_the_agent_waits_on_a_question() {
         || {
             core.sessions
                 .session_status(CHAT)
-                .is_some_and(|s| s.status == zeron_proto::SessionStatus::AwaitingInput)
+                .is_some_and(|s| s.status == clyra_proto::SessionStatus::AwaitingInput)
         },
         "the agent to park on its question",
     )
@@ -1374,10 +1606,10 @@ async fn protected_edit_rpc_round_trips_its_camel_case_protocol() {
         .doc_host
         .queue_message(CHAT, "rpc edit", Vec::new())
         .expect("queue row");
-    let client = zeron_rpc::memory_client(core.rpc_service());
+    let client = clyra_rpc::memory_client(core.rpc_service());
     let begin = client
         .call(
-            zeron_rpc::methods::BEGIN_QUEUED_MESSAGE_EDIT,
+            clyra_rpc::methods::BEGIN_QUEUED_MESSAGE_EDIT,
             serde_json::json!({
                 "chatId": CHAT,
                 "id": id,
@@ -1392,7 +1624,7 @@ async fn protected_edit_rpc_round_trips_its_camel_case_protocol() {
 
     let finish = client
         .call(
-            zeron_rpc::methods::FINISH_QUEUED_MESSAGE_EDIT,
+            clyra_rpc::methods::FINISH_QUEUED_MESSAGE_EDIT,
             serde_json::json!({
                 "chatId": CHAT,
                 "id": id,
@@ -1536,12 +1768,12 @@ async fn failed_queue_dispatch_stays_paused_until_explicit_retry() {
 async fn queued_turn_uses_current_config_at_turn_end_and_send_now() {
     for send_now in [false, true] {
         let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
-        let mut config = zeron_proto::ChatConfig {
+        let mut config = clyra_proto::ChatConfig {
             harness: HarnessId::Mock,
             model: Some("old-model".into()),
             reasoning: Some(ReasoningLevel::Medium),
             model_options: Default::default(),
-            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            sandbox: clyra_proto::SandboxLevel::WorkspaceWrite,
         };
         core.workspace.set_chat_config(CHAT, &config).unwrap();
         core.doc_host

@@ -1,14 +1,14 @@
 //! Persist only successful live catalogs, partitioned by credential/binary context.
+use clyra_harness::{
+    CatalogFailure, CatalogFailureCode, Harness, HarnessError, ModelCatalog, ModelContext,
+};
+use clyra_proto::Model;
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use zeron_harness::{
-    CatalogFailure, CatalogFailureCode, Harness, HarnessError, ModelCatalog, ModelContext,
-};
-use zeron_proto::Model;
 
 #[derive(Serialize, Deserialize)]
 struct Saved {
@@ -141,7 +141,7 @@ pub(crate) async fn list(
         Some(Ok(Ok(catalog))) if !catalog.models.is_empty() => catalog,
         Some(Ok(Err(error))) if !CatalogFailure::classify(&error).allows_stale() => {
             // Claude intentionally offers its manifest even while logged out.
-            if harness.id() == zeron_proto::HarnessId::ClaudeCode
+            if harness.id() == clyra_proto::HarnessId::ClaudeCode
                 && CatalogFailure::classify(&error) == CatalogFailureCode::AuthRequired
             {
                 ModelCatalog {
@@ -204,7 +204,7 @@ mod tests {
         forced: std::sync::atomic::AtomicBool,
         cached: std::sync::atomic::AtomicBool,
         failure: std::sync::Mutex<String>,
-        harness: zeron_proto::HarnessId,
+        harness: clyra_proto::HarnessId,
     }
     impl Probe {
         fn new() -> Arc<Self> {
@@ -215,14 +215,14 @@ mod tests {
                 forced: false.into(),
                 cached: false.into(),
                 failure: std::sync::Mutex::new("offline".into()),
-                harness: zeron_proto::HarnessId::Codex,
+                harness: clyra_proto::HarnessId::Codex,
             })
         }
     }
     use std::sync::atomic::Ordering::SeqCst;
     #[async_trait::async_trait]
     impl Harness for Probe {
-        fn id(&self) -> zeron_proto::HarnessId {
+        fn id(&self) -> clyra_proto::HarnessId {
             self.harness
         }
         fn display_name(&self) -> &str {
@@ -231,10 +231,10 @@ mod tests {
         fn supports_steering(&self) -> bool {
             false
         }
-        fn steering_mode(&self) -> zeron_proto::SteeringMode {
-            zeron_proto::SteeringMode::TurnBoundary
+        fn steering_mode(&self) -> clyra_proto::SteeringMode {
+            clyra_proto::SteeringMode::TurnBoundary
         }
-        fn reasoning_levels(&self) -> &[zeron_proto::ReasoningLevel] {
+        fn reasoning_levels(&self) -> &[clyra_proto::ReasoningLevel] {
             &[]
         }
         fn model_context(&self) -> Result<Option<ModelContext>, HarnessError> {
@@ -267,10 +267,10 @@ mod tests {
         }
         async fn run(
             &self,
-            _: zeron_proto::RunRequest,
-            _: zeron_harness::RunControls,
+            _: clyra_proto::RunRequest,
+            _: clyra_harness::RunControls,
         ) -> Result<
-            futures::stream::BoxStream<'static, Result<zeron_proto::AgentEvent, HarnessError>>,
+            futures::stream::BoxStream<'static, Result<clyra_proto::AgentEvent, HarnessError>>,
             HarnessError,
         > {
             unreachable!()
@@ -294,7 +294,7 @@ mod tests {
     async fn logged_out_claude_uses_curated_rows_instead_of_disk() {
         let dir = tempfile::tempdir().unwrap();
         let mut probe = Probe::new();
-        Arc::get_mut(&mut probe).unwrap().harness = zeron_proto::HarnessId::ClaudeCode;
+        Arc::get_mut(&mut probe).unwrap().harness = clyra_proto::HarnessId::ClaudeCode;
         list(dir.path(), probe.clone(), false).await.unwrap();
         probe.fail.store(true, SeqCst);
         *probe.failure.lock().unwrap() = "authentication required".into();

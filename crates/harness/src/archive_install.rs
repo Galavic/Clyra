@@ -3,7 +3,7 @@
 //! server.
 //!
 //! same contract as the npm installs in [`crate::adapter_install`]: the pinned
-//! archive lands ONCE in `~/.zeron/adapters/<name>/<version>`, extraction runs
+//! archive lands ONCE in `~/.clyra/adapters/<name>/<version>`, extraction runs
 //! in a `.tmp-*` sibling that is renamed into place only after the entry
 //! resolves and the marker is written, so a killed download never passes for
 //! a working install.
@@ -81,7 +81,7 @@ pub async fn ensure_installed(
     let _ = std::fs::remove_dir_all(&tmp_dir);
     std::fs::create_dir_all(&tmp_dir)?;
     tracing::info!(
-        target: "zeron_harness::adapter_install",
+        target: "clyra_harness::adapter_install",
         url = pin.url,
         dir = %tmp_dir.display(),
         "installing {display_name} ACP server"

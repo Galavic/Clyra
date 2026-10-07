@@ -1,12 +1,12 @@
 //! Exercise the actual manual/setup runner with commands at the supported limit.
 #![cfg(unix)]
 
-use std::time::Duration;
-use zeron_engine::project_actions::{
+use clyra_engine::project_actions::{
     MAX_PROJECT_ACTION_COMMAND_BYTES, launch_project_action, launch_project_setup_action,
 };
-use zeron_engine::{ProjectActionsStore, Terminals};
-use zeron_proto::{ProjectActionDraft, ProjectActionIcon};
+use clyra_engine::{ProjectActionsStore, Terminals};
+use clyra_proto::{ProjectActionDraft, ProjectActionIcon};
+use std::time::Duration;
 
 #[tokio::test]
 async fn manual_and_setup_actions_preserve_long_multiline_commands() {

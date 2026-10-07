@@ -2,9 +2,9 @@
 
 use super::ShortcutsPage;
 use crate::{popover::Loadable, settings, settings::widgets, theme::Theme};
+use clyra_engine::registry::HarnessDescriptor;
+use clyra_proto::HarnessId;
 use gpui::{AnyElement, Context, SharedString, div, prelude::*, px};
-use zeron_engine::registry::HarnessDescriptor;
-use zeron_proto::HarnessId;
 
 /// Use the same installed/enabled gate as the composer, in settings order.
 fn active_agents(list: &[HarnessDescriptor]) -> Vec<(HarnessId, &'static str)> {
@@ -26,7 +26,7 @@ impl ShortcutsPage {
         self.completion_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
-                .call(zeron_rpc::methods::LIST_HARNESSES, serde_json::json!({}))
+                .call(clyra_rpc::methods::LIST_HARNESSES, serde_json::json!({}))
                 .await;
             this.update(cx, |page, cx| {
                 page.completion_harnesses = match result {
@@ -256,7 +256,7 @@ mod completion_tests {
             id,
             name: format!("{id:?}"),
             supports_steering: false,
-            steering_mode: zeron_proto::SteeringMode::TurnBoundary,
+            steering_mode: clyra_proto::SteeringMode::TurnBoundary,
             reasoning_levels: Vec::new(),
             installed,
             can_install: false,

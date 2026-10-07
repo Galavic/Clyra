@@ -5,8 +5,8 @@
 //! (`delta`/`textDelta`, `exitCode`/`exit_code`, camelCase/snake_case item
 //! types) are accepted, and unknown item types map to nothing.
 
+use clyra_proto::{AgentEvent, DoneStatus, TodoItem, ToolCall, ToolDiff};
 use serde_json::Value;
-use zeron_proto::{AgentEvent, DoneStatus, TodoItem, ToolCall};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -201,6 +201,71 @@ fn file_change_call(changes: &[(String, String)]) -> ToolCall {
     }
 }
 
+/// The lone change of a `fileChange` item as a [`ToolDiff`]: `add` carries
+/// the new content, `delete` the old, and `update` a unified diff whose
+/// context/removed lines rebuild the old side and context/added lines the
+/// new side — enough for exact line counts. Multi-file changes yield `None`.
+fn file_change_diff(item: &Value) -> Option<ToolDiff> {
+    let [change] = item.get("changes").and_then(Value::as_array)?.as_slice() else {
+        return None;
+    };
+    let path = str_field(change, &["path"]);
+    let text = change.get("diff").and_then(Value::as_str)?;
+    let kind = change
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("update");
+    match kind {
+        "add" => Some(ToolDiff {
+            path,
+            old_text: None,
+            new_text: text.to_owned(),
+        }),
+        "delete" => Some(ToolDiff {
+            path,
+            old_text: Some(text.to_owned()),
+            new_text: String::new(),
+        }),
+        _ => {
+            let (mut old, mut new) = (String::new(), String::new());
+            let mut in_hunk = false;
+            for line in text.lines() {
+                if line.starts_with("@@") {
+                    in_hunk = true;
+                    continue;
+                }
+                if !in_hunk {
+                    continue;
+                }
+                match line.as_bytes().first() {
+                    Some(b'+') => {
+                        new.push_str(&line[1..]);
+                        new.push('\n');
+                    }
+                    Some(b'-') => {
+                        old.push_str(&line[1..]);
+                        old.push('\n');
+                    }
+                    // "\ No newline at end of file"
+                    Some(b'\\') => {}
+                    _ => {
+                        let context = line.strip_prefix(' ').unwrap_or(line);
+                        old.push_str(context);
+                        old.push('\n');
+                        new.push_str(context);
+                        new.push('\n');
+                    }
+                }
+            }
+            in_hunk.then_some(ToolDiff {
+                path,
+                old_text: Some(old),
+                new_text: new,
+            })
+        }
+    }
+}
+
 pub(crate) fn item_type(item: &Value) -> &str {
     item.get("type").and_then(Value::as_str).unwrap_or("")
 }
@@ -337,12 +402,15 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
                     (str_field(c, &["path"]), kind.to_owned())
                 })
                 .collect();
-            tool_lifecycle(
-                phase,
-                id,
-                file_change_call(&changes),
-                status == "failed" || status == "declined",
-            )
+            let failed = status == "failed" || status == "declined";
+            let mut events = tool_lifecycle(phase, id, file_change_call(&changes), failed);
+            // A completed single-file change carries its diff: surface it so
+            // the fold can record +/- line counts (the text never persists).
+            if let (Some(AgentEvent::ToolResult { diff, .. }), false) = (events.last_mut(), failed)
+            {
+                *diff = file_change_diff(item);
+            }
+            events
         }
         "mcpToolCall" | "mcp_tool_call" => match phase {
             Phase::Started => {
@@ -839,6 +907,48 @@ mod tests {
                 call: ToolCall::ApplyPatch { path: None },
             }]
         );
+    }
+
+    #[test]
+    fn completed_single_file_change_carries_its_diff() {
+        let events = map_item(
+            Phase::Completed,
+            &json!({"type": "fileChange", "id": "f4", "status": "completed",
+                    "changes": [{"path": "/c.rs", "kind": "update",
+                                 "diff": "--- a/c.rs\n+++ b/c.rs\n@@ -1,3 +1,3 @@\n keep\n-old\n+new\n+more\n\\ No newline at end of file\n"}]}),
+        );
+        let Some(AgentEvent::ToolResult {
+            diff: Some(diff), ..
+        }) = events.last()
+        else {
+            panic!("expected a ToolResult with a diff: {events:?}");
+        };
+        assert_eq!(diff.path, "/c.rs");
+        assert_eq!(diff.old_text.as_deref(), Some("keep\nold\n"));
+        assert_eq!(diff.new_text, "keep\nnew\nmore\n");
+
+        let added = map_item(
+            Phase::Completed,
+            &json!({"type": "fileChange", "id": "f5", "status": "completed",
+                    "changes": [{"path": "/d.rs", "kind": "add", "diff": "a\nb\n"}]}),
+        );
+        assert!(matches!(
+            added.last(),
+            Some(AgentEvent::ToolResult {
+                diff: Some(ToolDiff { old_text: None, .. }),
+                ..
+            })
+        ));
+        // Declined changes wrote nothing.
+        let declined = map_item(
+            Phase::Completed,
+            &json!({"type": "fileChange", "id": "f6", "status": "declined",
+                    "changes": [{"path": "/d.rs", "kind": "add", "diff": "a\n"}]}),
+        );
+        assert!(matches!(
+            declined.last(),
+            Some(AgentEvent::ToolResult { diff: None, .. })
+        ));
     }
 
     #[test]

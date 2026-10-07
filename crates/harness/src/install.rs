@@ -1,8 +1,8 @@
 //! Explicit, user-requested CLI installation. Catalog probes never call this module's executor.
 use std::{path::PathBuf, time::Duration};
 
+use clyra_proto::HarnessId;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use zeron_proto::HarnessId;
 
 use crate::{
     CancellationToken, Harness, HarnessError, StderrTail,
@@ -173,7 +173,7 @@ fn cli_and_dir(id: HarnessId) -> (&'static str, &'static str) {
         Grok => ("grok", "~/.grok/bin or the npm global bin"),
         Hermes => ("hermes", "~/.local/bin or ~/.hermes/bin"),
         Devin => ("devin", "~/.local/bin"),
-        Antigravity => ("agy_acp_server", "~/.zeron/adapters"),
+        Antigravity => ("agy_acp_server", "~/.clyra/adapters"),
         Mock => ("mock", "PATH"),
     }
 }

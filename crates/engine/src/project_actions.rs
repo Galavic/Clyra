@@ -1,4 +1,4 @@
-//! Host-local project Actions and explicit `zeron.json` imports.
+//! Host-local project Actions and explicit `clyra.json` imports.
 //!
 //! Commands are intentionally stored outside the synced workspace registry. The
 //! owning engine is the only authority that can persist or execute them.
@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-use zeron_proto::{
+use clyra_proto::{
     ProjectAction, ProjectActionDraft, ProjectActionIcon, ProjectActionRun, ProjectActionsSnapshot,
 };
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::{EngineError, Terminals};
 
@@ -24,7 +24,7 @@ pub const MAX_PROJECT_ACTION_ID_BYTES: usize = 96;
 
 const STORE_FILE: &str = "project-actions.json";
 const STORE_VERSION: u32 = 1;
-const PROJECT_FILE: &str = "zeron.json";
+const PROJECT_FILE: &str = "clyra.json";
 const MAX_PROJECT_FILE_BYTES: u64 = 256 * 1024;
 const SETUP_HANDOFF_TTL: Duration = Duration::from_secs(10 * 60);
 
@@ -618,7 +618,7 @@ fn read_project_file_bytes(reader: impl Read) -> Result<Vec<u8>, String> {
 }
 
 fn project_file_issue(message: String) -> (Vec<ProjectActionDraft>, Option<String>) {
-    (Vec::new(), Some(format!("Invalid zeron.json: {message}")))
+    (Vec::new(), Some(format!("Invalid clyra.json: {message}")))
 }
 
 #[cfg(test)]
@@ -900,12 +900,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn project_actions_rpc_does_not_block_async_worker() {
-        use zeron_rpc::{RpcService, methods};
+        use clyra_rpc::{RpcService, methods};
         let temp = tempfile::tempdir().unwrap();
         let core = crate::EngineCore::assemble(
             temp.path(),
             Arc::new(crate::HarnessRegistry::new()),
-            zeron_proto::HarnessId::Mock,
+            clyra_proto::HarnessId::Mock,
             None,
         )
         .unwrap();

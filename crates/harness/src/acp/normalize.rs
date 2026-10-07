@@ -8,8 +8,8 @@
 //! tagged `sessionUpdate`/snake_case; structs are camelCase; tool kinds and
 //! statuses are snake_case).
 
+use clyra_proto::{AgentEvent, SlashCommand, TodoItem, ToolCall, ToolDiff};
 use serde_json::Value;
-use zeron_proto::{AgentEvent, SlashCommand, TodoItem, ToolCall, ToolDiff};
 
 /// Byte cap applied to tool output text at the harness boundary. The doc-side
 /// fold applies its own (smaller) cap before anything persists; this one only
@@ -161,7 +161,7 @@ fn arg_from_title(title: &str) -> Option<String> {
 }
 
 /// Reduce an ACP tool call (kind + title + rawInput + locations + diff
-/// content) to the typed [`ToolCall`] zeron renders. Best-effort: agents vary
+/// content) to the typed [`ToolCall`] clyra renders. Best-effort: agents vary
 /// in how much structure they put in `rawInput`, so every arm has a fallback.
 /// Title is only used when it looks like a real arg — never a placeholder
 /// label or markdown-escaped summary.
@@ -412,11 +412,11 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
             // update refresh the same chip (fold refreshes in place by id).
             vec![
                 AgentEvent::ToolCall {
-                    id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
+                    id: clyra_proto::LIVE_PLAN_TOOL_ID.into(),
                     call: ToolCall::Todo { items },
                 },
                 AgentEvent::ToolResult {
-                    id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
+                    id: clyra_proto::LIVE_PLAN_TOOL_ID.into(),
                     is_error: false,
                     output: None,
                     diff: None,
@@ -656,7 +656,7 @@ mod tests {
         assert_eq!(
             events[0],
             AgentEvent::ToolCall {
-                id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
+                id: clyra_proto::LIVE_PLAN_TOOL_ID.into(),
                 call: ToolCall::Todo {
                     items: vec![
                         TodoItem {

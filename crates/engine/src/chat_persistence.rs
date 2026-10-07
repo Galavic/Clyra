@@ -1,11 +1,11 @@
 //! Coalesced chat snapshots. Cursor is sampled BEFORE export; snapshot and
 //! cursor commit atomically. Queue/lock waits never occupy a Tokio worker.
+use clyra_doc::SessionDoc;
+use clyra_sync::DocsStore;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use zeron_doc::SessionDoc;
-use zeron_sync::DocsStore;
 
 const SAVE_INTERVAL: Duration = Duration::from_secs(1);
 

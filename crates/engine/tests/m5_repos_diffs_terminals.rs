@@ -8,16 +8,16 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-use zeron_engine::{
+use clyra_engine::{
     EngineCore, HarnessRegistry, Repos, Terminals, capture_commit_diff, capture_diff,
     capture_diff_against, capture_turn_diff, merge_base, read_diff_file_text, snapshot_tree,
     working_diff_base,
 };
-use zeron_proto::{
+use clyra_proto::{
     CreateWorktreeOutcome, GitHistoryRefKind, ProjectActionDraft, ProjectActionIcon,
     ProjectActionRun, TerminalEvent,
 };
-use zeron_rpc::methods;
+use clyra_rpc::methods;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -76,7 +76,7 @@ fn assemble(dir: &Path) -> EngineCore {
     EngineCore::assemble(
         dir,
         Arc::new(HarnessRegistry::new()),
-        zeron_proto::HarnessId::Mock,
+        clyra_proto::HarnessId::Mock,
         None,
     )
     .expect("engine assembles")
@@ -151,13 +151,13 @@ async fn repos_round_trip_add_branches_worktrees() {
     assert_eq!(branches[0], "main", "default branch first: {branches:?}");
     assert!(branches.contains(&"feature/x".to_string()));
 
-    // Worktree add: zeron/<name> branch, isolated dir under the test root.
+    // Worktree add: clyra/<name> branch, isolated dir under the test root.
     let worktree = repos
         .create_worktree(&repo_dir, "main")
         .await
         .expect("worktree");
     assert!(
-        worktree.branch.starts_with("zeron/"),
+        worktree.branch.starts_with("clyra/"),
         "branch: {}",
         worktree.branch
     );
@@ -175,7 +175,7 @@ async fn repos_round_trip_add_branches_worktrees() {
     assert!(branches.contains(&worktree.branch));
 
     // Refs carry checkout state: `main` is current (main folder), the
-    // worktree's zeron/<name> branch maps to its linked-checkout path, and
+    // worktree's clyra/<name> branch maps to its linked-checkout path, and
     // a plain branch has neither.
     let refs = repos.refs(&repo_dir).await.expect("refs");
     let by_name = |name: &str| refs.iter().find(|r| r.name == name).expect("ref row");
@@ -210,7 +210,7 @@ async fn repos_round_trip_add_branches_worktrees() {
         .expect("wt identity");
     assert_ne!(main_identity.id, wt_identity.id);
 
-    // Delete: dir removed, zeron branch removed, refs pruned.
+    // Delete: dir removed, clyra branch removed, refs pruned.
     repos
         .delete_worktree(&repo_dir, Path::new(&worktree.path))
         .await
@@ -222,7 +222,7 @@ async fn repos_round_trip_add_branches_worktrees() {
         .expect("branches after delete");
     assert!(
         !branches.contains(&worktree.branch),
-        "zeron branch deleted: {branches:?}"
+        "clyra branch deleted: {branches:?}"
     );
 
     // CreateRepo: sanitized name, initialized on main.
@@ -573,7 +573,7 @@ async fn diff_capture_tracked_untracked_and_checksum() {
 
 #[tokio::test]
 async fn git_status_preserves_index_changes_even_when_head_diff_is_empty() {
-    use zeron_proto::GitFileState::*;
+    use clyra_proto::GitFileState::*;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("repo");
     init_repo(&root).await;
@@ -663,7 +663,7 @@ async fn git_status_enumerates_untracked_symlinks_without_reading_their_targets(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn git_status_stream_is_scoped_deduplicated_and_resets_after_commit() {
-    use zeron_proto::CheckoutGitStatus;
+    use clyra_proto::CheckoutGitStatus;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("repo");
     let other = tmp.path().join("other");
@@ -684,19 +684,19 @@ async fn git_status_stream_is_scoped_deduplicated_and_resets_after_commit() {
             .unwrap();
     }
     core.diff_sync.reconcile_now().await;
-    let client = zeron_rpc::memory_client(core.rpc_service());
+    let client = clyra_rpc::memory_client(core.rpc_service());
     let params = serde_json::json!({"chatId": "chat"});
     let mut stream = client
         .subscribe_checked(methods::WATCH_WORKSPACE_GIT_STATUS, params.clone())
         .await
         .unwrap();
-    async fn next(stream: &mut zeron_rpc::RpcSubscription) -> CheckoutGitStatus {
+    async fn next(stream: &mut clyra_rpc::RpcSubscription) -> CheckoutGitStatus {
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 let value = stream.recv().await.expect("stream alive");
                 assert!(value.get("patch").is_none());
                 if let Some(status) =
-                    serde_json::from_value::<zeron_proto::WorkspaceGitStatusFrame>(value)
+                    serde_json::from_value::<clyra_proto::WorkspaceGitStatusFrame>(value)
                         .unwrap()
                         .status
                 {
@@ -754,10 +754,10 @@ async fn git_status_stream_is_scoped_deduplicated_and_resets_after_commit() {
 
     git(&root, &["add", "a.txt"]).await;
     let staged = next(&mut stream).await;
-    assert_eq!(staged.files[0].index, zeron_proto::GitFileState::Modified);
+    assert_eq!(staged.files[0].index, clyra_proto::GitFileState::Modified);
     assert_eq!(
         staged.files[0].worktree,
-        zeron_proto::GitFileState::Unchanged
+        clyra_proto::GitFileState::Unchanged
     );
     git(&root, &["commit", "-m", "done"]).await;
     let clean = next(&mut stream).await;
@@ -873,7 +873,7 @@ async fn diff_file_text_returns_both_checked_sources() {
     assert!(!pair.binary);
     assert!(!pair.truncated);
 
-    let escape = zeron_proto::DiffFileSummary {
+    let escape = clyra_proto::DiffFileSummary {
         path: "../outside.txt".into(),
         old_path: None,
         status: "modified".into(),
@@ -983,7 +983,7 @@ async fn diff_capture_truncates_at_patch_cap() {
     let snapshot = capture_diff(&repos, &repo_dir).await.expect("capture");
     assert!(snapshot.truncated, "patch cap hit");
     assert!(snapshot.patch.len() <= 3 * 1024 * 1024 + 64);
-    assert!(snapshot.patch.contains("# Zeron diff truncated"));
+    assert!(snapshot.patch.contains("# Clyra diff truncated"));
     let (statuses, complete) = snapshot.git_status.unwrap();
     assert!(complete, "patch truncation must not truncate Git status");
     assert_eq!(statuses.len(), 1);
@@ -1188,7 +1188,7 @@ async fn checkout_file_diff_text_rpc_fits_the_default_worker_stack() {
     let snapshot = capture_diff(&core.repos, &repo_dir)
         .await
         .expect("diff snapshot");
-    let client = zeron_rpc::memory_client(core.rpc_service());
+    let client = clyra_rpc::memory_client(core.rpc_service());
 
     let response = client
         .call(
@@ -1203,7 +1203,7 @@ async fn checkout_file_diff_text_rpc_fits_the_default_worker_stack() {
         )
         .await
         .expect("GetCheckoutFileDiffText");
-    let response: zeron_proto::CheckoutFileDiffText =
+    let response: clyra_proto::CheckoutFileDiffText =
         serde_json::from_value(response).expect("typed response");
     assert_eq!(response.old_text.as_deref(), Some("one\ntwo\n"));
     assert_eq!(response.new_text.as_deref(), Some("one\ntwo edited\n"));
@@ -1235,7 +1235,7 @@ async fn checkout_file_diff_text_rpc_reads_pinned_commit_sources() {
     let snapshot = capture_commit_diff(&core.repos, &repo_dir, &sha)
         .await
         .expect("commit snapshot");
-    let client = zeron_rpc::memory_client(core.rpc_service());
+    let client = clyra_rpc::memory_client(core.rpc_service());
 
     let response = client
         .call(
@@ -1251,7 +1251,7 @@ async fn checkout_file_diff_text_rpc_reads_pinned_commit_sources() {
         )
         .await
         .expect("GetCheckoutFileDiffText");
-    let response: zeron_proto::CheckoutFileDiffText =
+    let response: clyra_proto::CheckoutFileDiffText =
         serde_json::from_value(response).expect("typed response");
     assert_eq!(response.old_text.as_deref(), Some("one\ntwo\n"));
     assert_eq!(
@@ -1402,8 +1402,8 @@ async fn project_actions_crud_preserves_saved_actions_with_invalid_imports() {
             true,
         )
         .unwrap();
-    let client = zeron_rpc::memory_client(core.rpc_service());
-    let path = project.join("zeron.json");
+    let client = clyra_rpc::memory_client(core.rpc_service());
+    let path = project.join("clyra.json");
     // Directories must be reported as an import issue without preventing CRUD.
     std::fs::create_dir(&path).unwrap();
     let listed = client
@@ -1527,7 +1527,7 @@ async fn project_actions_run_in_fresh_host_resolved_terminals() {
         )
         .expect("save Action");
     let action_id = snapshot.actions[0].id.clone();
-    let client = zeron_rpc::memory_client(core.rpc_service());
+    let client = clyra_rpc::memory_client(core.rpc_service());
 
     let run = client
         .call_as::<ProjectActionRun>(
@@ -1692,7 +1692,7 @@ async fn rpc_dispatch_for_m5_methods() {
     // worktrees out of $HOME. (Process-global — this is the only test that sets it.)
     unsafe { std::env::set_var("ZERON_WORKTREES_DIR", tmp.path().join("worktrees")) };
     let core = assemble(&tmp.path().join("data"));
-    let client = zeron_rpc::memory_client(core.rpc_service());
+    let client = clyra_rpc::memory_client(core.rpc_service());
 
     // CreateRepo → ListRepos.
     let created = client
@@ -1817,7 +1817,7 @@ async fn rpc_dispatch_for_m5_methods() {
                     "sleep 2; ",
                     "printf 'ROOT=%s\\nWT=%s\\nCWD=%s\\n' ",
                     "\"$ZERON_PROJECT_ROOT\" \"$ZERON_WORKTREE_PATH\" \"$PWD\" ",
-                    "| tee .zeron-setup-env"
+                    "| tee .clyra-setup-env"
                 )
                 .into(),
                 icon: ProjectActionIcon::Configure,
@@ -1842,13 +1842,13 @@ async fn rpc_dispatch_for_m5_methods() {
         worktree["branch"]
             .as_str()
             .expect("branch")
-            .starts_with("zeron/")
+            .starts_with("clyra/")
     );
     assert!(worktree["checkoutId"].is_string());
     assert!(worktree.get("setupAction").is_none());
     assert!(
         !PathBuf::from(&worktree_path)
-            .join(".zeron-setup-env")
+            .join(".clyra-setup-env")
             .exists()
     );
     let deleted = client
@@ -1922,7 +1922,7 @@ async fn rpc_dispatch_for_m5_methods() {
     assert!(setup_output.contains(&format!("ROOT={}", canonical_repo.display())));
     assert!(setup_output.contains(&format!("WT={}", canonical_worktree.display())));
     assert!(setup_output.contains(&format!("CWD={}", canonical_worktree.display())));
-    assert!(canonical_worktree.join(".zeron-setup-env").exists());
+    assert!(canonical_worktree.join(".clyra-setup-env").exists());
     core.terminals
         .close(&setup.terminal.id)
         .expect("close setup terminal");

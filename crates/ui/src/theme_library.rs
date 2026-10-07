@@ -3,11 +3,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, anyhow};
-use gpui::{App, Global};
-use zeron_theme::vscode::SourceCompilation;
-use zeron_theme::{
+use clyra_theme::vscode::SourceCompilation;
+use clyra_theme::{
     CustomThemeEntry, CustomThemeLibrary, InstallMode, ThemeRegistry, replace_custom_families,
 };
+use gpui::{App, Global};
 
 use crate::appearance;
 use crate::theme::Appearance;
@@ -164,9 +164,9 @@ fn reconcile_and_refresh(cx: &mut App) {
     let selected = appearance::themes(cx);
     for appearance_kind in [Appearance::Light, Appearance::Dark] {
         let model = if appearance_kind.is_light() {
-            zeron_theme::Appearance::Light
+            clyra_theme::Appearance::Light
         } else {
-            zeron_theme::Appearance::Dark
+            clyra_theme::Appearance::Dark
         };
         let selected_id = selected.variant_id(model);
         if registry.variant(selected_id).is_none()
@@ -197,17 +197,17 @@ mod tests {
         next.entries.push(CustomThemeEntry {
             id: "unpersisted".into(),
             name: "Unpersisted".into(),
-            source: zeron_theme::CustomThemeSource::ImportedSnapshot {
+            source: clyra_theme::CustomThemeSource::ImportedSnapshot {
                 imported_from: None,
             },
-            family: zeron_theme::ThemeFamily {
+            family: clyra_theme::ThemeFamily {
                 id: "unpersisted".into(),
                 name: "Unpersisted".into(),
                 variants: Vec::new(),
             },
             reports: Default::default(),
             selected_variant_ids: Vec::new(),
-            status: zeron_theme::CustomThemeStatus::Ready,
+            status: clyra_theme::CustomThemeStatus::Ready,
         });
 
         assert!(persist_and_activate(&mut state, next).is_err());

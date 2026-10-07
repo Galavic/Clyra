@@ -4,13 +4,13 @@ use crate::{
     catalog::Catalog,
     peer::{OutgoingSignal, Peers, Signal},
 };
+use clyra_proto::PreviewService;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 use tokio_util::sync::CancellationToken;
-use zeron_proto::PreviewService;
 #[async_trait::async_trait]
 pub trait TokenSource: Send + Sync {
     async fn token(&self) -> anyhow::Result<String>;

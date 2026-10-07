@@ -65,7 +65,7 @@ fn preview_link_outcome(activation: &render::LinkActivation) -> render::LinkOutc
 
 /// URL path resolution is independent of the UI host's filesystem.
 pub(super) fn relative_target(document: &str, target: &str) -> Option<(String, Option<String>)> {
-    if let Some(target) = target.strip_prefix("zeron-file:") {
+    if let Some(target) = target.strip_prefix("clyra-file:") {
         return relative_target("", target);
     }
     if target.starts_with('/') || target.contains(':') || target.contains('\\') {
@@ -127,7 +127,7 @@ pub(super) struct MarkdownPreview {
     pub editor: Option<gpui::WeakEntity<super::editor::FileEditorState>>,
     list: ListState,
     cache: Rc<RefCell<RenderCache>>,
-    highlights: HashMap<usize, Arc<zeron_syntax::HighlightedDocument>>,
+    highlights: HashMap<usize, Arc<clyra_syntax::HighlightedDocument>>,
     anchors: HashMap<String, usize>,
     parse_task: Option<Task<()>>,
     epoch: u64,
@@ -431,7 +431,7 @@ impl MarkdownPreview {
                     for (ix, top) in tree.blocks.iter().enumerate() {
                         if let Block::CodeBlock { language, code } = &top.block {
                             if let Ok(doc) =
-                                zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+                                clyra_syntax::highlight(clyra_syntax::HighlightRequest {
                                     source: code,
                                     path: None,
                                     fence_tag: language.as_deref(),
@@ -1950,7 +1950,7 @@ mod async_tests {
         let raster = image::RgbaImage::new(3000, 3000);
         let mut png = std::io::Cursor::new(Vec::new());
         raster.write_to(&mut png, image::ImageFormat::Png).unwrap();
-        assert!(png.get_ref().len() < zeron_proto::MAX_WORKSPACE_IMAGE_BYTES);
+        assert!(png.get_ref().len() < clyra_proto::MAX_WORKSPACE_IMAGE_BYTES);
         let media = crate::image_media::decode_image("image/png", png.into_inner()).unwrap();
         view.read_with(cx, |view, _| {
             assert!(view.admit_media(Ok(media)).is_err());

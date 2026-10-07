@@ -1,6 +1,6 @@
 #![cfg(unix)]
+use clyra_harness::{AcpHarness, CodexHarness, Harness};
 use std::{path::Path, sync::Arc};
-use zeron_harness::{AcpHarness, CodexHarness, Harness};
 
 fn harnesses(binary: &Path) -> Vec<Arc<dyn Harness>> {
     vec![
@@ -76,8 +76,8 @@ async fn every_native_catalog_retains_last_good_and_cold_failure_stays_an_error(
         .unwrap();
         let error = harness.model_catalog(true).await.unwrap_err();
         assert_eq!(
-            zeron_harness::CatalogFailure::classify(&error),
-            zeron_harness::CatalogFailureCode::AuthRequired
+            clyra_harness::CatalogFailure::classify(&error),
+            clyra_harness::CatalogFailureCode::AuthRequired
         );
         assert!(
             harness.models().await.is_err(),
@@ -96,8 +96,8 @@ async fn codex_empty_catalogs_retire_children_and_next_request_spawns_fresh() {
     std::fs::write(&state, r#"{"fail":false,"empty":true,"id":"ignored"}"#).unwrap();
     let error = harness.model_catalog(true).await.unwrap_err();
     assert_eq!(
-        zeron_harness::CatalogFailure::classify(&error),
-        zeron_harness::CatalogFailureCode::Failed
+        clyra_harness::CatalogFailure::classify(&error),
+        clyra_harness::CatalogFailureCode::Failed
     );
     let reaped = |expected: usize| {
         let ids: Vec<i32> = std::fs::read_to_string(dir.path().join("pids"))
@@ -158,8 +158,8 @@ fn auth_context_child() {
             "{auth}"
         );
     }
-    let claude = zeron_harness::ClaudeHarness::new().with_executable(&binary);
-    let opencode = zeron_harness::OpencodeHarness::new().with_executable(&binary);
+    let claude = clyra_harness::ClaudeHarness::new().with_executable(&binary);
+    let opencode = clyra_harness::OpencodeHarness::new().with_executable(&binary);
     for (harness, file) in [
         (&claude as &dyn Harness, ".claude/settings.json"),
         (&opencode as &dyn Harness, ".local/share/opencode/auth.json"),

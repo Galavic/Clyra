@@ -13,18 +13,18 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable as _, KeyDownEvent, SharedString,
     Subscription, Task, Window, div, prelude::*, px,
 };
 
-use zeron_engine::registry::HarnessDescriptor;
-use zeron_proto::{
+use clyra_engine::registry::HarnessDescriptor;
+use clyra_proto::{
     ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel, Space,
 };
-use zeron_rpc::methods;
+use clyra_rpc::methods;
 
 /// Display cap for the ref list (t3code shows pages of 100 with a status
 /// footer; a flat cap + "Showing X of Y refs" reads the same without
@@ -32,6 +32,317 @@ use zeron_rpc::methods;
 const MAX_REF_ROWS: usize = 300;
 
 const FOOTER_CHIP_RADIUS: f32 = 6.0;
+
+/// Effort slider geometry (reference-component proportions, app theme).
+const EFFORT_TRACK_H: f32 = 26.0;
+const EFFORT_TRACK_RADIUS: f32 = 10.0;
+const EFFORT_TRACK_PAD: f32 = 1.0;
+const EFFORT_THUMB_W: f32 = 22.0;
+const EFFORT_THUMB_H: f32 = 24.0;
+/// How long a left top rung keeps its reveal clock for instant resume.
+const EFFORT_ULTRA_GRACE_MS: u128 = 400;
+
+/// In-flight release spring for the effort slider (reference `_springTo`:
+/// stiffness 920, damping 40, flick velocity preserved from the scrub).
+struct EffortSpring {
+    target: f32,
+    pos: f32,
+    vel: f32,
+    last: Instant,
+}
+
+/// Reference `_applyMagnet`: pulls the dragged value toward the nearest rung
+/// inside a 0.5 radius (pure).
+fn effort_magnet(value: f32) -> f32 {
+    let nearest = value.round();
+    let delta = value - nearest;
+    let distance = delta.abs();
+    if distance < 0.001 || distance > 0.5 {
+        return value;
+    }
+    let t = 1.0 - distance / 0.5;
+    let strength = 0.68 + 0.42 * t;
+    value - delta * strength * t * t
+}
+
+/// One reference `_springTo` integration step (pure): returns (pos, vel).
+fn effort_spring_step(pos: f32, vel: f32, target: f32, dt: f32, max: f32) -> (f32, f32) {
+    let accel = -920.0 * (pos - target) - 40.0 * vel;
+    let vel = vel + accel * dt;
+    ((pos + vel * dt).clamp(0.0, max), vel)
+}
+
+/// Reference `smoothstep` (pure).
+fn effort_smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    let x = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
+/// One painted ultra cell: local rect, gradient base flag, pixel color.
+struct EffortCell {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    base: [f32; 3],
+    pixel: Option<([f32; 3], f32)>,
+}
+
+/// Pure grid behind the ultra paint: gradient base + pixel per cell.
+/// Every grid cell paints (reference `fillRect` rows — sharp squares);
+/// corner rounding comes from the container, exactly like the reference
+/// relying on its canvas clip. Lets tests assert coverage (no missing
+/// bands) without a window.
+fn effort_field_cells(w: f32, h: f32, elapsed_ms: f32, reveal: f32, dark: bool) -> Vec<EffortCell> {
+    let mut out = Vec::new();
+    if w <= 0.0 || h <= 0.0 {
+        return out;
+    }
+    let cell = if w < 280.0 { 5.0 } else { 6.0 };
+    let cols = (w / cell).ceil() as usize;
+    let rows = (h / cell).ceil() as usize;
+    for row in 0..rows {
+        for col in 0..cols {
+            let x = col as f32 * cell;
+            let y = row as f32 * cell;
+            let nx = ((x + cell * 0.5) / w).clamp(0.0, 1.0);
+            let (rgb, alpha) = effort_pixel(col, row, nx, elapsed_ms, reveal, dark);
+            out.push(EffortCell {
+                x0: x,
+                y0: y,
+                x1: (x + cell).min(w),
+                y1: (y + cell).min(h),
+                base: effort_gradient(nx, dark),
+                pixel: if alpha <= 0.002 {
+                    None
+                } else {
+                    Some((rgb, alpha))
+                },
+            });
+        }
+    }
+    out
+}
+
+/// Deterministic 0..1 stream hash (reference sin-hash shape, salted per
+/// stream so flicker/phase/chroma/flow stay decorrelated).
+fn effort_hash01(a: f32, b: f32) -> f32 {
+    let x = (a * 12.9898 + b * 78.233).sin() * 43758.5453;
+    x - x.floor()
+}
+
+fn effort_mix3(from: [f32; 3], to: [f32; 3], amount: f32) -> [f32; 3] {
+    [
+        from[0] + (to[0] - from[0]) * amount,
+        from[1] + (to[1] - from[1]) * amount,
+        from[2] + (to[2] - from[2]) * amount,
+    ]
+}
+
+fn effort_rgb8(color: [f32; 3], alpha: f32) -> gpui::Hsla {
+    fn channel(v: f32) -> f32 {
+        (v / 255.0).clamp(0.0, 1.0)
+    }
+    let (r, g, b) = (channel(color[0]), channel(color[1]), channel(color[2]));
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let l = (max + min) / 2.0;
+    let (h, s) = if (max - min).abs() < f32::EPSILON {
+        (0.0, 0.0)
+    } else {
+        let d = max - min;
+        let s = if l > 0.5 {
+            d / (2.0 - max - min)
+        } else {
+            d / (max + min)
+        };
+        let h = if (max - r).abs() < f32::EPSILON {
+            (g - b) / d + if g < b { 6.0 } else { 0.0 }
+        } else if (max - g).abs() < f32::EPSILON {
+            (b - r) / d + 2.0
+        } else {
+            (r - g) / d + 4.0
+        } / 6.0;
+        (h, s)
+    };
+    gpui::hsla(h, s, l, alpha.clamp(0.0, 1.0))
+}
+
+/// Ultra track gradient stops (reference `.track::before`): light set is
+/// the reference palette verbatim; dark set follows the same hue
+/// progression darkened, so the field reads violet instead of washed-out
+/// on the dark track. Motion math is identical in both.
+const EFFORT_GRADIENT_LIGHT: [([f32; 3], f32); 7] = [
+    ([238.0, 235.0, 233.0], 0.0),
+    ([236.0, 233.0, 231.0], 0.18),
+    ([226.0, 220.0, 227.0], 0.32),
+    ([217.0, 208.0, 223.0], 0.48),
+    ([208.0, 193.0, 218.0], 0.68),
+    ([205.0, 188.0, 217.0], 0.82),
+    ([203.0, 186.0, 216.0], 1.0),
+];
+const EFFORT_GRADIENT_DARK: [([f32; 3], f32); 7] = [
+    ([52.0, 48.0, 66.0], 0.0),
+    ([58.0, 52.0, 72.0], 0.18),
+    ([72.0, 62.0, 90.0], 0.32),
+    ([88.0, 74.0, 108.0], 0.48),
+    ([104.0, 86.0, 126.0], 0.68),
+    ([114.0, 92.0, 134.0], 0.82),
+    ([120.0, 96.0, 140.0], 1.0),
+];
+
+fn effort_gradient(nx: f32, dark: bool) -> [f32; 3] {
+    let stops = if dark {
+        EFFORT_GRADIENT_DARK
+    } else {
+        EFFORT_GRADIENT_LIGHT
+    };
+    let mut prev = stops[0];
+    for stop in stops.iter().skip(1) {
+        if nx <= stop.1 {
+            let span = (stop.1 - prev.1).max(f32::EPSILON);
+            return effort_mix3(prev.0, stop.0, (nx - prev.1) / span);
+        }
+        prev = *stop;
+    }
+    stops[stops.len() - 1].0
+}
+
+/// Exact port of the reference `_drawPixelField` per-cell math (same
+/// hashes, pulses, flow, reveal): RGB + opacity for the cell at
+/// (`col`, `row`) with center `nx` 0..1, `elapsed_ms` since the top rung
+/// engaged, and `reveal` 0..1. `dark` selects the base tone so the field
+/// reads violet on dark tracks instead of washed-out.
+fn effort_pixel(
+    col: usize,
+    row: usize,
+    nx: f32,
+    elapsed_ms: f32,
+    reveal: f32,
+    dark: bool,
+) -> ([f32; 3], f32) {
+    const LEFT_LIGHT: [f32; 3] = [210.0, 206.0, 214.0];
+    const LEFT_DARK: [f32; 3] = [52.0, 48.0, 66.0];
+    const TONES: [[f32; 3]; 11] = [
+        [156.0, 120.0, 192.0],
+        [156.0, 120.0, 192.0],
+        [156.0, 132.0, 192.0],
+        [156.0, 132.0, 192.0],
+        [168.0, 144.0, 204.0],
+        [168.0, 144.0, 204.0],
+        [168.0, 144.0, 204.0],
+        [168.0, 156.0, 204.0],
+        [168.0, 156.0, 204.0],
+        [180.0, 168.0, 204.0],
+        [192.0, 180.0, 204.0],
+    ];
+    const HIGHLIGHT: [f32; 3] = [216.0, 204.0, 228.0];
+    const PEAK: [f32; 3] = [232.0, 224.0, 242.0];
+
+    let frontier = 1.0 - reveal;
+    let reveal_alpha = effort_smoothstep(frontier - 0.1, frontier + 0.07, nx);
+    if reveal_alpha <= 0.002 {
+        return ([0.0, 0.0, 0.0], 0.0);
+    }
+    let left = if dark { LEFT_DARK } else { LEFT_LIGHT };
+    let c = col as f32;
+    let r = row as f32;
+    let purple_amount = effort_smoothstep(0.1, 0.88, nx);
+    let field_intensity = effort_smoothstep(0.04, 0.38, nx);
+    let depth_bias = effort_smoothstep(0.35, 0.95, nx);
+
+    let base_hash = effort_hash01(c * 1.0 + 0.13, r);
+    let tempo_hash = effort_hash01(c * 0.55 + 3.1, r * 0.9 + 1.7);
+    let phase_hash = effort_hash01(c * 1.7 + 5.9, r * 1.3 + 2.2);
+    let chroma_hash = effort_hash01(c * 0.83 + 9.4, r * 2.1 + 4.8);
+
+    let period = 500.0 + tempo_hash * 1500.0;
+    let local_time = elapsed_ms + phase_hash * period;
+    let cycle = (local_time / period).floor();
+    let cycle_progress = (local_time % period) / period;
+    let cycle_hash = effort_hash01(c * 0.71 + cycle * 2.3 + 11.0, r * 1.9 + cycle);
+    let width_hash = effort_hash01(c * 0.37 + cycle * 1.1 + 23.0, r * 2.7);
+
+    let pulse_center = 0.2 + cycle_hash * 0.55;
+    let pulse_width = 0.09 + width_hash * 0.08;
+    let pulse_distance = (cycle_progress - pulse_center) / pulse_width;
+    let pulse_envelope = (-pulse_distance * pulse_distance * 1.45).exp();
+    let active_cycle = if cycle_hash > 0.12 { 1.0 } else { 0.26 };
+    let irregular_flicker = pulse_envelope * active_cycle;
+
+    let flow_duration = 4000.0;
+    let raw_flow = elapsed_ms / flow_duration;
+    let flow_cycle = raw_flow.floor();
+    let eased_flow = flow_cycle + effort_smoothstep(0.0, 1.0, raw_flow - flow_cycle);
+    let flow_coordinate = (nx + eased_flow) * 9.0;
+    let flow_index = flow_coordinate.floor();
+    let flow_progress = effort_smoothstep(0.0, 1.0, flow_coordinate - flow_index);
+    let flow_a = effort_hash01(flow_index * 1.31 + 41.0, r * 1.7);
+    let flow_b = effort_hash01((flow_index + 1.0) * 1.31 + 41.0, r * 1.7);
+    let cluster_gate = effort_smoothstep(0.46, 0.84, flow_a + (flow_b - flow_a) * flow_progress);
+    let wave_phase = (nx + eased_flow + r * 0.06 + base_hash * 0.02) * std::f32::consts::PI * 2.0;
+    let directional_wave = (0.5 + 0.5 * wave_phase.cos()).powi(5);
+    let directional_flow = cluster_gate.max(directional_wave * 0.62);
+    let flowing_flicker = (irregular_flicker * (0.48 + directional_flow * 0.58))
+        .max(directional_flow * (0.38 + base_hash * 0.28));
+
+    let reveal_glow = if reveal < 0.995 {
+        (-((nx - frontier).powi(2)) / 0.012).exp() * (1.0 - effort_smoothstep(0.7, 1.0, reveal))
+    } else {
+        0.0
+    };
+    let light_amount = flowing_flicker.max(reveal_glow * (0.4 + base_hash * 0.4));
+
+    let peak_highlight =
+        light_amount > 0.4 && irregular_flicker > 0.16 && cycle_hash > 0.26 && cluster_gate > 0.04;
+    let hottest_highlight =
+        light_amount > 0.68 && irregular_flicker > 0.3 && cycle_hash > 0.48 && cluster_gate > 0.12;
+    let highlight_amount = if peak_highlight {
+        0.97
+    } else {
+        (light_amount * (0.44 + cycle_hash * 0.3)).clamp(0.0, 0.64)
+    };
+
+    let tone_drift = base_hash * 0.28
+        + depth_bias * 0.28
+        + cycle_progress * 0.38
+        + eased_flow * 0.18
+        + cycle_hash * 0.2
+        + (elapsed_ms * 0.00135 + phase_hash * std::f32::consts::PI * 2.0).sin() * 0.14;
+    let tone_position = (((tone_drift % 1.0) + 1.0) % 1.0) * TONES.len() as f32;
+    let tone_index = (tone_position.floor() as usize).min(TONES.len() - 1);
+    let tone_mix = tone_position - tone_index as f32;
+    let tone_a = TONES[tone_index];
+    let tone_b = TONES[(tone_index + 1) % TONES.len()];
+    let cell_tone = effort_mix3(tone_a, tone_b, tone_mix);
+
+    let chroma_nudge = (chroma_hash - 0.5) * 10.0 + depth_bias * 12.0;
+    let varied_purple = [
+        (cell_tone[0] + chroma_nudge * 0.35 - depth_bias * 8.0).clamp(140.0, 196.0),
+        (cell_tone[1] - depth_bias * 16.0 + (base_hash - 0.5) * 8.0).clamp(104.0, 168.0),
+        (cell_tone[2] + depth_bias * 6.0 + (cycle_hash - 0.5) * 6.0).clamp(182.0, 216.0),
+    ];
+    let base_color = effort_mix3(left, varied_purple, purple_amount);
+    let color = if hottest_highlight {
+        effort_mix3(base_color, PEAK, 0.95)
+    } else {
+        effort_mix3(base_color, HIGHLIGHT, highlight_amount)
+    };
+
+    let base_opacity = 0.7 + base_hash * 0.2;
+    let alpha = if peak_highlight || hottest_highlight {
+        reveal_alpha * field_intensity
+    } else {
+        reveal_alpha * field_intensity * (base_opacity + flowing_flicker * 0.12).clamp(0.0, 1.0)
+    };
+    (
+        [
+            color[0].clamp(0.0, 255.0),
+            color[1].clamp(0.0, 255.0),
+            color[2].clamp(0.0, 255.0),
+        ],
+        alpha,
+    )
+}
 
 /// Both sides of the composer handoff share one leading-aligned workspace
 /// cluster. Available width belongs after the pair, never between its labels.
@@ -124,7 +435,7 @@ pub enum CheckoutPlan {
     CurrentCheckout { branch: Option<String> },
     /// Reuse the picked ref's existing worktree (a cwd override; no git).
     ReuseWorktree { path: String, branch: String },
-    /// `CreateWorktree` off `base` on send (zeron mints a `zeron/<name>`
+    /// `CreateWorktree` off `base` on send (clyra mints a `clyra/<name>`
     /// branch). `base: None` = refs never loaded — send falls back to the
     /// space folder rather than failing.
     NewWorktree { base: Option<String> },
@@ -159,7 +470,7 @@ impl ResolvedRunConfig {
 // ---------------------------------------------------------------------------
 
 /// The harness's default model: the first catalog row (both curated catalogs
-/// lead with the flagship — zeron's `pickDefaultModel` Opus preference maps to
+/// lead with the flagship — clyra's `pickDefaultModel` Opus preference maps to
 /// the same row here).
 pub fn default_model(models: &[Model]) -> Option<&Model> {
     models.first()
@@ -173,7 +484,7 @@ fn selected_catalog_model<'a>(models: &'a [Model], selected: Option<&str>) -> Op
     }
 }
 
-/// A model's default reasoning: X-High when the ladder offers it (zeron
+/// A model's default reasoning: X-High when the ladder offers it (clyra
 /// `DEFAULT_REASONING = "xhigh"`), else High, else the ladder's first entry.
 /// `None` only for ladder-less models (e.g. Haiku's thinking toggle instead).
 pub fn default_reasoning(ladder: &[ReasoningLevel]) -> Option<ReasoningLevel> {
@@ -190,7 +501,7 @@ pub fn default_reasoning(ladder: &[ReasoningLevel]) -> Option<ReasoningLevel> {
 
 /// Clamp a picked/remembered level to what the model actually offers: keep it
 /// when the ladder lists it, else fall to the model's default (never a stale
-/// or foreign level — zeron use-run-config.ts's derived-model discipline).
+/// or foreign level — clyra use-run-config.ts's derived-model discipline).
 pub fn clamp_reasoning(
     level: Option<ReasoningLevel>,
     ladder: &[ReasoningLevel],
@@ -405,7 +716,7 @@ pub fn breadcrumbs(path: &str) -> Vec<(String, String)> {
 }
 
 /// Directory rows of a listing (files never render in the browser).
-pub fn browser_rows(listing: &FolderListing) -> Vec<&zeron_proto::FolderEntry> {
+pub fn browser_rows(listing: &FolderListing) -> Vec<&clyra_proto::FolderEntry> {
     listing.entries.iter().filter(|e| e.is_dir).collect()
 }
 
@@ -501,7 +812,7 @@ struct SettingGroup {
 pub struct Pickers {
     state: Entity<AppState>,
     config: DraftConfig,
-    /// Sticky last-used picks (zeron `zeron.composer.defaults:v1`): seeds the
+    /// Sticky last-used picks (clyra `clyra.composer.defaults:v1`): seeds the
     /// new-chat chips and is rewritten on every new-chat pick.
     defaults: ComposerDefaults,
     /// Where [`Self::defaults`] persists (`{data_dir}/composer-defaults.json`);
@@ -529,6 +840,31 @@ pub struct Pickers {
     setting_hover: popover::HoverIntent<ModelSetting>,
     setting_bounds: Option<gpui::Bounds<gpui::Pixels>>,
     setting_scroll: gpui::ScrollHandle,
+    /// Effort slider state (reasoning ladder as a scrubable track): the live
+    /// continuous value while scrubbing (`None` = settled on the effective
+    /// reasoning), whether a scrub gesture is in flight, and the measured
+    /// track bar for pointer→value mapping.
+    effort_value: Option<f32>,
+    effort_scrub: bool,
+    effort_track: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    /// Release spring (reference `_springTo`): target rung, physics state,
+    /// and last step time. While set, renders advance it toward the target
+    /// and pick on settle instead of snapping instantly.
+    effort_spring: Option<EffortSpring>,
+    /// Recent (time, value) samples for release-flick velocity (reference
+    /// keeps the last 90ms, up to 5 samples).
+    effort_samples: Vec<(Instant, f32)>,
+    /// Top-rung engagement time for the pixel-field reveal sweep.
+    ultra_since: Option<Instant>,
+    /// Disengage grace: leaving the top rung starts a short window during
+    /// which the reveal clock is preserved, so scrubbing back and forth
+    /// across the boundary resumes the sweep instead of replaying it from
+    /// zero (which read as a permanently patchy field).
+    ultra_left_at: Option<Instant>,
+    /// Displayed level label + outgoing label animation state (reference
+    /// label swap: index for direction, instant for progress).
+    effort_shown: String,
+    effort_prev: Option<(String, usize, Instant)>,
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     models: HashMap<HarnessId, Loadable<Vec<Model>>>,
     model_refresh_errors: HashMap<HarnessId, String>,
@@ -708,7 +1044,7 @@ impl Pickers {
             menu_geometry: HashMap::new(),
             model_trigger_bounds: None,
             open_model_width: None,
-            open_model_height: model_menu_height(0),
+            open_model_height: model_menu_height(0.0),
             config: DraftConfig::default(),
             defaults,
             data_dir,
@@ -721,6 +1057,15 @@ impl Pickers {
             setting_hover: popover::HoverIntent::default(),
             setting_bounds: None,
             setting_scroll: gpui::ScrollHandle::new(),
+            effort_value: None,
+            effort_scrub: false,
+            effort_track: Default::default(),
+            effort_spring: None,
+            effort_samples: Vec::new(),
+            ultra_since: None,
+            ultra_left_at: None,
+            effort_shown: String::new(),
+            effort_prev: None,
             harnesses: Loadable::Idle,
             models: HashMap::new(),
             model_refresh_errors: HashMap::new(),
@@ -783,7 +1128,7 @@ impl Pickers {
     }
 
     /// Effective harness: picked, or the chat's config, or the first listed.
-    fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
+    pub(crate) fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
         if let Some(harness) = self.config.harness {
             return Some(harness);
         }
@@ -1019,7 +1364,7 @@ impl Pickers {
         }
         if kind == PickerKind::HarnessModel {
             self.open_model_width = self.model_trigger_bounds.map(|bounds| bounds.size.width);
-            self.open_model_height = model_menu_height(self.setting_groups(cx).len());
+            self.open_model_height = model_menu_height(self.settings_tray_height(cx));
         }
         self.open.open(kind);
         self.focus_on_mount = true;
@@ -1560,6 +1905,578 @@ impl Pickers {
         cx.notify();
     }
 
+    /// Sorted reasoning ladder for the effort slider (declaration order =
+    /// effort order: Minimal … Ultrathink).
+    fn effort_ladder(&self, cx: &App) -> Vec<ReasoningLevel> {
+        let mut ladder = self.trait_ladder(cx);
+        ladder.sort();
+        ladder.dedup();
+        ladder
+    }
+
+    /// Pointer→value mapping for the effort track: window-x into the
+    /// continuous 0..=(stops-1) range, thumb-aware like the reference
+    /// component (the knob center, not its edge, tracks the pointer).
+    /// While scrubbing the reference magnetizes toward rungs and samples
+    /// the motion for release-flick velocity; a new press cancels a spring.
+    fn effort_set_from_x(
+        &mut self,
+        x: gpui::Pixels,
+        stops: usize,
+        track: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+        cx: &mut Context<Self>,
+    ) {
+        if stops < 2 {
+            return;
+        }
+        let Some(bounds) = track.get() else {
+            return;
+        };
+        let width = f32::from(bounds.size.width);
+        if width <= 0.0 {
+            return;
+        }
+        self.effort_spring = None;
+        let raw = (f32::from(x - bounds.origin.x) - EFFORT_TRACK_PAD - EFFORT_THUMB_W / 2.0)
+            / (width - EFFORT_TRACK_PAD * 2.0 - EFFORT_THUMB_W)
+            * (stops - 1) as f32;
+        let value = effort_magnet(raw).clamp(0.0, (stops - 1) as f32);
+        let now = Instant::now();
+        self.effort_samples.push((now, value));
+        let mut kept: Vec<(Instant, f32)> = self
+            .effort_samples
+            .iter()
+            .copied()
+            .filter(|(time, _)| now.duration_since(*time).as_millis() < 90)
+            .collect();
+        if kept.len() > 5 {
+            kept = kept.split_off(kept.len() - 5);
+        }
+        self.effort_samples = kept;
+        self.effort_value = Some(value);
+        self.effort_scrub = true;
+        cx.notify();
+    }
+
+    /// Release-flick velocity from the scrub samples (reference: first to
+    /// last sample over ≥16ms, clamped to ±8).
+    fn effort_velocity(&self) -> f32 {
+        if self.effort_samples.len() < 2 {
+            return 0.0;
+        }
+        let (first_time, first_value) = self.effort_samples[0];
+        let (last_time, last_value) = self.effort_samples[self.effort_samples.len() - 1];
+        let elapsed = (last_time.duration_since(first_time).as_secs_f32()).max(0.016);
+        ((last_value - first_value) / elapsed).clamp(-8.0, 8.0)
+    }
+
+    /// Release the scrub: under reduced motion (or an already-settled
+    /// value) snap + persist immediately; otherwise arm the reference
+    /// spring toward the nearest rung and pick on settle. Releases
+    /// without a preceding track press (press started elsewhere) are
+    /// no-ops.
+    fn effort_release(&mut self, ladder: &[ReasoningLevel], cx: &mut Context<Self>) {
+        let Some(value) = self.effort_value else {
+            return;
+        };
+        if ladder.len() < 2 {
+            self.effort_value = None;
+            self.effort_scrub = false;
+            self.effort_spring = None;
+            cx.notify();
+            return;
+        }
+        let target = value.round().clamp(0.0, (ladder.len() - 1) as f32);
+        if motion::reduced_motion(cx) || (target - value).abs() < 0.001 {
+            self.effort_value = None;
+            self.effort_scrub = false;
+            self.effort_spring = None;
+            self.effort_samples.clear();
+            self.pick_reasoning(ladder[target as usize], cx);
+            return;
+        }
+        self.effort_spring = Some(EffortSpring {
+            target,
+            pos: value,
+            vel: self.effort_velocity(),
+            last: Instant::now(),
+        });
+        self.effort_scrub = false;
+        cx.notify();
+    }
+
+    /// Animation lease for effort motion, targeting the view that owns the
+    /// elements (the popover skeleton that renders this picker).
+    fn effort_lease(&self, cx: &mut Context<Self>) {
+        motion::pulse_lease(cx.entity_id(), cx);
+    }
+
+    /// Effort slider panel for the Reasoning setting (reference-component
+    /// layout adapted to the app theme): `Effort {Level}` header,
+    /// Faster/Smarter axis, scrubable track with rung ticks and a knob.
+    /// The top rung paints accent + a staggered shimmer wave (the
+    /// reference's pixel field, via the app motion kit). Dragging scrubs
+    /// the live value; release snaps to the nearest rung and persists it.
+    /// Returns `None` when the ladder has fewer than two rungs (the caller
+    /// falls back to the list UI).
+    fn render_effort_panel(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = Theme::of(cx).for_popup();
+        let ladder = self.effort_ladder(cx);
+        if ladder.len() < 2 {
+            return None;
+        }
+        let stops = ladder.len();
+        let selected = self.effective_reasoning(cx);
+        let sel_idx = selected
+            .and_then(|s| ladder.iter().position(|l| *l == s))
+            .or_else(|| {
+                default_reasoning(&ladder).and_then(|d| ladder.iter().position(|l| *l == d))
+            })
+            .unwrap_or(0);
+        // Advance a release spring (reference `_springTo`): each render
+        // steps the physics and re-arms the frame lease until it settles,
+        // then persists the target rung.
+        if let Some(mut spring) = self.effort_spring.take() {
+            let now = Instant::now();
+            let dt = now.duration_since(spring.last).as_secs_f32().min(0.032);
+            spring.last = now;
+            let max = (stops - 1) as f32;
+            let (pos, vel) = effort_spring_step(spring.pos, spring.vel, spring.target, dt, max);
+            spring.pos = pos;
+            spring.vel = vel;
+            if (pos - spring.target).abs() < 0.001 && vel.abs() < 0.01 {
+                self.effort_value = None;
+                self.effort_scrub = false;
+                self.effort_samples.clear();
+                self.pick_reasoning(ladder[spring.target as usize], cx);
+            } else {
+                self.effort_value = Some(pos);
+                self.effort_lease(cx);
+                self.effort_spring = Some(spring);
+            }
+        }
+        let value = self
+            .effort_value
+            .unwrap_or(sel_idx as f32)
+            .clamp(0.0, (stops - 1) as f32);
+        let live_idx = value.round().clamp(0.0, (stops - 1) as f32) as usize;
+        let is_max = live_idx + 1 == stops;
+        let ratio = value / (stops - 1) as f32;
+        let reduced = motion::reduced_motion(cx);
+        // Top-rung engagement clock for the pixel-field reveal sweep
+        // (reference reveals left→right over 1s). Latched while the top
+        // rung is live OR a spring is flying toward it: the spring can
+        // oscillate across the rung boundary on release, and restarting
+        // the clock on every crossing would keep the field dim forever.
+        // Only a settled leave resets it.
+        let now = Instant::now();
+        let engaged_max = is_max
+            || self
+                .effort_spring
+                .as_ref()
+                .is_some_and(|spring| spring.target as usize + 1 == stops);
+        if engaged_max {
+            if self.ultra_since.is_none() {
+                self.ultra_since = Some(now);
+            }
+            self.ultra_left_at = None;
+        } else if self.ultra_since.is_some() {
+            // Grace window before forgetting the clock: quick re-entries
+            // (boundary wiggle while scrubbing) resume the sweep.
+            match self.ultra_left_at {
+                None => self.ultra_left_at = Some(now),
+                Some(left_at)
+                    if now.duration_since(left_at).as_millis() >= EFFORT_ULTRA_GRACE_MS =>
+                {
+                    self.ultra_since = None;
+                    self.ultra_left_at = None;
+                }
+                _ => {}
+            }
+        }
+        let elapsed_ms = self
+            .ultra_since
+            .map(|t| now.duration_since(t).as_secs_f32() * 1000.0)
+            .unwrap_or(0.0);
+        let reveal = if reduced {
+            1.0
+        } else {
+            effort_smoothstep(0.0, 1.0, elapsed_ms / 1000.0)
+        };
+        // Frame driver: armed while the top rung is live (pixel field),
+        // a label swap is mid-flight, or the ultra grace is counting down,
+        // so the ~30fps lease runs solely for active effort animation.
+        if !reduced && (is_max || self.ultra_left_at.is_some()) {
+            self.effort_lease(cx);
+        }
+        // Level label swap (reference 180ms slide): track the displayed
+        // label plus the outgoing one with its direction and start time.
+        let live_label = reasoning_label(ladder[live_idx]).to_string();
+        if self.effort_shown.is_empty() {
+            self.effort_shown = live_label.clone();
+        }
+        if self.effort_shown != live_label {
+            let prev_idx = ladder
+                .iter()
+                .position(|l| reasoning_label(*l) == self.effort_shown)
+                .unwrap_or(live_idx);
+            self.effort_prev = Some((
+                std::mem::replace(&mut self.effort_shown, live_label.clone()),
+                prev_idx,
+                now,
+            ));
+        }
+        let label_anim = self.effort_prev.as_ref().and_then(|(_, _, t0)| {
+            let age = now.duration_since(*t0).as_secs_f32() * 1000.0;
+            if age >= 200.0 {
+                None
+            } else {
+                self.effort_lease(cx);
+                Some(age / 180.0)
+            }
+        });
+        if self.effort_prev.is_some() && label_anim.is_none() {
+            self.effort_prev = None;
+        }
+        // Outgoing label + direction for the swap animation below.
+        let label_swap: Option<(String, bool, f32)> = match (label_anim, self.effort_prev.as_ref())
+        {
+            (Some(p), Some((prev_label, prev_idx, _))) => {
+                Some((prev_label.clone(), live_idx >= *prev_idx, p.clamp(0.0, 1.0)))
+            }
+            _ => None,
+        };
+        let level_color = if is_max {
+            theme.accent_strong
+        } else {
+            theme.text
+        };
+        let dark = theme.appearance == crate::theme::Appearance::Dark;
+        let track = self.effort_track.clone();
+        let down_track = track.clone();
+        let move_track = track.clone();
+        let release_ladder = ladder.clone();
+        let release_ladder_out = ladder.clone();
+        let thumb = div()
+            .flex_none()
+            .w(px(EFFORT_THUMB_W))
+            .h(px(EFFORT_THUMB_H))
+            .rounded(px(7.0))
+            .bg(theme.text)
+            .border_1()
+            .border_color(if is_max { theme.accent } else { theme.border });
+        let bar = div()
+            .relative()
+            .w_full()
+            .h(px(EFFORT_TRACK_H))
+            .rounded(px(EFFORT_TRACK_RADIUS))
+            .bg(theme.input_bg)
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                // Fill up to the knob center (hidden at the top rung, like
+                // the reference, where the ultra gradient takes over).
+                div()
+                    .absolute()
+                    .left(px(EFFORT_TRACK_PAD))
+                    .top(px(EFFORT_TRACK_PAD))
+                    .bottom(px(EFFORT_TRACK_PAD))
+                    .right(px(EFFORT_TRACK_PAD))
+                    .opacity(if is_max { 0.0 } else { 1.0 })
+                    .child(
+                        div().w_full().h_full().child(
+                            div()
+                                .h_full()
+                                .w(gpui::relative(ratio))
+                                .rounded(px(EFFORT_TRACK_RADIUS - 1.0))
+                                .bg(theme.accent),
+                        ),
+                    ),
+            )
+            .when(is_max, |el| {
+                // Top-rung pixel field: exact port of the reference canvas
+                // (same palette, hashes, pulses, flow, reveal sweep).
+                let pixel_track = track.clone();
+                el.child(
+                    div()
+                        .absolute()
+                        .left(px(EFFORT_TRACK_PAD))
+                        .top(px(EFFORT_TRACK_PAD))
+                        .bottom(px(EFFORT_TRACK_PAD))
+                        .right(px(EFFORT_TRACK_PAD))
+                        .rounded(px(EFFORT_TRACK_RADIUS - 1.0))
+                        .overflow_hidden()
+                        .child(
+                            gpui::canvas(
+                                move |_, _, _| {},
+                                move |_, _, window, _| {
+                                    let Some(bar) = pixel_track.get() else {
+                                        return;
+                                    };
+                                    let ox = f32::from(bar.origin.x) + EFFORT_TRACK_PAD;
+                                    let oy = f32::from(bar.origin.y) + EFFORT_TRACK_PAD;
+                                    let w = f32::from(bar.size.width) - EFFORT_TRACK_PAD * 2.0;
+                                    let h = f32::from(bar.size.height) - EFFORT_TRACK_PAD * 2.0;
+                                    if w <= 0.0 || h <= 0.0 {
+                                        return;
+                                    }
+                                    // Ultra gradient base (reference
+                                    // `.track::before`, fading in over 340ms).
+                                    let base_alpha = (elapsed_ms / 340.0).clamp(0.0, 1.0);
+                                    let gap = 1.1;
+                                    for cell_rect in
+                                        effort_field_cells(w, h, elapsed_ms, reveal, dark)
+                                    {
+                                        if base_alpha > 0.0 {
+                                            window.paint_quad(gpui::quad(
+                                                gpui::Bounds {
+                                                    origin: gpui::point(
+                                                        px(ox + cell_rect.x0),
+                                                        px(oy + cell_rect.y0),
+                                                    ),
+                                                    size: gpui::size(
+                                                        px(cell_rect.x1 - cell_rect.x0),
+                                                        px(cell_rect.y1 - cell_rect.y0),
+                                                    ),
+                                                },
+                                                px(0.0),
+                                                effort_rgb8(cell_rect.base, base_alpha),
+                                                px(0.0),
+                                                gpui::transparent_black(),
+                                                gpui::BorderStyle::default(),
+                                            ));
+                                        }
+                                        if let Some((rgb, alpha)) = cell_rect.pixel {
+                                            let pw = cell_rect.x1 - cell_rect.x0 - gap;
+                                            let ph = cell_rect.y1 - cell_rect.y0 - gap;
+                                            if pw <= 0.5 || ph <= 0.5 {
+                                                continue;
+                                            }
+                                            window.paint_quad(gpui::quad(
+                                                gpui::Bounds {
+                                                    origin: gpui::point(
+                                                        px(ox + cell_rect.x0 + gap * 0.5),
+                                                        px(oy + cell_rect.y0 + gap * 0.5),
+                                                    ),
+                                                    size: gpui::size(px(pw), px(ph)),
+                                                },
+                                                px(0.0),
+                                                effort_rgb8(rgb, alpha),
+                                                px(0.0),
+                                                gpui::transparent_black(),
+                                                gpui::BorderStyle::default(),
+                                            ));
+                                        }
+                                    }
+                                },
+                            )
+                            .absolute()
+                            .inset_0(),
+                        ),
+                )
+            })
+            .child(
+                // Rung ticks (hidden at the top rung, like the reference).
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px(px(EFFORT_TRACK_PAD + EFFORT_THUMB_W / 2.0))
+                    .opacity(if is_max { 0.0 } else { 1.0 })
+                    .children((0..stops).map(|i| {
+                        // Filled rungs paint accent; coming rungs stay a
+                        // clearly visible gray (reference ticks read at a
+                        // glance — a near-invisible dot reads as missing).
+                        div()
+                            .w(px(4.0))
+                            .h(px(4.0))
+                            .rounded_full()
+                            .bg(if i <= live_idx {
+                                theme.accent
+                            } else {
+                                theme.text_muted
+                            })
+                    })),
+            )
+            .child(
+                // Knob positioned by flex spacers (exact without measuring).
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .px(px(EFFORT_TRACK_PAD))
+                    .child(div().flex_grow(value))
+                    .child(thumb)
+                    .child(div().flex_grow((stops - 1) as f32 - value)),
+            )
+            .child(
+                gpui::canvas(move |bounds, _, _| track.set(Some(bounds)), |_, _, _, _| {})
+                    .absolute()
+                    .inset_0(),
+            );
+        Some(
+            div()
+                .id("effort-panel")
+                .flex()
+                .flex_col()
+                .px(px(12.0))
+                .pt(px(10.0))
+                .pb(px(12.0))
+                .gap(px(2.0))
+                .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme.text_muted)
+                                        .child(SharedString::from("Effort")),
+                                )
+                                .child(
+                                    // Level slot: fixed floor width (longest
+                                    // rung) so swaps never reflow the header;
+                                    // outgoing + incoming crossfade with a
+                                    // 3px directional slide (reference 180ms).
+                                    div()
+                                        .relative()
+                                        .h(px(18.0))
+                                        .min_w(px(76.0))
+                                        .flex()
+                                        .items_center()
+                                        .children(label_swap.into_iter().flat_map(
+                                            |(prev_label, forward, p)| {
+                                                let in_p =
+                                                    ((p * 180.0 - 24.0) / 156.0).clamp(0.0, 1.0);
+                                                let exit_y = if forward { -3.0 } else { 3.0 } * p;
+                                                let enter_y =
+                                                    if forward { 3.0 } else { -3.0 } * (1.0 - in_p);
+                                                [
+                                                    div()
+                                                        .absolute()
+                                                        .left_0()
+                                                        .top(px(exit_y))
+                                                        .opacity(1.0 - p)
+                                                        .text_size(px(13.0))
+                                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                                        .text_color(level_color)
+                                                        .child(SharedString::from(prev_label))
+                                                        .into_any_element(),
+                                                    div()
+                                                        .absolute()
+                                                        .left_0()
+                                                        .top(px(enter_y))
+                                                        .opacity(in_p)
+                                                        .text_size(px(13.0))
+                                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                                        .text_color(level_color)
+                                                        .child(SharedString::from(
+                                                            live_label.clone(),
+                                                        ))
+                                                        .into_any_element(),
+                                                ]
+                                            },
+                                        ))
+                                        .children(self.effort_prev.is_none().then(|| {
+                                            div()
+                                                .text_size(px(13.0))
+                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .text_color(level_color)
+                                                .child(SharedString::from(live_label.clone()))
+                                                .into_any_element()
+                                        })),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .pt(px(6.0))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from("Faster")),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from("Smarter")),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("effort-track-hit")
+                        .relative()
+                        .w_full()
+                        .h(px(EFFORT_TRACK_H + 14.0))
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                this.effort_set_from_x(
+                                    event.position.x,
+                                    stops,
+                                    down_track.clone(),
+                                    cx,
+                                );
+                                window.prevent_default();
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(
+                            move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                                if this.effort_scrub && event.dragging() {
+                                    this.effort_set_from_x(
+                                        event.position.x,
+                                        stops,
+                                        move_track.clone(),
+                                        cx,
+                                    );
+                                }
+                            },
+                        ))
+                        .on_mouse_up(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                let ladder = release_ladder.clone();
+                                this.effort_release(&ladder, cx);
+                            }),
+                        )
+                        .on_mouse_up_out(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                let ladder = release_ladder_out.clone();
+                                this.effort_release(&ladder, cx);
+                            }),
+                        )
+                        .child(bar),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn pick_option(
         &mut self,
         option_id: String,
@@ -2075,10 +2992,10 @@ impl Pickers {
     }
 
     /// Devices in picker order: this device first, then by name.
-    fn device_rows(&self, cx: &App) -> Vec<zeron_proto::Device> {
+    fn device_rows(&self, cx: &App) -> Vec<clyra_proto::Device> {
         let state = self.state.read(cx);
         let local = state.local_device_id.clone();
-        let mut devices: Vec<zeron_proto::Device> = state.devices.clone();
+        let mut devices: Vec<clyra_proto::Device> = state.devices.clone();
         devices.sort_by_key(|d| {
             (
                 local.as_deref() != Some(d.id.as_str()),
@@ -2091,7 +3008,7 @@ impl Pickers {
 
     /// [`Self::device_rows`] filtered by the search box (same ranked
     /// substring match as the project rows).
-    fn filtered_device_rows(&self, cx: &App) -> Vec<zeron_proto::Device> {
+    fn filtered_device_rows(&self, cx: &App) -> Vec<clyra_proto::Device> {
         let query = self.search.read(cx).text().to_string();
         let rows = self.device_rows(cx);
         let names: Vec<String> = rows.iter().map(|d| d.name.clone()).collect();
@@ -2547,7 +3464,7 @@ impl Pickers {
             PickerKind::Device => "picker-device",
         };
         let open = self.open_kind() == Some(kind);
-        // Ghost pill (zeron composer/styles.tsx `pill`): `h-8 rounded-lg px-2.5
+        // Ghost pill (clyra composer/styles.tsx `pill`): `h-8 rounded-lg px-2.5
         // gap-1.5 text-[12px] font-medium text-muted-foreground`, icons size-4,
         // hover/open wash — no border, no caret; the actions row stays quiet.
         div()
@@ -2578,7 +3495,7 @@ impl Pickers {
             .rounded(px(8.0))
             .text_size(crate::typography::ui_rems(12.0))
             .font_weight(gpui::FontWeight::MEDIUM)
-            // zeron composer/styles.tsx `pill`: `transition-colors` — the wash
+            // clyra composer/styles.tsx `pill`: `transition-colors` — the wash
             // and text brighten fade over 150ms.
             .text_color(motion::hover_blend(
                 id,
@@ -3046,7 +3963,7 @@ impl Pickers {
         let theme = Theme::of(cx).for_popup();
         popover::popover_card(&theme)
             .w(px(width))
-            // zeron caps its tallest picker at min(640px, 75vh).
+            // clyra caps its tallest picker at min(640px, 75vh).
             .max_h(px(self.menu_geometry().height))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -3082,7 +3999,7 @@ impl Pickers {
     }
 
     /// [`Self::popover_frame`] without the p-1 inset — the harness/model
-    /// picker's rail + list panes bleed to the card edge (zeron
+    /// picker's rail + list panes bleed to the card edge (clyra
     /// harness-model-picker.tsx `className="w-80 p-0"`).
     fn popover_frame_flush(
         &self,
@@ -3412,7 +4329,7 @@ impl Pickers {
     /// Existing chats show only their own harness tab and models.
     fn render_harness_model_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let height = self.menu_geometry().height.min(self.open_model_height);
-        let (list_height, tray_height) = model_menu_budgets(height, self.setting_groups(cx).len());
+        let (list_height, tray_height) = model_menu_budgets(height, self.settings_tray_height(cx));
 
         let theme = Theme::of(cx).for_popup();
 
@@ -3942,6 +4859,28 @@ impl Pickers {
         div().pb(px(2.0)).child(el).into_any_element()
     }
 
+    /// Whether the Reasoning setting renders as the inline effort slider
+    /// (a ladder of at least two rungs) instead of a submenu row.
+    fn reasoning_inline(&self, cx: &App) -> bool {
+        self.effort_ladder(cx).len() >= 2
+    }
+
+    /// Desired settings-tray height: submenu rows at 32px each, the
+    /// Reasoning ladder as the inline effort slider.
+    fn settings_tray_height(&self, cx: &App) -> f32 {
+        let groups = self.setting_groups(cx);
+        let slider = self.reasoning_inline(cx)
+            && groups
+                .iter()
+                .any(|group| group.id == ModelSetting::Reasoning);
+        let rows = groups.len() - usize::from(slider);
+        if slider {
+            rows_tray(rows).max(7.0) + EFFORT_PANEL_H
+        } else {
+            rows_tray(rows)
+        }
+    }
+
     fn setting_groups(&self, cx: &App) -> Vec<SettingGroup> {
         let mut groups = Vec::new();
         let levels = self.trait_ladder(cx);
@@ -4092,7 +5031,18 @@ impl Pickers {
         let theme = Theme::of(cx).for_popup();
         let base_index = self.model_rows_len(cx);
         let mut rows = Vec::new();
+        let reasoning_inline = self.reasoning_inline(cx);
         for (ix, group) in self.setting_groups(cx).into_iter().enumerate() {
+            // Reasoning is the effort slider itself, inline in the tray: the
+            // model card is the only place a level gets picked (the composer
+            // has no effort chip of its own).
+            if group.id == ModelSetting::Reasoning
+                && reasoning_inline
+                && let Some(panel) = self.render_effort_panel(cx)
+            {
+                rows.push(div().id(("model-setting-hover", ix)).child(panel));
+                continue;
+            }
             let open = self.setting_menu.as_ref() == Some(&group.id);
             let value = group
                 .choices
@@ -4486,7 +5436,7 @@ pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Ve
             .to_ascii_lowercase()
     }
     let catalog = match harness {
-        HarnessId::ClaudeCode => zeron_harness::claude::catalog::static_models(),
+        HarnessId::ClaudeCode => clyra_harness::claude::catalog::static_models(),
         _ => Vec::new(),
     };
     // Curated label for an id: exact normalized match, else — for bare
@@ -4527,15 +5477,15 @@ pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Ve
                     }
                 }
                 if !model.options.iter().any(|o| o.id == "contextWindow") {
-                    model.options.push(zeron_proto::ModelOption {
+                    model.options.push(clyra_proto::ModelOption {
                         id: "contextWindow".into(),
                         label: "Context Window".into(),
                         choices: vec![
-                            zeron_proto::ModelOptionChoice {
+                            clyra_proto::ModelOptionChoice {
                                 id: "200k".into(),
                                 label: "200K".into(),
                             },
-                            zeron_proto::ModelOptionChoice {
+                            clyra_proto::ModelOptionChoice {
                                 id: "1m".into(),
                                 label: "1M".into(),
                             },
@@ -4550,6 +5500,23 @@ pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Ve
             Some(model)
         })
         .collect()
+}
+
+/// The agent's display name, next to [`harness_brand_icon`] because the two
+/// always travel together: a row that shows the mark shows the name beside it.
+pub(crate) fn harness_name(harness: HarnessId) -> &'static str {
+    match harness {
+        HarnessId::ClaudeCode => "Claude Code",
+        HarnessId::Codex => "Codex",
+        HarnessId::Cursor => "Cursor",
+        HarnessId::Devin => "Devin",
+        HarnessId::Grok => "Grok Build",
+        HarnessId::Hermes => "Hermes",
+        HarnessId::Pi => "Pi",
+        HarnessId::Opencode => "OpenCode",
+        HarnessId::Antigravity => "Antigravity",
+        HarnessId::Mock => "Mock",
+    }
 }
 
 pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gpui::Hsla>) {
@@ -4622,7 +5589,7 @@ fn offered_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<H
         .into_iter()
         .filter(|d| {
             d.installed
-                && (zeron_engine::registry::descriptor_enabled(d)
+                && (clyra_engine::registry::descriptor_enabled(d)
                     || (allow_mock && d.id == HarnessId::Mock))
         })
         .collect()
@@ -4630,22 +5597,26 @@ fn offered_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<H
 
 // Tabs and search consume 80px, with 2px reserved for the card border.
 // Keep one model row where possible; long option stacks scroll in the tray.
-fn model_menu_height(setting_count: usize) -> f32 {
-    let tray = if setting_count == 0 {
+/// Height the effort slider takes in the settings tray (header, axis labels,
+/// track and padding — see [`Pickers::render_effort_panel`]).
+const EFFORT_PANEL_H: f32 = 108.0;
+
+/// Desired tray height for `rows` plain setting rows (32px each + insets).
+fn rows_tray(rows: usize) -> f32 {
+    if rows == 0 {
         0.0
     } else {
-        (setting_count as f32 * 32.0 + 7.0).min(236.0)
-    };
-    82.0 + 216.0 + tray
+        rows as f32 * 32.0 + 7.0
+    }
 }
 
-fn model_menu_budgets(height: f32, setting_count: usize) -> (f32, f32) {
+fn model_menu_height(tray: f32) -> f32 {
+    82.0 + 216.0 + tray.min(236.0)
+}
+
+fn model_menu_budgets(height: f32, tray: f32) -> (f32, f32) {
     let body = (height - 82.0).max(0.0);
-    let desired_tray = if setting_count == 0 {
-        0.0
-    } else {
-        (setting_count as f32 * 32.0 + 7.0).min(236.0)
-    };
+    let desired_tray = tray.min(236.0);
     let tray = desired_tray.min((body - 30.0).max(0.0));
     // The list absorbs changes in tray height, keeping the card's top edge
     // and search field stationary while choosing models and options.
@@ -4776,7 +5747,7 @@ impl Render for Pickers {
         {
             self.ensure_refs(false, cx);
         }
-        // Chip shows the model's display name alone (zeron `modelText`); the
+        // Chip shows the model's display name alone (clyra `modelText`); the
         // harness reads from the brand mark beside it. Never "Default model":
         // before the catalog lands the remembered label (or the configured id)
         // names the pick; the loaded list then resolves it to a concrete row.
@@ -4919,7 +5890,7 @@ impl Render for Pickers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeron_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+    use clyra_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
 
     struct ModelShortcutHost {
         focus_sub: Option<gpui::Subscription>,
@@ -5226,8 +6197,8 @@ mod tests {
             let geometry = popover::menu_geometry(top, bottom, viewport);
             assert_eq!(geometry.below, below);
             for settings in [0, 1, 3, 20] {
-                let height = geometry.height.min(model_menu_height(settings));
-                let (list, tray) = model_menu_budgets(height, settings);
+                let height = geometry.height.min(model_menu_height(rows_tray(settings)));
+                let (list, tray) = model_menu_budgets(height, rows_tray(settings));
                 assert!(list + tray + 82.0 <= geometry.height);
                 assert!((0.0..=216.0).contains(&list));
                 assert!((0.0..=236.0).contains(&tray));
@@ -5236,7 +6207,9 @@ mod tests {
                 }
             }
         }
-        assert!(model_menu_budgets(180.0, 2).0 < model_menu_budgets(400.0, 2).0);
+        assert!(
+            model_menu_budgets(180.0, rows_tray(2)).0 < model_menu_budgets(400.0, rows_tray(2)).0
+        );
     }
 
     #[gpui::test]
@@ -5290,7 +6263,11 @@ mod tests {
                     assert_eq!(geometry.below, new_thread && !near_bottom);
                     assert!(geometry.height > 180.0);
                     assert!(
-                        model_menu_budgets(geometry.height.min(model_menu_height(2)), 2).0 >= 30.0
+                        model_menu_budgets(
+                            geometry.height.min(model_menu_height(rows_tray(2))),
+                            rows_tray(2)
+                        )
+                        .0 >= 30.0
                     );
                 })
                 .unwrap();
@@ -5404,7 +6381,7 @@ mod tests {
                 pickers.config.harness = Some(HarnessId::Codex);
                 pickers.config.model = Some("model".into());
                 pickers.harnesses = Loadable::Ready(vec![descriptor(HarnessId::Codex, "Codex")]);
-                pickers.open_model_height = model_menu_height(2);
+                pickers.open_model_height = model_menu_height(rows_tray(2));
                 pickers.menu_geometry.insert(
                     PickerKind::HarnessModel,
                     popover::MenuGeometry {
@@ -5459,8 +6436,9 @@ mod tests {
                 cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear())
                     .unwrap();
                 assert!(
-                    (f32::from(bounds.get().size.height) - available.min(model_menu_height(2)))
-                        .abs()
+                    (f32::from(bounds.get().size.height)
+                        - available.min(model_menu_height(rows_tray(2))))
+                    .abs()
                         < 0.1,
                     "settings={settings}, available={available}, bounds={:?}",
                     bounds.get()
@@ -5630,6 +6608,200 @@ mod tests {
             reasoning_levels: Vec::new(),
             options: Vec::new(),
         }
+    }
+
+    #[gpui::test]
+    fn effort_slider_lives_in_the_model_traits_tray(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(Theme::dark());
+        });
+        let handle = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Pickers::new(state, cx)
+        });
+        handle
+            .update(cx, |pickers, _, cx| {
+                let mut model = bare_model("m", "M");
+                model.reasoning_levels = vec![
+                    ReasoningLevel::Low,
+                    ReasoningLevel::Medium,
+                    ReasoningLevel::High,
+                ];
+                pickers.config.harness = Some(HarnessId::ClaudeCode);
+                pickers.config.model = Some("m".into());
+                pickers.config.reasoning = Some(ReasoningLevel::High);
+                pickers.harnesses =
+                    Loadable::Ready(vec![descriptor(HarnessId::ClaudeCode, "Claude Code")]);
+                pickers.apply_model_catalog(
+                    HarnessId::ClaudeCode,
+                    Loadable::Ready(vec![model]),
+                    cx,
+                );
+                // The composer has no effort chip: the ladder renders as the
+                // inline slider inside the model popover's traits tray, and
+                // the tray budgets the panel's height for it.
+                assert!(pickers.reasoning_inline(cx));
+                assert!(pickers.render_effort_panel(cx).is_some());
+                assert_eq!(pickers.setting_groups(cx).len(), 1);
+                assert!(pickers.settings_tray_height(cx) > rows_tray(1));
+
+                // A single-rung ladder has nothing to scrub: the panel falls
+                // back to the one-row list UI.
+                let mut bare = bare_model("m", "M");
+                bare.reasoning_levels = vec![ReasoningLevel::High];
+                pickers.apply_model_catalog(HarnessId::ClaudeCode, Loadable::Ready(vec![bare]), cx);
+                assert!(!pickers.reasoning_inline(cx));
+                assert!(pickers.render_effort_panel(cx).is_none());
+                assert!((pickers.settings_tray_height(cx) - rows_tray(1)).abs() < 0.1);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn effort_ladder_sorts_rungs_in_effort_order(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(Theme::dark());
+        });
+        let handle = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Pickers::new(state, cx)
+        });
+        handle
+            .update(cx, |pickers, _, cx| {
+                let mut model = bare_model("m", "M");
+                model.reasoning_levels = vec![
+                    ReasoningLevel::High,
+                    ReasoningLevel::Low,
+                    ReasoningLevel::High,
+                    ReasoningLevel::Medium,
+                ];
+                pickers.config.harness = Some(HarnessId::ClaudeCode);
+                pickers.config.model = Some("m".into());
+                pickers.harnesses =
+                    Loadable::Ready(vec![descriptor(HarnessId::ClaudeCode, "Claude Code")]);
+                pickers.apply_model_catalog(
+                    HarnessId::ClaudeCode,
+                    Loadable::Ready(vec![model]),
+                    cx,
+                );
+                assert_eq!(
+                    pickers.effort_ladder(cx),
+                    vec![
+                        ReasoningLevel::Low,
+                        ReasoningLevel::Medium,
+                        ReasoningLevel::High
+                    ]
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn effort_release_snaps_to_nearest_rung(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(Theme::dark());
+        });
+        let handle = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Pickers::new(state, cx)
+        });
+        handle
+            .update(cx, |pickers, _, cx| {
+                // Reduced motion: release snaps + persists immediately.
+                motion::set_reduced_motion(cx, true);
+                let ladder = vec![
+                    ReasoningLevel::Low,
+                    ReasoningLevel::Medium,
+                    ReasoningLevel::High,
+                ];
+                pickers.effort_value = Some(1.6);
+                pickers.effort_scrub = true;
+                pickers.effort_release(&ladder, cx);
+                assert_eq!(pickers.config.reasoning, Some(ReasoningLevel::High));
+                assert!(pickers.effort_value.is_none());
+                assert!(!pickers.effort_scrub);
+                assert!(pickers.effort_spring.is_none());
+                // A release without a preceding track press (press started
+                // elsewhere) changes nothing.
+                pickers.config.reasoning = Some(ReasoningLevel::Low);
+                pickers.effort_release(&ladder, cx);
+                assert_eq!(pickers.config.reasoning, Some(ReasoningLevel::Low));
+                // Full motion: release arms the spring instead of snapping.
+                motion::set_reduced_motion(cx, false);
+                pickers.effort_value = Some(0.4);
+                pickers.effort_release(&ladder, cx);
+                let spring = pickers.effort_spring.as_ref().unwrap();
+                assert_eq!(spring.target, 0.0);
+                assert_eq!(pickers.config.reasoning, Some(ReasoningLevel::Low));
+                motion::set_reduced_motion(cx, false);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn effort_magnet_pull_is_reference_shaped() {
+        // On a rung (or exactly at the radius edge, where strength is 0):
+        // untouched.
+        assert_eq!(effort_magnet(2.0), 2.0);
+        assert_eq!(effort_magnet(2.5), 2.5);
+        // Inside the radius: pulled toward the rung.
+        let pulled = effort_magnet(2.3);
+        assert!(pulled > 2.0 && pulled < 2.3);
+        let pulled_down = effort_magnet(1.7);
+        assert!(pulled_down > 1.7 && pulled_down < 2.0);
+    }
+
+    #[test]
+    fn effort_spring_step_settles_on_target() {
+        // Stiffness/damping converge without overshooting into instability.
+        let (mut pos, mut vel) = (0.4, 0.0);
+        for _ in 0..600 {
+            (pos, vel) = effort_spring_step(pos, vel, 0.0, 0.016, 5.0);
+        }
+        assert!((pos - 0.0).abs() < 0.001 && vel.abs() < 0.01);
+        // Clamped to the ladder range.
+        let (pos, _) = effort_spring_step(4.9, 8.0, 5.0, 0.016, 5.0);
+        assert!(pos <= 5.0);
+    }
+
+    #[test]
+    fn effort_field_covers_the_whole_track() {
+        // Full reveal on a 274x24 track: every grid cell paints (sharp
+        // reference squares, no clipping gaps) — 55 cols x 5 rows.
+        let cells = effort_field_cells(274.0, 24.0, 2000.0, 1.0, true);
+        assert_eq!(cells.len(), 55 * 5);
+        let min_x0 = cells.iter().map(|c| c.x0).fold(f32::INFINITY, f32::min);
+        let max_x1 = cells.iter().map(|c| c.x1).fold(f32::NEG_INFINITY, f32::max);
+        let min_y0 = cells.iter().map(|c| c.y0).fold(f32::INFINITY, f32::min);
+        let max_y1 = cells.iter().map(|c| c.y1).fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(min_x0, 0.0);
+        assert_eq!(min_y0, 0.0);
+        assert!((max_x1 - 274.0).abs() < 0.01);
+        assert!((max_y1 - 24.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn effort_pixel_field_matches_reference_behavior() {
+        // Pre-reveal (left of the frontier): transparent.
+        let (_, alpha) = effort_pixel(0, 0, 0.0, 100.0, 0.1, true);
+        assert_eq!(alpha, 0.0);
+        // Engaged + revealed: visible violet in both appearances.
+        for dark in [false, true] {
+            let (rgb, alpha) = effort_pixel(40, 2, 0.9, 2000.0, 1.0, dark);
+            assert!(alpha > 0.0);
+            assert!(rgb[2] > rgb[0] && rgb[0] >= 140.0 && rgb[0] <= 196.0);
+        }
+        // Dark base stays dark (no washed-out track); light keeps the
+        // reference stops. Compared mid-track where the base still weighs
+        // (at nx=0.9 the violet mix already covers it in both).
+        let (dark_rgb, _) = effort_pixel(12, 2, 0.3, 2000.0, 1.0, true);
+        let (light_rgb, _) = effort_pixel(12, 2, 0.3, 2000.0, 1.0, false);
+        assert!(dark_rgb[0] < light_rgb[0]);
+        // Gradient endpoints match the reference stops per appearance.
+        assert_eq!(effort_gradient(0.0, false), [238.0, 235.0, 233.0]);
+        assert_eq!(effort_gradient(1.0, false), [203.0, 186.0, 216.0]);
+        assert_eq!(effort_gradient(0.0, true), [52.0, 48.0, 66.0]);
+        assert_eq!(effort_gradient(1.0, true), [120.0, 96.0, 140.0]);
     }
 
     #[gpui::test]
@@ -6160,7 +7332,7 @@ mod tests {
             can_install: false,
             enabled: Some(true),
             reasoning_levels: Vec::new(),
-            steering_mode: zeron_proto::SteeringMode::StepBoundary,
+            steering_mode: clyra_proto::SteeringMode::StepBoundary,
             supports_steering: false,
         }
     }
@@ -6355,16 +7527,16 @@ mod tests {
     #[test]
     fn standard_tier_is_hidden_but_other_defaults_remain() {
         let mut model = bare_model("test", "Test");
-        model.options = vec![zeron_proto::ModelOption {
+        model.options = vec![clyra_proto::ModelOption {
             id: "serviceTier".into(),
             label: "Service Tier".into(),
             default_choice: "default".into(),
             choices: vec![
-                zeron_proto::ModelOptionChoice {
+                clyra_proto::ModelOptionChoice {
                     id: "default".into(),
                     label: "Standard".into(),
                 },
-                zeron_proto::ModelOptionChoice {
+                clyra_proto::ModelOptionChoice {
                     id: "fast".into(),
                     label: "Fast".into(),
                 },
@@ -6537,9 +7709,9 @@ mod tests {
         // Case-insensitive; the length indexes into the NAME's bytes.
         assert_eq!(completion_prefix_len("Documents", "doc"), Some(3));
         assert_eq!(&"Documents"[3..], "uments");
-        assert_eq!(completion_prefix_len("zeron", "zeron"), Some(5));
-        assert_eq!(completion_prefix_len("zeron", ""), Some(0));
-        assert_eq!(completion_prefix_len("zeron", "dev"), None);
+        assert_eq!(completion_prefix_len("clyra", "clyra"), Some(5));
+        assert_eq!(completion_prefix_len("clyra", ""), Some(0));
+        assert_eq!(completion_prefix_len("clyra", "dev"), None);
         // Longer than the name → not a prefix.
         assert_eq!(completion_prefix_len("dev", "devel"), None);
         // Multibyte names slice on a char boundary.
@@ -6600,7 +7772,7 @@ mod tests {
                     is_repo: false,
                 },
                 FolderEntry {
-                    name: "zeron".into(),
+                    name: "clyra".into(),
                     is_dir: true,
                     is_repo: true,
                 },
@@ -6609,7 +7781,7 @@ mod tests {
         };
         // Files never show as rows.
         assert_eq!(browser_rows(&listing).len(), 2);
-        assert_eq!(browser_rows(&listing)[1].name, "zeron");
+        assert_eq!(browser_rows(&listing)[1].name, "clyra");
     }
 
     #[test]
@@ -6683,7 +7855,7 @@ mod tests {
             id,
             name: name.into(),
             supports_steering: true,
-            steering_mode: zeron_proto::SteeringMode::StepBoundary,
+            steering_mode: clyra_proto::SteeringMode::StepBoundary,
             reasoning_levels: vec![],
             installed: true,
             can_install: false,
@@ -6710,7 +7882,7 @@ mod tests {
             id,
             name: name.into(),
             supports_steering: true,
-            steering_mode: zeron_proto::SteeringMode::StepBoundary,
+            steering_mode: clyra_proto::SteeringMode::StepBoundary,
             reasoning_levels: vec![],
             installed: true,
             can_install: false,
@@ -6763,7 +7935,7 @@ mod tests {
                 id,
                 name: name.into(),
                 supports_steering: true,
-                steering_mode: zeron_proto::SteeringMode::StepBoundary,
+                steering_mode: clyra_proto::SteeringMode::StepBoundary,
                 reasoning_levels: vec![],
                 installed,
                 can_install: false,

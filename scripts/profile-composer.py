@@ -16,7 +16,7 @@ args = parser.parse_args()
 out = args.output.resolve()
 out.mkdir(parents=True, exist_ok=False)
 name = out.name
-binary = out / 'profiled-zeron'
+binary = out / 'profiled-clyra'
 shutil.copy2(args.binary, binary)
 settings = json.loads(args.settings.read_text())
 (out / 'ui-settings.json').write_text(json.dumps(settings))
@@ -90,7 +90,7 @@ def phase(name, fn):
     print(json.dumps(result), flush=True)
 try:
     time.sleep(2)
-    ids = subprocess.check_output(['xdotool', 'search', '--class', 'zeron'], env=env, text=True).splitlines()
+    ids = subprocess.check_output(['xdotool', 'search', '--class', 'clyra'], env=env, text=True).splitlines()
     wid = ids[-1]
     key('windowmap', wid, 'windowsize', wid, '1280', '900', 'windowmove', wid, '0', '0', 'windowfocus', wid)
     time.sleep(1)

@@ -1,8 +1,8 @@
 //! Catalog refresh must survive large responses, account changes, and failed
 //! probes without pinning a stale catalog for the lifetime of the engine.
 #![cfg(unix)]
+use clyra_harness::{AcpHarness, Harness};
 use std::{os::unix::fs::PermissionsExt, path::Path};
-use zeron_harness::{AcpHarness, Harness};
 
 fn fixture(dir: &Path) -> std::path::PathBuf {
     let script = dir.join("agent.py");

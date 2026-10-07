@@ -291,20 +291,19 @@ impl Shell {
             stable_panel_content_width(target, self.active_tween_endpoints(self.files_tween));
         // The explorer is the right pane's rightmost column: its left hairline
         // is the divider from the surface host (or the pane's own edge when
-        // that portion is closed), and it carries the CSD window's right
-        // corners in place of the surface column (see `render_right_pane`).
+        // that portion is closed), and it carries the CSD window's
+        // bottom-right corner in place of the surface column (see
+        // `render_right_pane`). The column starts below the titlebar band so
+        // the band composites over bare frost up there, like everywhere else.
         let corner = Self::window_corner_radius(window);
         let inner = div()
             .w(px(content_width))
             .h_full()
-            .pt(px(Theme::TITLEBAR_HEIGHT))
             .occlude()
             .border_l_1()
             .border_color(theme.border)
-            .bg(theme.panel_bg())
-            .when(corner > 0.0, |el| {
-                el.rounded_tr(px(corner)).rounded_br(px(corner))
-            })
+            .bg(theme.chat_panel_bg(crate::settings::current(cx).chat_opacity))
+            .when(corner > 0.0, |el| el.rounded_br(px(corner)))
             .overflow_hidden()
             .children(content);
         div()
@@ -316,6 +315,7 @@ impl Shell {
                 div()
                     .h_full()
                     .w(px(self.files_visible_width(cx)))
+                    .pt(px(Theme::TITLEBAR_HEIGHT))
                     .overflow_hidden()
                     .child(inner),
             )
@@ -445,7 +445,7 @@ mod tests {
                     edge_token: None,
                     org_id: None,
                     workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
+                    default_harness: clyra_proto::HarnessId::Mock,
                 },
                 cx,
             )
@@ -493,9 +493,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn pane_toggle_drives_surfaces_only_and_last_tab_close_collapses_them(
-        cx: &mut TestAppContext,
-    ) {
+    fn pane_toggle_drives_surfaces_only_and_last_tab_close_collapses_them(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
             gpui_base::init(cx);
@@ -513,7 +511,7 @@ mod tests {
                     edge_token: None,
                     org_id: None,
                     workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
+                    default_harness: clyra_proto::HarnessId::Mock,
                 },
                 cx,
             )

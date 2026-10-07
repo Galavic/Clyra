@@ -1,4 +1,4 @@
-//! zeron-engine — the headless backend: sessions engine, doc host + command executor,
+//! clyra-engine — the headless backend: sessions engine, doc host + command executor,
 //! run journal + crash recovery, and the IPC RPC server.
 //!
 //! Spec: ARCHITECTURE.md §5 and docs/research/feature-inventory.md §3. M2 surface:
@@ -10,13 +10,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-pub use zeron_proto::{EngineInfo, HarnessId, WorkspaceScope};
-use zeron_rpc::{RpcError, RpcReply, RpcService, methods};
+pub use clyra_proto::{EngineInfo, HarnessId, WorkspaceScope};
+use clyra_rpc::{RpcError, RpcReply, RpcService, methods};
 
-use zeron_sync::DocsStore;
+use clyra_sync::DocsStore;
 
 pub mod agent_accounts;
 pub mod auth;
+pub mod automations;
 pub mod change_requests;
 pub mod chat2_host;
 mod chat_persistence;
@@ -44,6 +45,7 @@ pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
+pub use automations::{Automations, AutomationsStore};
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
     CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
@@ -62,7 +64,7 @@ pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
 pub use source_control::{
     BranchHeadContext, ChangeRequestError, ChangeRequestProvider, ChangeRequestResolution,
     ChangeRequestResolver, CheckoutChangeRequestLookup, CheckoutSourceContext, GitHubCli,
-    GitRemote, parse_git_remote,
+    GitRemote, PullRequestActivity, parse_git_remote,
 };
 pub use spaces::SpacesSync;
 pub use terminals::Terminals;
@@ -78,15 +80,15 @@ pub(crate) const LEGACY_UNKNOWN_DEVICE_NAME: &str = "unknown-device";
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error(transparent)]
-    Token(#[from] zeron_rpc::TokenError),
+    Token(#[from] clyra_rpc::TokenError),
     #[error("doc: {0}")]
-    Doc(#[from] zeron_doc::DocError),
+    Doc(#[from] clyra_doc::DocError),
     #[error("journal: {0}")]
     Journal(#[from] run_journal::JournalError),
     #[error("store: {0}")]
-    Store(#[from] zeron_sync::StoreError),
+    Store(#[from] clyra_sync::StoreError),
     #[error("harness: {0}")]
-    Harness(#[from] zeron_harness::HarnessError),
+    Harness(#[from] clyra_harness::HarnessError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("{0}")]
@@ -104,7 +106,7 @@ pub(crate) fn new_id() -> String {
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    /// Data directory (default `~/.zeron`, dev `~/.zeron-dev`).
+    /// Data directory (default `~/.clyra`, dev `~/.clyra-dev`).
     pub data_dir: PathBuf,
     /// Edge base URL.
     pub edge_url: String,
@@ -133,7 +135,9 @@ pub struct EngineCore {
     pub workspace_files: WorkspaceFiles,
     pub terminals: Terminals,
     pub project_actions: ProjectActionsStore,
-    pub previews: zeron_preview::PreviewService,
+    /// Scheduled / event-triggered automations, and the loop that fires them.
+    pub automations: Automations,
+    pub previews: clyra_preview::PreviewService,
     pub change_requests: CheckoutChangeRequests,
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
@@ -146,10 +150,10 @@ pub struct EngineCore {
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
     /// Peer link cache for `targetDeviceId` routing (attached when edge+auth are ready).
-    links: std::sync::Mutex<Option<Arc<zeron_rpc::LinkCache>>>,
+    links: std::sync::Mutex<Option<Arc<clyra_rpc::LinkCache>>>,
     /// Release checker (attached by [`Engine::assemble_runtime`]) — the
     /// UpdateStatus stream + ApplyUpdate.
-    updater: std::sync::Mutex<Option<zeron_update::Updater>>,
+    updater: std::sync::Mutex<Option<clyra_update::Updater>>,
     /// The updater's token-change wake forwarder — owned so shutdown can end it.
     updater_wake: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Exclusive data-dir lock — held for the engine's lifetime (single-instance).
@@ -250,6 +254,7 @@ impl EngineCore {
             Err(err) => tracing::error!(error = %err, "stale-session recovery failed"),
         }
         doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
+        doc_host.spawn_diff_stats_backfill(profile.store_root().join("journals"));
         let repos = Repos::new(data_dir, &device_id);
         doc_host.set_repos(repos.clone());
         let change_requests = CheckoutChangeRequests::start(repos.clone(), &device_id);
@@ -258,7 +263,7 @@ impl EngineCore {
         let terminals = Terminals::new();
         let project_actions = ProjectActionsStore::open(profile.store_root())?;
         doc_host.set_project_action_runtime(project_actions.clone(), terminals.clone());
-        let previews = zeron_preview::PreviewService::new(
+        let previews = clyra_preview::PreviewService::new(
             profile.store_root().join("previews.json"),
             device_id.clone(),
             local_device_name(&device_id),
@@ -310,6 +315,16 @@ impl EngineCore {
             turn_diff.note_turn_start(chat_id, cwd);
         }));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
+        // Started here (not with the updater) so an automation can fire with
+        // no edge link: the run is local, and a queued session must not depend
+        // on the relay being up.
+        let automations = Automations::start(
+            AutomationsStore::open(profile.store_root())?,
+            workspace.clone(),
+            doc_host.clone(),
+            &device_id,
+            default_harness,
+        );
         Ok(Self {
             sessions,
             doc_host,
@@ -319,6 +334,7 @@ impl EngineCore {
             workspace_files,
             terminals,
             project_actions,
+            automations,
             previews,
             change_requests,
             diff_sync,
@@ -369,7 +385,7 @@ impl EngineCore {
 
     /// Attach the peer link cache — enables `targetDeviceId` routing,
     /// [`Self::dial_device`], and the doc host's queued-attachment transfers.
-    pub fn set_links(&self, links: Arc<zeron_rpc::LinkCache>) {
+    pub fn set_links(&self, links: Arc<clyra_rpc::LinkCache>) {
         self.doc_host.set_links(links.clone());
         *self
             .links
@@ -377,7 +393,7 @@ impl EngineCore {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(links);
     }
 
-    pub fn links(&self) -> Option<Arc<zeron_rpc::LinkCache>> {
+    pub fn links(&self) -> Option<Arc<clyra_rpc::LinkCache>> {
         self.links
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -392,14 +408,14 @@ impl EngineCore {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
     }
 
-    pub fn set_updater(&self, updater: zeron_update::Updater) {
+    pub fn set_updater(&self, updater: clyra_update::Updater) {
         *self
             .updater
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(updater);
     }
 
-    pub fn updater(&self) -> Option<zeron_update::Updater> {
+    pub fn updater(&self) -> Option<clyra_update::Updater> {
         self.updater
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -411,7 +427,7 @@ impl EngineCore {
     pub async fn dial_device(
         &self,
         device_id: &str,
-    ) -> Result<Arc<zeron_rpc::RpcClient>, EngineError> {
+    ) -> Result<Arc<clyra_rpc::RpcClient>, EngineError> {
         let links = self
             .links()
             .ok_or_else(|| EngineError::Other("peer links unavailable (offline)".into()))?;
@@ -424,12 +440,12 @@ impl EngineCore {
     /// Start hosting our device room: serve the full RPC surface to relay clients and
     /// warm-open chat docs on nudges (§7 cold-chat command delivery). The token source
     /// re-reads auth on every (re)dial, so token refreshes take effect at reconnect.
-    pub fn start_host_relay(&self, edge_url: &str) -> zeron_rpc::HostRelay {
+    pub fn start_host_relay(&self, edge_url: &str) -> clyra_rpc::HostRelay {
         let auth = self.auth();
         let config =
-            zeron_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
+            clyra_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
         let doc_host = self.doc_host.clone();
-        let on_nudge: zeron_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
+        let on_nudge: clyra_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
             // Opening the doc joins its room + syncs; drain fires on the change
             // subscription — the command executes with no standing per-chat socket.
             match doc_host.open(&chat_id) {
@@ -439,7 +455,7 @@ impl EngineCore {
                 }
             }
         });
-        zeron_rpc::HostRelay::spawn(config, self.rpc_service(), on_nudge)
+        clyra_rpc::HostRelay::spawn(config, self.rpc_service(), on_nudge)
     }
 
     pub fn rpc_service(&self) -> Arc<EngineRpc> {
@@ -452,6 +468,7 @@ impl EngineCore {
             self.workspace_files.clone(),
             self.terminals.clone(),
             self.project_actions.clone(),
+            self.automations.clone(),
             self.change_requests.clone(),
             self.diff_sync.clone(),
             self.uploads.clone(),
@@ -520,6 +537,9 @@ impl EngineCore {
         self.diff_sync.shutdown().await;
         self.workspace_files.shutdown().await;
         self.spaces_sync.shutdown().await;
+        // Before the doc host retires: the loop queues runs through it, and a
+        // teardown order that reversed these would drop a due automation.
+        self.automations.shutdown().await;
         self.doc_host.shutdown_workers().await;
         self.doc_host.flush_all();
         self.workspace.shutdown();
@@ -538,10 +558,10 @@ pub struct Engine {
 /// in-process engine so their production authentication paths cannot diverge.
 pub struct EngineRuntime {
     core: EngineCore,
-    host_relay: std::sync::Mutex<Option<zeron_rpc::HostRelay>>,
+    host_relay: std::sync::Mutex<Option<clyra_rpc::HostRelay>>,
 }
 
-/// IPC-only lifecycle control owned by `zeron headless`. The regular
+/// IPC-only lifecycle control owned by `clyra headless`. The regular
 /// [`EngineRpc`] deliberately does not expose this method, so a viewport
 /// attached to another headed process cannot shut down that process's engine.
 struct HeadlessRpc {
@@ -613,13 +633,15 @@ impl Engine {
     pub async fn build_auth(config: &EngineConfig) -> Auth {
         let mut auth_config = AuthConfig::new(config.edge_url.clone(), config.data_dir.clone());
         auth_config.workos_client_id = config.workos_client_id.clone();
-        if let Ok(base) = std::env::var("ZERON_WORKOS_API_BASE")
+        if let Ok(base) = std::env::var("CLYRA_WORKOS_API_BASE")
+            .or_else(|_| std::env::var("ZERON_WORKOS_API_BASE"))
             && !base.trim().is_empty()
         {
             auth_config.workos_api_base = base;
         }
         auth_config.callback_port = Some(
-            std::env::var("ZERON_CALLBACK_PORT")
+            std::env::var("CLYRA_CALLBACK_PORT")
+                .or_else(|_| std::env::var("ZERON_CALLBACK_PORT"))
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(27641),
@@ -698,8 +720,8 @@ impl Engine {
         Ok(EngineInfo {
             device_id: load_or_create_device_id(&config.data_dir)?,
             workspace_scope,
-            cursor_sdk_version: Some(zeron_harness::CursorHarness::sdk_version().into()),
-            capabilities: zeron_proto::capabilities::current(),
+            cursor_sdk_version: Some(clyra_harness::CursorHarness::sdk_version().into()),
+            capabilities: clyra_proto::capabilities::current(),
         })
     }
 
@@ -761,7 +783,7 @@ impl Engine {
             // path returns every parked reconnect backoff redials, and while
             // the OS says there is no path the dial loops park instead of
             // burning attempts. No-op on platforms without a monitor.
-            zeron_sync::net_path::spawn_path_monitor();
+            clyra_sync::net_path::spawn_path_monitor();
         }
         let device_id = load_or_create_device_id(profile.device_root())?;
         let edge = edge_enabled.then(|| {
@@ -784,6 +806,7 @@ impl Engine {
                 edge.clone(),
             )?,
         };
+        core.sessions.set_mcp_port(config.ipc_port);
         core.set_auth(auth.clone());
         let preview_workspace = core.workspace.clone();
         let preview_device = core.device_id.clone();
@@ -796,7 +819,7 @@ impl Engine {
                 .filter_map(|chat| chat.cwd.map(std::path::PathBuf::from))
                 .collect()
         });
-        let preview_signaling = edge_enabled.then(|| zeron_preview::signaling::Config {
+        let preview_signaling = edge_enabled.then(|| clyra_preview::signaling::Config {
             edge_url: config.edge_url.clone(),
             org_id: preview_org,
             tokens: Arc::new(auth.clone()),
@@ -808,19 +831,19 @@ impl Engine {
         #[cfg(windows)]
         let check_updates = check_updates
             || matches!(
-                zeron_update::detect_install(),
-                zeron_update::InstallKind::WindowsPortable { .. }
+                clyra_update::detect_install(),
+                clyra_update::InstallKind::WindowsPortable { .. }
             );
         if check_updates {
             // Release checker: polls {edge}/releases on a 6h cadence; headless
             // installs with ZERON_AUTO_UPDATE=1 apply + restart themselves — gated
             // on quiescence so a restart never lands under a live run or open PTY.
-            let quiescent: zeron_update::QuiescentCheck = {
+            let quiescent: clyra_update::QuiescentCheck = {
                 let sessions = core.sessions.clone();
                 let terminals = core.terminals.clone();
                 Arc::new(move || !sessions.any_active() && !terminals.any_open())
             };
-            let updater = zeron_update::Updater::spawn(config.edge_url.clone(), Some(quiescent));
+            let updater = clyra_update::Updater::spawn(config.edge_url.clone(), Some(quiescent));
             if let Some(mut token_changes) = edge.as_ref().and_then(EdgeConfig::token_changes) {
                 let updater_for_tokens = updater.clone();
                 let wake = tokio::spawn(async move {
@@ -836,11 +859,11 @@ impl Engine {
         // Managed ACP adapters install in the background at boot (agents
         // whose CLI is present but whose adapter isn't yet), so a first chat
         // never waits on — or dies inside — an npm run.
-        zeron_harness::acp::prewarm_managed_adapters();
+        clyra_harness::acp::prewarm_managed_adapters();
 
         let host_relay = edge.as_ref().map(|edge| {
             let mut link_config =
-                zeron_rpc::LinkCacheConfig::new(edge.url.clone(), Arc::new(auth.clone()));
+                clyra_rpc::LinkCacheConfig::new(edge.url.clone(), Arc::new(auth.clone()));
             // Registry-dark dial gate: devices with no recent presence fail
             // fast with zero dials; presence returning un-parks them (the
             // peer-alive hook below clears any cooldown at the same moment).
@@ -848,7 +871,7 @@ impl Engine {
             link_config.liveness = Some(Arc::new(move |device_id: &str| {
                 workspace_for_liveness.peer_liveness(device_id)
             }));
-            let links = zeron_rpc::LinkCache::new(link_config);
+            let links = clyra_rpc::LinkCache::new(link_config);
             let links_for_presence = links.clone();
             core.workspace
                 .set_peer_alive_hook(Arc::new(move |device_id: &str| {
@@ -965,11 +988,11 @@ async fn shutdown_signal() -> std::io::Result<()> {
 /// port, not who can reach it.
 pub async fn serve_ipc(
     port: u16,
-    service: std::sync::Arc<dyn zeron_rpc::RpcService>,
+    service: std::sync::Arc<dyn clyra_rpc::RpcService>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     tracing::info!(port, "IPC server listening");
-    Ok(tokio::spawn(zeron_rpc::serve_ws_listener(
+    Ok(tokio::spawn(clyra_rpc::serve_ws_listener(
         listener, service,
     )))
 }
@@ -978,7 +1001,7 @@ pub async fn serve_ipc(
 /// headless (paste-code) sign-in URL, read the pasted `state.code` from stdin, and
 /// run workspace onboarding (create / auto-join / numbered picker). Off a TTY this
 /// errors immediately — a daemon under systemd/launchd must load the session that
-/// `zeron login` persisted, never wait on a prompt nobody can see.
+/// `clyra login` persisted, never wait on a prompt nobody can see.
 pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
     use std::io::IsTerminal;
     let interactive = std::io::stdin().is_terminal();
@@ -998,12 +1021,12 @@ pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
                     // No reader tasks have been spawned on this path (both spawns
                     // are TTY-gated), so an early return leaks nothing.
                     return Err(EngineError::Other(format!(
-                        "signed in as {} but no workspace is selected — run `zeron login` on this machine to pick one",
+                        "signed in as {} but no workspace is selected — run `clyra login` on this machine to pick one",
                         user.email
                     )));
                 }
                 if org_reader.is_none() {
-                    // Workspace onboarding on the TTY (old zeron's
+                    // Workspace onboarding on the TTY (old clyra's
                     // `backend login` flow): create if none, auto-join a
                     // single membership, numbered picker otherwise.
                     println!("Signed in as {}.", user.email);
@@ -1013,12 +1036,12 @@ pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
             AuthState::SignedOut => {
                 if !interactive {
                     return Err(EngineError::Other(
-                        "not signed in — run `zeron login` on this machine first".into(),
+                        "not signed in — run `clyra login` on this machine first".into(),
                     ));
                 }
                 if stdin_reader.is_none() {
                     let url = auth.start_headless_sign_in();
-                    println!("Sign in to Zeron:\n\n  {url}\n");
+                    println!("Sign in to Clyra:\n\n  {url}\n");
                     println!("Then paste the code shown in the browser here and press enter.");
                     let auth = auth.clone();
                     stdin_reader = Some(tokio::spawn(async move {
@@ -1066,7 +1089,7 @@ async fn read_stdin_line() -> Option<String> {
     .flatten()
 }
 
-/// TTY workspace onboarding for an org-less session (ports old zeron's
+/// TTY workspace onboarding for an org-less session (ports old clyra's
 /// `backend login` flow): no memberships → prompt a name and create; exactly
 /// one → auto-join; several → numbered picker. Success flips the auth state to
 /// `SignedIn`, which ends [`wait_for_sign_in`]'s wait (and aborts this task).
@@ -1075,7 +1098,7 @@ async fn run_org_onboarding(auth: Auth) {
         Ok(orgs) => orgs,
         Err(err) => {
             println!(
-                "Could not list workspaces ({err}) — create or select one from the Zeron UI to continue."
+                "Could not list workspaces ({err}) — create or select one from the Clyra UI to continue."
             );
             return;
         }
@@ -1137,7 +1160,9 @@ async fn run_org_onboarding(auth: Auth) {
 fn local_device_name(device_id: &str) -> String {
     select_local_device_name(
         [
-            std::env::var("ZERON_DEVICE_NAME").ok(),
+            std::env::var("CLYRA_DEVICE_NAME")
+                .or_else(|_| std::env::var("ZERON_DEVICE_NAME"))
+                .ok(),
             native_friendly_device_name(),
             std::env::var("HOSTNAME").ok(),
             gethostname::gethostname().into_string().ok(),

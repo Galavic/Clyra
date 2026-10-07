@@ -402,7 +402,7 @@ async fn repeated_startup_failures_retain_all_user_messages_without_nesting_or_d
     let store =
         std::fs::read_to_string(fixture.dir.path().join("state/by-agent/agent-fixture")).unwrap();
     let receipt: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(std::path::Path::new(store.trim()).join(".zeron-user-receipt.json"))
+        &std::fs::read(std::path::Path::new(store.trim()).join(".clyra-user-receipt.json"))
             .unwrap(),
     )
     .unwrap();
@@ -428,7 +428,7 @@ async fn corrupt_interrupted_receipt_fails_before_sending_a_contextless_prompt()
     let store =
         std::fs::read_to_string(fixture.dir.path().join("state/by-agent/agent-fixture")).unwrap();
     let root = std::path::Path::new(store.trim());
-    std::fs::write(root.join(".zeron-user-receipt.json"), "{\"version\":999}").unwrap();
+    std::fs::write(root.join(".clyra-user-receipt.json"), "{\"version\":999}").unwrap();
     let (mut child, stdin, mut lines) = fixture.start("must not send", true).await;
     let error = frame(&mut lines).await;
     assert_eq!(error["status"], "error");

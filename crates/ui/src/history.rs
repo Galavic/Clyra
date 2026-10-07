@@ -11,17 +11,17 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use chrono::DateTime;
+use clyra_engine::repos::git_history_matches;
+use clyra_proto::{
+    GitHistoryCommit, GitHistoryComparison, GitHistoryPage, GitHistoryRef, GitHistoryRefKind,
+};
+use clyra_rpc::methods;
 use gpui::{
     AnyElement, App, ClipboardItem, Context, Entity, EventEmitter, Focusable as _, Image,
     ImageFormat, ListAlignment, ListOffset, ListState, ObjectFit, PathBuilder, Pixels, Render,
     SharedString, Subscription, Task, Window, canvas, container_query, div, img, list, point,
     prelude::*, px,
 };
-use zeron_engine::repos::git_history_matches;
-use zeron_proto::{
-    GitHistoryCommit, GitHistoryComparison, GitHistoryPage, GitHistoryRef, GitHistoryRefKind,
-};
-use zeron_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::motion::AnimationExt;
@@ -2501,7 +2501,7 @@ impl GitHistory {
                 history.search_loading = false;
                 match result.and_then(|value| {
                     serde_json::from_value::<GitHistoryPage>(value)
-                        .map_err(|error| zeron_rpc::RpcError::Failed(error.to_string()))
+                        .map_err(|error| clyra_rpc::RpcError::Failed(error.to_string()))
                 }) {
                     Ok(page) => {
                         let anchor = history.current_scroll_anchor();
@@ -2611,7 +2611,7 @@ impl GitHistory {
                 }
                 if let Ok(avatars) = result.and_then(|value| {
                     serde_json::from_value::<HashMap<String, String>>(value)
-                        .map_err(|error| zeron_rpc::RpcError::Failed(error.to_string()))
+                        .map_err(|error| clyra_rpc::RpcError::Failed(error.to_string()))
                 }) {
                     history.avatar_images.extend(avatars.into_iter().filter_map(
                         |(email, encoded)| {
@@ -2675,7 +2675,7 @@ impl GitHistory {
                 history.loading = false;
                 match result.and_then(|value| {
                     serde_json::from_value::<GitHistoryPage>(value)
-                        .map_err(|error| zeron_rpc::RpcError::Failed(error.to_string()))
+                        .map_err(|error| clyra_rpc::RpcError::Failed(error.to_string()))
                 }) {
                     Ok(page) => {
                         let restart_search = (reset && history.search_active())
@@ -4266,7 +4266,7 @@ impl Render for GitHistory {
                 .items_center()
                 .justify_center()
                 .gap(px(8.0))
-                .child(crate::loaders::gradient_spinner(
+                .child(crate::loaders::dotm_helix(
                     "history-loading",
                     &theme,
                     3.0,

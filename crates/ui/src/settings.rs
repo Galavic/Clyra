@@ -1,5 +1,5 @@
 //! UI settings persisted to a small JSON file in the data dir — pane widths and
-//! collapse flags (zeron persisted the same set in localStorage).
+//! collapse flags (clyra persisted the same set in localStorage).
 //!
 //! Loaded once at boot and then owned by [`SettingsStore`], the only production
 //! writer. Frequent geometry changes are debounced; durable choices flush
@@ -12,11 +12,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use clyra_proto::{AuthState, WorkspaceScope};
 use gpui::{App, Global, Task};
 use serde::{Deserialize, Serialize};
-use zeron_proto::{AuthState, WorkspaceScope};
 
 pub mod accounts;
+pub mod analytics;
 pub mod appearance;
 pub mod archived;
 pub mod composer;
@@ -60,12 +61,14 @@ pub const FILES_AUTOSAVE_DELAY_MIN_MS: u64 = 100;
 pub const FILES_AUTOSAVE_DELAY_MAX_MS: u64 = 10_000;
 
 const FILE_NAME: &str = "ui-settings.json";
+/// Settings format / value-migration revision. See [`UiSettings::version`].
+const SETTINGS_VERSION: u32 = 1;
 const NEW_THREAD_BACKGROUND_DIR: &str = "new-thread-backgrounds";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewThreadComposerBackground {
-    /// Managed copy inside Zeron's device-local data directory.
+    /// Managed copy inside Clyra's device-local data directory.
     pub path: String,
     /// Original file name shown in Appearance settings.
     pub name: String,
@@ -238,6 +241,95 @@ pub fn set_transcript_width(width: f32, cx: &mut App) {
     }
 }
 
+pub const CHROME_OPACITY_MIN: f32 = 0.0;
+pub const CHROME_OPACITY_MAX: f32 = 1.0;
+pub const CHROME_OPACITY_STEP: f32 = 0.05;
+/// Authored coverage per surface: sidebar reproduces the frost depth, chat
+/// reproduces the translucent panel exactly, composer its plate at the same
+/// depth. 0% is all glass, 100% fully solid on every slider.
+/// Sidebar default reproduces the authored frost depth (glass alpha); 1.0 is
+/// fully solid. Chat defaults to the authored panel; composer to its plate.
+pub const SIDEBAR_OPACITY_DEFAULT: f32 = 0.8;
+pub const CHAT_OPACITY_DEFAULT: f32 = 0.4;
+pub const COMPOSER_OPACITY_DEFAULT: f32 = 0.4;
+
+fn default_panel_opacity() -> f32 {
+    CHAT_OPACITY_DEFAULT
+}
+
+fn default_sidebar_opacity() -> f32 {
+    SIDEBAR_OPACITY_DEFAULT
+}
+
+pub fn normalize_sidebar_opacity(value: f32) -> f32 {
+    clamp_or(
+        value,
+        CHROME_OPACITY_MIN,
+        CHROME_OPACITY_MAX,
+        SIDEBAR_OPACITY_DEFAULT,
+    )
+}
+
+pub fn normalize_chat_opacity(value: f32) -> f32 {
+    clamp_or(
+        value,
+        CHROME_OPACITY_MIN,
+        CHROME_OPACITY_MAX,
+        CHAT_OPACITY_DEFAULT,
+    )
+}
+
+pub fn normalize_composer_opacity(value: f32) -> f32 {
+    clamp_or(
+        value,
+        CHROME_OPACITY_MIN,
+        CHROME_OPACITY_MAX,
+        COMPOSER_OPACITY_DEFAULT,
+    )
+}
+
+pub fn sidebar_opacity(cx: &App) -> f32 {
+    cx.try_global::<SettingsStore>()
+        .map(|store| store.current.sidebar_opacity)
+        .unwrap_or(SIDEBAR_OPACITY_DEFAULT)
+}
+
+pub fn chat_opacity(cx: &App) -> f32 {
+    cx.try_global::<SettingsStore>()
+        .map(|store| store.current.chat_opacity)
+        .unwrap_or(CHAT_OPACITY_DEFAULT)
+}
+
+pub fn set_sidebar_opacity(value: f32, cx: &mut App) {
+    if update(SavePolicy::Debounced, cx, |settings| {
+        settings.sidebar_opacity = normalize_sidebar_opacity(value);
+    }) {
+        cx.refresh_windows();
+    }
+}
+
+pub fn set_chat_opacity(value: f32, cx: &mut App) {
+    if update(SavePolicy::Debounced, cx, |settings| {
+        settings.chat_opacity = normalize_chat_opacity(value);
+    }) {
+        cx.refresh_windows();
+    }
+}
+
+pub fn composer_opacity(cx: &App) -> f32 {
+    cx.try_global::<SettingsStore>()
+        .map(|store| store.current.composer_opacity)
+        .unwrap_or(COMPOSER_OPACITY_DEFAULT)
+}
+
+pub fn set_composer_opacity(value: f32, cx: &mut App) {
+    if update(SavePolicy::Debounced, cx, |settings| {
+        settings.composer_opacity = normalize_composer_opacity(value);
+    }) {
+        cx.refresh_windows();
+    }
+}
+
 /// Whether a settings mutation should wait for the normal coalescing window or
 /// reach disk before returning to the event loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,7 +400,7 @@ pub fn current(cx: &App) -> UiSettings {
         .unwrap_or_default()
 }
 
-/// Copy a selected image into Zeron's device-local data directory and make it
+/// Copy a selected image into Clyra's device-local data directory and make it
 /// the new-thread canvas background. A unique file name avoids stale image
 /// caches when the background is replaced.
 pub fn install_new_thread_composer_background(source: &Path, cx: &mut App) -> Result<(), String> {
@@ -321,7 +413,7 @@ pub fn install_new_thread_composer_background(source: &Path, cx: &mut App) -> Re
     let data_dir = cx
         .try_global::<SettingsStore>()
         .map(|store| store.data_dir.clone())
-        .ok_or_else(|| "Unable to save the image. Restart Zeron and try again.".to_string())?;
+        .ok_or_else(|| "Unable to save the image. Restart Clyra and try again.".to_string())?;
     let backgrounds_dir = data_dir.join(NEW_THREAD_BACKGROUND_DIR);
     std::fs::create_dir_all(&backgrounds_dir).map_err(|_| {
         "Unable to save the image. Check folder permissions and try again.".to_string()
@@ -374,7 +466,7 @@ pub fn remove_new_thread_composer_background(cx: &mut App) -> Result<(), String>
     let data_dir = cx
         .try_global::<SettingsStore>()
         .map(|store| store.data_dir.clone())
-        .ok_or_else(|| "Unable to remove the image. Restart Zeron and try again.".to_string())?;
+        .ok_or_else(|| "Unable to remove the image. Restart Clyra and try again.".to_string())?;
     let mut next = current(cx);
     let previous = next.new_thread_composer_background.take();
     if previous.is_none() {
@@ -634,8 +726,8 @@ pub struct SkillCompletionSettings {
 }
 
 impl SkillCompletionSettings {
-    pub fn for_harness(harness: zeron_proto::HarnessId) -> Self {
-        let native_dollar = harness == zeron_proto::HarnessId::Codex;
+    pub fn for_harness(harness: clyra_proto::HarnessId) -> Self {
+        let native_dollar = harness == clyra_proto::HarnessId::Codex;
         Self {
             dollar: native_dollar,
             separate_from_slash: native_dollar,
@@ -643,21 +735,32 @@ impl SkillCompletionSettings {
     }
 }
 
-pub const SKILL_COMPLETION_HARNESSES: [(zeron_proto::HarnessId, &str); 9] = [
-    (zeron_proto::HarnessId::Antigravity, "Antigravity"),
-    (zeron_proto::HarnessId::ClaudeCode, "Claude Code"),
-    (zeron_proto::HarnessId::Codex, "Codex"),
-    (zeron_proto::HarnessId::Cursor, "Cursor"),
-    (zeron_proto::HarnessId::Devin, "Devin"),
-    (zeron_proto::HarnessId::Grok, "Grok"),
-    (zeron_proto::HarnessId::Hermes, "Hermes"),
-    (zeron_proto::HarnessId::Pi, "Pi"),
-    (zeron_proto::HarnessId::Opencode, "OpenCode"),
+pub const SKILL_COMPLETION_HARNESSES: [(clyra_proto::HarnessId, &str); 9] = [
+    (clyra_proto::HarnessId::Antigravity, "Antigravity"),
+    (clyra_proto::HarnessId::ClaudeCode, "Claude Code"),
+    (clyra_proto::HarnessId::Codex, "Codex"),
+    (clyra_proto::HarnessId::Cursor, "Cursor"),
+    (clyra_proto::HarnessId::Devin, "Devin"),
+    (clyra_proto::HarnessId::Grok, "Grok"),
+    (clyra_proto::HarnessId::Hermes, "Hermes"),
+    (clyra_proto::HarnessId::Pi, "Pi"),
+    (clyra_proto::HarnessId::Opencode, "OpenCode"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
+    /// Bumped when a change has to REACH profiles that already exist on disk.
+    /// A fresh profile starts at the current version, with the defaults already
+    /// reflecting it; an older file runs the value migrations that shipped with
+    /// the bump, once. Renamed fields keep using the `legacy_*` shadows below —
+    /// this is for defaults that move under people who never chose them.
+    ///
+    /// Field-level `default` (0), NOT the container's: an ABSENT version is
+    /// exactly the signal that the file predates versioning, and the container
+    /// default would stamp today's version onto it and skip every migration.
+    #[serde(default)]
+    pub version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_geometry: Option<WindowGeometry>,
     /// Submit using Enter or the platform modifier plus Enter.
@@ -665,7 +768,7 @@ pub struct UiSettings {
     /// Legacy global opt-in; per-harness preferences take precedence.
     pub skills_in_slash_menu: bool,
     pub skill_completion_by_harness:
-        std::collections::HashMap<zeron_proto::HarnessId, SkillCompletionSettings>,
+        std::collections::HashMap<clyra_proto::HarnessId, SkillCompletionSettings>,
     pub sidebar_width: f32,
     pub sidebar_collapsed: bool,
     /// Legacy: the grouped-by-project toggle predates spaces (which group by
@@ -726,13 +829,13 @@ pub struct UiSettings {
     /// Desktop banner notifications on the same transitions.
     /// `ZERON_DISABLE_NOTIFICATIONS` overrides.
     pub notifications_enabled: bool,
-    /// Suppress the banner while a Zeron window is focused (the chime covers
+    /// Suppress the banner while a Clyra window is focused (the chime covers
     /// the foreground case).
     pub notifications_background_only: bool,
     pub files_panel_width: f32,
     pub right_pane_width: f32,
     /// Legacy: panel *open* flags are session-scoped in-memory state now
-    /// (`shell::SessionPanels`, zeron `sessionPanels` parity). Kept for file
+    /// (`shell::SessionPanels`, clyra `sessionPanels` parity). Kept for file
     /// compatibility; no longer read or written by the shell.
     pub right_pane_open: bool,
     pub terminal_height: f32,
@@ -773,7 +876,7 @@ pub struct UiSettings {
     pub code_font_family: crate::typography::UiFontFamily,
     pub code_font_size: f32,
     /// Independently selected light and dark theme variants.
-    pub theme_selection: zeron_theme::ThemeSelection,
+    pub theme_selection: clyra_theme::ThemeSelection,
     /// Changes pane: side-by-side diffs instead of the unified stack.
     pub diff_split: bool,
     /// Changes pane: wrap long source lines instead of scrolling horizontally.
@@ -785,7 +888,7 @@ pub struct UiSettings {
     pub transcript_width: f32,
     /// Open a normal web-link activation in the session Browser. Explicit
     /// context-menu actions remain available regardless of this preference.
-    pub open_web_links_in_zeron: bool,
+    pub open_web_links_in_clyra: bool,
     /// Compact transcript: a turn's working steps (thinking, tool calls, and
     /// the narration between them) fold into one collapsed accordion, so only
     /// the reply text stays visible.
@@ -799,9 +902,21 @@ pub struct UiSettings {
     /// Include hidden and ignored entries in workspace file trees.
     pub files_show_all: bool,
     /// Interactive identity overlay; imported themes default to their own accent.
-    pub accent: zeron_theme::AccentSelection,
+    pub accent: clyra_theme::AccentSelection,
     /// Glass policy, independent from the selected appearance, theme, and accent.
-    pub surface: zeron_theme::SurfacePreference,
+    pub surface: clyra_theme::SurfacePreference,
+    /// Sidebar + titlebar chrome coverage (0 = glass only, 1 = fully solid).
+    /// Device-local. Defaults to the authored frost depth.
+    #[serde(default = "default_sidebar_opacity")]
+    pub sidebar_opacity: f32,
+    /// Chat panel coverage (0 = window glass only, 1 = fully solid).
+    /// Device-local. Defaults to the authored panel.
+    #[serde(default = "default_panel_opacity")]
+    pub chat_opacity: f32,
+    /// Composer pill coverage (0 = window glass only, 1 = fully solid).
+    /// Device-local.
+    #[serde(default = "default_panel_opacity")]
+    pub composer_opacity: f32,
     /// Optional device-local artwork behind the blank new-thread composer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_thread_composer_background: Option<NewThreadComposerBackground>,
@@ -811,11 +926,16 @@ pub struct UiSettings {
     /// [`Self::accent`], and never write it again.
     #[serde(default, rename = "accentColor", skip_serializing)]
     legacy_accent_color: Option<crate::theme::AccentColor>,
+    /// Pre-rebrand settings used `openWebLinksInZeron`. Read it once,
+    /// migrate to [`Self::open_web_links_in_clyra`], never write it again.
+    #[serde(default, rename = "openWebLinksInZeron", skip_serializing)]
+    legacy_open_web_links_in_zeron: Option<bool>,
 }
 
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
+            version: SETTINGS_VERSION,
             window_geometry: None,
             sidebar_width: SIDEBAR_DEFAULT,
             sidebar_collapsed: false,
@@ -823,7 +943,11 @@ impl Default for UiSettings {
             sidebar_organization: SidebarOrganization::InOneList,
             sidebar_sort: SidebarSort::LastUpdated,
             sidebar_show_project_label: true,
-            sidebar_compact: true,
+            // The three-line session card is what a row is FOR: the agent and
+            // its model, the title, then the branch. Compact remains a density
+            // option for people who want a chat list they can scan by title
+            // alone, but it is no longer what the app ships (user request).
+            sidebar_compact: false,
             sidebar_show_project_icon: true,
             sidebar_show_harness: true,
             sidebar_show_branch: true,
@@ -866,22 +990,26 @@ impl Default for UiSettings {
             terminal_font_size: crate::typography::TERMINAL_FONT_SIZE_DEFAULT,
             code_font_family: crate::typography::UiFontFamily::GeistMono,
             code_font_size: crate::typography::CODE_FONT_SIZE_DEFAULT,
-            theme_selection: zeron_theme::ThemeSelection::default(),
+            theme_selection: clyra_theme::ThemeSelection::default(),
             diff_split: false,
             diff_wrap: false,
             code_fences_fit_content: false,
             transcript_width: TRANSCRIPT_WIDTH_DEFAULT,
-            open_web_links_in_zeron: true,
+            open_web_links_in_clyra: true,
             transcript_compact_mode: false,
             files_autosave_enabled: false,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
             files_show_all: false,
-            accent: zeron_theme::AccentSelection::default(),
-            surface: zeron_theme::SurfacePreference::default(),
+            accent: clyra_theme::AccentSelection::default(),
+            surface: clyra_theme::SurfacePreference::default(),
+            sidebar_opacity: SIDEBAR_OPACITY_DEFAULT,
+            chat_opacity: CHAT_OPACITY_DEFAULT,
+            composer_opacity: COMPOSER_OPACITY_DEFAULT,
             new_thread_composer_background: None,
             new_thread_background_effect: NewThreadBackgroundEffect::None,
             legacy_accent_color: None,
+            legacy_open_web_links_in_zeron: None,
         }
     }
 }
@@ -961,7 +1089,7 @@ impl ShortcutId {
         self != Self::CaptureAppshot || crate::appshots::is_desktop()
     }
 
-    /// Row label (zeron lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
+    /// Row label (clyra lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
     pub fn label(self) -> &'static str {
         match self {
             ShortcutId::CaptureAppshot => "Capture Appshot",
@@ -1093,7 +1221,7 @@ pub fn sidebar_pin_profile_key(
             }
             let org_id = token_org_id
                 .or(development_org_id.filter(|org_id| !org_id.is_empty()))
-                .unwrap_or(zeron_engine::DEFAULT_ORG_ID);
+                .unwrap_or(clyra_engine::DEFAULT_ORG_ID);
             Some(format!("development:{org_id}:{user_id}"))
         }
     }
@@ -1387,7 +1515,7 @@ impl UiSettings {
             .or_default()
     }
 
-    pub fn skill_completion(&self, harness: zeron_proto::HarnessId) -> SkillCompletionSettings {
+    pub fn skill_completion(&self, harness: clyra_proto::HarnessId) -> SkillCompletionSettings {
         self.skill_completion_by_harness
             .get(&harness)
             .copied()
@@ -1414,6 +1542,9 @@ impl UiSettings {
     /// Clamp widths into their legal ranges (also heals NaN to defaults).
     pub fn clamped(mut self) -> Self {
         self.transcript_width = normalize_transcript_width(self.transcript_width);
+        self.sidebar_opacity = normalize_sidebar_opacity(self.sidebar_opacity);
+        self.chat_opacity = normalize_chat_opacity(self.chat_opacity);
+        self.composer_opacity = normalize_composer_opacity(self.composer_opacity);
         self.window_geometry = self.window_geometry.filter(|geometry| geometry.is_valid());
         self.sidebar_width = clamp_or(
             self.sidebar_width,
@@ -1578,12 +1709,25 @@ impl UiSettings {
     }
 
     fn migrated(mut self) -> Self {
-        if self.accent == zeron_theme::AccentSelection::ThemeDefault
+        if self.version < 1 {
+            // The session card became the shipped sidebar row: agent + model,
+            // then the title, then the branch. Every profile written before
+            // this was on the old one-line default, so there is no density
+            // preference to preserve — the card is what they get, and the
+            // compact row stays one click away in the view menu.
+            self.sidebar_compact = false;
+        }
+        self.version = SETTINGS_VERSION;
+        if self.accent == clyra_theme::AccentSelection::ThemeDefault
             && let Some(accent) = self.legacy_accent_color.take()
         {
-            self.accent = zeron_theme::AccentSelection::Preset(accent.into());
+            self.accent = clyra_theme::AccentSelection::Preset(accent.into());
         }
         self.legacy_accent_color = None;
+        if let Some(open) = self.legacy_open_web_links_in_zeron.take() {
+            self.open_web_links_in_clyra = open;
+        }
+        self.legacy_open_web_links_in_zeron = None;
         self
     }
 
@@ -1608,7 +1752,7 @@ fn min_or(value: f32, min: f32, default: f32) -> f32 {
     }
 }
 
-pub use zeron_proto::SidebarSection;
+pub use clyra_proto::SidebarSection;
 
 #[cfg(test)]
 mod tests {
@@ -1616,7 +1760,7 @@ mod tests {
 
     #[test]
     fn skill_completion_defaults_overrides_and_persistence_are_per_harness() {
-        use zeron_proto::HarnessId;
+        use clyra_proto::HarnessId;
         let dir = tempfile::tempdir().unwrap();
         let mut settings = UiSettings::default();
         for (harness, _) in SKILL_COMPLETION_HARNESSES {
@@ -1677,7 +1821,7 @@ mod tests {
 
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.composer_send_behavior, ComposerSendBehavior::Enter);
-        assert!(loaded.open_web_links_in_zeron);
+        assert!(loaded.open_web_links_in_clyra);
         assert!(loaded.new_thread_composer_background.is_none());
         assert_eq!(
             loaded.new_thread_background_effect,
@@ -2142,6 +2286,7 @@ mod tests {
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let settings = UiSettings {
+            version: SETTINGS_VERSION,
             window_geometry: None,
             sidebar_width: 300.0,
             sidebar_collapsed: true,
@@ -2225,7 +2370,7 @@ mod tests {
             git_history_author_display: GitHistoryAuthorDisplay::Name,
             ui_font_family: crate::typography::UiFontFamily::Installed("Arial".into()),
             ui_font_size: crate::typography::UiFontSize::ALL[5],
-            theme_selection: zeron_theme::ThemeSelection {
+            theme_selection: clyra_theme::ThemeSelection {
                 light: "catppuccin-latte".into(),
                 dark: "catppuccin-mocha".into(),
             },
@@ -2233,7 +2378,7 @@ mod tests {
             diff_wrap: true,
             code_fences_fit_content: true,
             transcript_width: 960.0,
-            open_web_links_in_zeron: false,
+            open_web_links_in_clyra: false,
             transcript_compact_mode: true,
             files_autosave_enabled: true,
             files_autosave_delay_ms: 1_500,
@@ -2243,26 +2388,33 @@ mod tests {
             code_font_family: crate::typography::UiFontFamily::Geist,
             code_font_size: 11.0,
             files_show_all: true,
-            accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
-            surface: zeron_theme::SurfacePreference::Frosted,
+            accent: clyra_theme::AccentSelection::Preset(clyra_theme::AccentPreset::Cyan),
+            surface: clyra_theme::SurfacePreference::Frosted,
+            sidebar_opacity: 0.4,
+            chat_opacity: 0.75,
+            composer_opacity: 0.3,
             new_thread_composer_background: Some(NewThreadComposerBackground {
-                path: "/tmp/zeron/new-thread-background.png".into(),
+                path: "/tmp/clyra/new-thread-background.png".into(),
                 name: "background.png".into(),
             }),
             new_thread_background_effect: NewThreadBackgroundEffect::Ascii,
             legacy_accent_color: None,
+            legacy_open_web_links_in_zeron: None,
         };
         settings.save(dir.path()).unwrap();
         let json = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
         assert!(json.contains(r#""diffWrap": true"#));
         assert_eq!(UiSettings::load(dir.path()), settings);
         assert!(json.contains(r#""codeFencesFitContent": true"#));
-        assert!(json.contains(r#""openWebLinksInZeron": false"#));
+        assert!(json.contains(r#""openWebLinksInClyra": false"#));
         assert!(json.contains(r#""newThreadBackgroundEffect": "ascii""#));
         assert!(json.contains(r#""terminalFontFamily": "installed:Menlo""#));
         assert!(json.contains(r#""terminalFontSize": 15.0"#));
         assert!(json.contains(r#""codeFontFamily": "geist""#));
         assert!(json.contains(r#""codeFontSize": 11.0"#));
+        assert!(json.contains(r#""sidebarOpacity": 0.4"#));
+        assert!(json.contains(r#""chatOpacity": 0.75"#));
+        assert!(json.contains(r#""composerOpacity": 0.3"#));
     }
 
     #[test]
@@ -2350,11 +2502,12 @@ mod tests {
     #[test]
     fn sidebar_display_defaults_and_preferences_round_trip() {
         let settings: UiSettings = serde_json::from_str("{}").unwrap();
-        assert!(settings.sidebar_compact);
+        // The three-line card ships; compact is opt-in density.
+        assert!(!settings.sidebar_compact);
         assert!(settings.sidebar_show_project_icon);
         assert!(settings.sidebar_show_project_label);
         let customized = UiSettings {
-            sidebar_compact: false,
+            sidebar_compact: true,
             sidebar_show_project_icon: false,
             sidebar_show_project_label: false,
             sidebar_organization: SidebarOrganization::ByProject,
@@ -2363,6 +2516,27 @@ mod tests {
         let restored: UiSettings =
             serde_json::from_str(&serde_json::to_string(&customized).unwrap()).unwrap();
         assert_eq!(restored.clamped(), customized);
+    }
+
+    #[test]
+    fn an_existing_profile_is_migrated_onto_the_session_card() {
+        // A profile written before the card shipped carries the old one-line
+        // default. Loading it must land on the card, not on the row the user
+        // never asked for.
+        let old: UiSettings =
+            serde_json::from_str(r#"{"sidebarCompact":true,"sidebarShowBranch":false}"#).unwrap();
+        assert!(old.sidebar_compact);
+        let loaded = old.migrated();
+        assert!(!loaded.sidebar_compact, "the card is the shipped row");
+        // Nothing else moves, and the version is stamped so the migration runs
+        // once: a later deliberate choice of compact survives the next load.
+        assert!(!loaded.sidebar_show_branch);
+        assert_eq!(loaded.version, SETTINGS_VERSION);
+        let chosen = UiSettings {
+            sidebar_compact: true,
+            ..loaded
+        };
+        assert!(chosen.migrated().sidebar_compact);
     }
 
     #[test]
@@ -2393,8 +2567,8 @@ mod tests {
         .unwrap();
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::System);
-        assert_eq!(loaded.accent, zeron_theme::AccentSelection::ThemeDefault);
-        assert_eq!(loaded.surface, zeron_theme::SurfacePreference::ThemeDefault);
+        assert_eq!(loaded.accent, clyra_theme::AccentSelection::ThemeDefault);
+        assert_eq!(loaded.surface, clyra_theme::SurfacePreference::ThemeDefault);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(loaded.sidebar_pinned_session_ids_by_profile.is_empty());
         assert!(!loaded.sound_enabled, "other keys still parse");
@@ -2407,6 +2581,10 @@ mod tests {
         );
         assert!(!loaded.files_autosave_enabled);
         assert!(!loaded.files_word_wrap);
+        // Files written before chrome opacity existed heal to the authored depths.
+        assert_eq!(loaded.sidebar_opacity, SIDEBAR_OPACITY_DEFAULT);
+        assert_eq!(loaded.chat_opacity, CHAT_OPACITY_DEFAULT);
+        assert_eq!(loaded.composer_opacity, COMPOSER_OPACITY_DEFAULT);
         assert_eq!(
             loaded.code_font_size,
             crate::typography::CODE_FONT_SIZE_DEFAULT
@@ -2481,11 +2659,27 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(
             loaded.accent,
-            zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan)
+            clyra_theme::AccentSelection::Preset(clyra_theme::AccentPreset::Cyan)
         );
         loaded.save(dir.path()).unwrap();
         let saved = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
         assert!(!saved.contains("accentColor"));
+    }
+
+    #[test]
+    fn legacy_open_links_key_migrates_to_clyra_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"openWebLinksInZeron":false}"#,
+        )
+        .unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert!(!loaded.open_web_links_in_clyra);
+        loaded.save(dir.path()).unwrap();
+        let saved = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
+        assert!(!saved.contains("openWebLinksInZeron"));
+        assert!(saved.contains(r#""openWebLinksInClyra": false"#));
     }
 
     #[test]
@@ -2549,7 +2743,7 @@ mod tests {
 
     fn signed_in(user_id: &str, org_id: Option<&str>) -> AuthState {
         AuthState::SignedIn {
-            user: zeron_proto::UserProfile {
+            user: clyra_proto::UserProfile {
                 id: user_id.to_string(),
                 email: format!("{user_id}@example.com"),
                 name: None,
@@ -2726,6 +2920,55 @@ mod tests {
             .code_font_size,
             crate::typography::CODE_FONT_SIZE_DEFAULT
         );
+        assert_eq!(
+            UiSettings {
+                sidebar_opacity: 5.0,
+                ..Default::default()
+            }
+            .clamped()
+            .sidebar_opacity,
+            CHROME_OPACITY_MAX
+        );
+        assert_eq!(
+            UiSettings {
+                chat_opacity: f32::NAN,
+                ..Default::default()
+            }
+            .clamped()
+            .chat_opacity,
+            CHAT_OPACITY_DEFAULT
+        );
+        assert_eq!(
+            UiSettings {
+                sidebar_opacity: f32::NAN,
+                ..Default::default()
+            }
+            .clamped()
+            .sidebar_opacity,
+            SIDEBAR_OPACITY_DEFAULT
+        );
+        assert_eq!(
+            UiSettings {
+                composer_opacity: 2.0,
+                ..Default::default()
+            }
+            .clamped()
+            .composer_opacity,
+            CHROME_OPACITY_MAX
+        );
+    }
+
+    #[test]
+    fn chrome_opacity_round_trips_through_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarOpacity": 0.4, "chatOpacity": 0.0}"#,
+        )
+        .unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.sidebar_opacity, 0.4);
+        assert_eq!(loaded.chat_opacity, 0.0);
     }
 
     #[test]
@@ -2803,6 +3046,9 @@ mod tests {
         assert_eq!(d.terminal_height, 280.0);
         assert!(!d.sidebar_collapsed && !d.right_pane_open && !d.terminal_open);
         assert!(!d.escape_stops_active_agent);
+        assert_eq!(d.sidebar_opacity, SIDEBAR_OPACITY_DEFAULT);
+        assert_eq!(d.chat_opacity, CHAT_OPACITY_DEFAULT);
+        assert_eq!(d.composer_opacity, COMPOSER_OPACITY_DEFAULT);
     }
 
     #[test]

@@ -23,13 +23,13 @@ use gpui::{
     px,
 };
 
+use clyra_engine::registry::TitleSettings;
+use clyra_engine::registry::{HarnessDescriptor, descriptor_enabled};
 use std::time::Duration;
-use zeron_engine::registry::TitleSettings;
-use zeron_engine::registry::{HarnessDescriptor, descriptor_enabled};
 
-use zeron_proto::Model;
-use zeron_proto::{AgentLoginPoll, AgentLoginStart, AgentLoginStatus, HarnessId};
-use zeron_rpc::methods;
+use clyra_proto::Model;
+use clyra_proto::{AgentLoginPoll, AgentLoginStart, AgentLoginStatus, HarnessId};
+use clyra_rpc::methods;
 
 use crate::pickers::visible_harnesses;
 use crate::popover::{self, Loadable};
@@ -78,7 +78,7 @@ fn install_hint(harness: HarnessId, enabled: bool, can_install: bool) -> String 
     } else {
         format!("Install the {} CLI to enable", cli_name(harness))
     };
-    if !can_install && let Some(command) = zeron_harness::install::manual_command(harness) {
+    if !can_install && let Some(command) = clyra_harness::install::manual_command(harness) {
         format!("{hint}. Install with `{command}`")
     } else {
         hint
@@ -440,7 +440,7 @@ impl HarnessesPage {
                             .filter(|h| {
                                 descriptor_enabled(h)
                                     && h.installed
-                                    && zeron_harness::supports_titles(h.id)
+                                    && clyra_harness::supports_titles(h.id)
                                     && h.id != HarnessId::Mock
                             })
                             .map(|h| {
@@ -1193,7 +1193,7 @@ impl Render for HarnessesPage {
                                     .flex_row()
                                     .items_center()
                                     .justify_between()
-                                    .child(widgets::page_header(&theme, "Agents", None))
+                                    .child(widgets::page_header(&theme, crate::shell::SettingsSection::Harnesses.icon(), "Agents", None))
                                     .child(switcher),
                             )
                             .child(
@@ -1221,7 +1221,7 @@ mod tests {
 
     #[test]
     fn explicit_sign_in_requires_installed_antigravity() {
-        use zeron_proto::HarnessId;
+        use clyra_proto::HarnessId;
         assert!(super::offers_sign_in(HarnessId::Antigravity, true));
         assert!(!super::offers_sign_in(HarnessId::Antigravity, false));
         assert!(!super::offers_sign_in(HarnessId::Codex, true));

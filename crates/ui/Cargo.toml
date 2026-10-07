@@ -1,5 +1,5 @@
 [package]
-name = "zeron-ui"
+name = "clyra-ui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -43,15 +43,15 @@ required-features = ["project-palette-fixture"]
 
 [dependencies]
 url = "2"
-zeron-proto.workspace = true
+clyra-proto.workspace = true
 similar.workspace = true
-zeron-doc.workspace = true
-zeron-engine.workspace = true
-zeron-harness.workspace = true
-zeron-rpc.workspace = true
-zeron-update.workspace = true
-zeron-syntax.workspace = true
-zeron-theme.workspace = true
+clyra-doc.workspace = true
+clyra-engine.workspace = true
+clyra-harness.workspace = true
+clyra-rpc.workspace = true
+clyra-update.workspace = true
+clyra-syntax.workspace = true
+clyra-theme.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
@@ -73,6 +73,7 @@ fontdb.workspace = true
 ttf-parser.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+reqwest.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 sha2.workspace = true

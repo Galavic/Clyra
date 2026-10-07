@@ -3,12 +3,12 @@ use std::{
     time::Duration,
 };
 
-use gpui::{
-    AnyElement, Context, ListSizingBehavior, SharedString, Task, Window, div, list, prelude::*, px,
-};
-use zeron_proto::{
+use clyra_proto::{
     ListWorkspaceDirectoryRequest, SearchWorkspaceFilesRequest, WorkspaceEntryKind,
     WorkspaceFileSearchMatch,
+};
+use gpui::{
+    AnyElement, Context, ListSizingBehavior, SharedString, Task, Window, div, list, prelude::*, px,
 };
 
 use super::{
@@ -812,7 +812,7 @@ mod reveal_tests {
 
     fn context(checkout: &str) -> FilesRequestContext {
         FilesRequestContext {
-            target: zeron_proto::WorkspaceTarget {
+            target: clyra_proto::WorkspaceTarget {
                 chat_id: Some("chat".into()),
                 space_id: None,
                 checkout_path: None,

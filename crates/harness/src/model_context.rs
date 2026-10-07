@@ -1,8 +1,8 @@
 //! Credential bytes are hashed locally and never included in diagnostics or disk catalogs.
 use crate::{HarnessError, ModelContext};
+use clyra_proto::HarnessId;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use zeron_proto::HarnessId;
 
 pub(crate) fn root(variable: &str, fallback: PathBuf) -> PathBuf {
     std::env::var_os(variable)

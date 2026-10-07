@@ -1,18 +1,18 @@
 [package]
-name = "zeron-engine"
+name = "clyra-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
-zeron-preview.workspace = true
-zeron-proto.workspace = true
-zeron-doc.workspace = true
-zeron-sync.workspace = true
-zeron-harness.workspace = true
-zeron-rpc.workspace = true
-zeron-update.workspace = true
+clyra-preview.workspace = true
+clyra-proto.workspace = true
+clyra-doc.workspace = true
+clyra-sync.workspace = true
+clyra-harness.workspace = true
+clyra-rpc.workspace = true
+clyra-update.workspace = true
 loro.workspace = true
 tokio.workspace = true
 futures.workspace = true
@@ -42,8 +42,8 @@ tempfile.workspace = true
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [dev-dependencies]
-zeron-harness = { workspace = true, features = ["installer-fixture"] }
+clyra-harness = { workspace = true, features = ["installer-fixture"] }
 zip.workspace = true
 tokio-tungstenite.workspace = true
 # In-process registry server for the two-engine workspace integration tests.
-zeron-sync = { workspace = true, features = ["mock-server"] }
+clyra-sync = { workspace = true, features = ["mock-server"] }

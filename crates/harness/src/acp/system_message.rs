@@ -4,9 +4,9 @@
 //! parrots the whole block back as its own reply text (verified against
 //! agy_acp_server 1.1.1), which would otherwise land verbatim in the chat.
 
+use clyra_proto::AgentEvent;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
-use zeron_proto::AgentEvent;
 
 use crate::HarnessError;
 

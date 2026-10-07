@@ -1,7 +1,7 @@
 //! SessionsEngine — per-chat agent runs: dispatch, steering, interrupts, input bridging,
 //! journal + broadcast fan-out, and 120ms coalesced doc streaming.
 //!
-//! Pragmatic port of zeron's `sessions.ts` (spec: feature-inventory §3.2):
+//! Pragmatic port of clyra's `sessions.ts` (spec: feature-inventory §3.2):
 //! - every `AgentEvent` is (a) appended to the on-disk run journal, (b) broadcast to
 //!   in-process subscribers, (c) folded via `fold_event_into_parts` and diffed into the
 //!   chat's `SessionDoc` through `SegmentWriter` on a coalesced `STREAM_COMMIT_MS` timer;
@@ -10,7 +10,7 @@
 //! - a `Steered` event splits the assistant entry at the exact boundary;
 //! - recovery (interrupt or a stale journal at boot) stamps the streaming entry `aborted`.
 //!
-//! Scope notes: sessions are keyed by chat id (one live run per chat). Zeron's pulse
+//! Scope notes: sessions are keyed by chat id (one live run per chat). Clyra's pulse
 //! loop is ported as the 15s liveness heartbeat in `drive_run`; its stall watchdog is
 //! deliberately NOT ported (rejected in review — agents may legitimately wait on
 //! something for far longer than any timeout, and a live child IS the working signal).
@@ -24,12 +24,12 @@ use chrono::Utc;
 use futures::StreamExt;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-use zeron_doc::{
+use clyra_doc::{
     DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
     SessionMessageEntry, fold_event_into_parts, sanitize_tool_call,
 };
-use zeron_harness::{CancellationToken, Harness, RunControls, SteerMessage};
-use zeron_proto::{
+use clyra_harness::{CancellationToken, Harness, RunControls, SteerMessage};
+use clyra_proto::{
     AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
     UserInputQuestion,
 };
@@ -59,7 +59,7 @@ type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnsw
 
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped (claude keys conversations by project
-/// directory — zeron sessions.ts:563 "harness session stores are keyed by
+/// directory — clyra sessions.ts:563 "harness session stores are keyed by
 /// cwd"), so resume is only injected for runs launched from the same cwd.
 #[derive(Debug, Clone)]
 struct HarnessSessionRef {
@@ -75,12 +75,12 @@ struct HarnessSessionRef {
 struct RuntimeConfig {
     harness_id: HarnessId,
     model: Option<String>,
-    reasoning: Option<zeron_proto::ReasoningLevel>,
+    reasoning: Option<clyra_proto::ReasoningLevel>,
     model_options: serde_json::Map<String, serde_json::Value>,
     cwd: String,
-    sandbox: zeron_proto::SandboxLevel,
+    sandbox: clyra_proto::SandboxLevel,
     auto_approve: bool,
-    worktree: Option<zeron_proto::WorktreeSpec>,
+    worktree: Option<clyra_proto::WorktreeSpec>,
 }
 
 impl RuntimeConfig {
@@ -132,6 +132,7 @@ struct RoutedSteer {
 
 struct Inner {
     device_id: String,
+    mcp_port: Mutex<u16>,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
     /// Set-once (first wins), cleared on runtime retirement: sessions and
@@ -149,7 +150,7 @@ struct Inner {
     last_requests: Mutex<HashMap<String, RunRequest>>,
     /// Harness-native session ids per chat (resume continuity across turns) —
     /// the live-process cache over the durable copy on the workspace chat row
-    /// (zeron kept the same pair on `chats.harness_session_id`). An empty
+    /// (clyra kept the same pair on `chats.harness_session_id`). An empty
     /// session id is the "do not resume" tombstone after a rejected resume.
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
@@ -183,6 +184,7 @@ impl SessionsEngine {
         Self {
             inner: Arc::new(Inner {
                 device_id,
+                mcp_port: Mutex::new(27654),
                 journal,
                 registry,
                 doc_host: Mutex::new(None),
@@ -201,6 +203,10 @@ impl SessionsEngine {
 
     /// Wire the doc host (called once at engine assembly; the two services are mutually
     /// referential by design — sessions stream into docs, docs execute commands here).
+    pub fn set_mcp_port(&self, port: u16) {
+        *lock(&self.inner.mcp_port) = port;
+    }
+
     pub fn set_doc_host(&self, host: DocHost) {
         // First set wins (the OnceLock contract this slot replaced).
         let mut slot = lock(&self.inner.doc_host);
@@ -321,7 +327,7 @@ impl SessionsEngine {
     ///
     /// - The user message entry is written to the doc immediately (id = `message_id`).
     /// - A live steerable run receives the prompt as its next turn via the mailbox
-    ///   (zeron's persistent-session routing); otherwise any live run is interrupted
+    ///   (clyra's persistent-session routing); otherwise any live run is interrupted
     ///   first — never two runtimes driving one chat.
     pub async fn dispatch(
         &self,
@@ -361,9 +367,30 @@ impl SessionsEngine {
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = expand_home(&request.cwd);
+        // Per-chat MCP identity survives resumed turns; tools use the engine's
+        // command plane and retain the harness permission policy.
+        if matches!(harness_id, HarnessId::Codex | HarnessId::ClaudeCode)
+            && request
+                .model_options
+                .get("_clyra_dot")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && let Ok(exe) = std::env::current_exe()
+        {
+            request.model_options.insert(
+                "_clyra_mcp".into(),
+                serde_json::json!({
+                    "command": exe.to_string_lossy(), "args": ["mcp"],
+                    "env": {"CLYRA_CHAT_ID": chat_id,
+                        "CLYRA_DEVICE_ID": self.inner.device_id,
+                        "CLYRA_IPC_PORT": lock(&self.inner.mcp_port).to_string()}
+                }),
+            );
+        }
+
         // Native-only catalog entries have no portable file fallback. Reject
         // cross-harness delivery before recording or routing the user turn.
-        zeron_proto::invocation::validate_harness_invocations(&request.prompt, harness_id)
+        clyra_proto::invocation::validate_harness_invocations(&request.prompt, harness_id)
             .map_err(EngineError::Other)?;
         // Every dispatched prompt is a turn — routed steer or fresh run alike.
         self.note_turn_start(chat_id, &request.cwd);
@@ -389,7 +416,7 @@ impl SessionsEngine {
                     prompt: if harness_id == HarnessId::Opencode {
                         request.prompt.clone()
                     } else {
-                        zeron_proto::invocation::harness_prompt(&request.prompt, harness_id)
+                        clyra_proto::invocation::harness_prompt(&request.prompt, harness_id)
                     },
                     message_id: Some(user_id.clone()),
                 };
@@ -452,7 +479,7 @@ impl SessionsEngine {
         let user_id = message_id.unwrap_or_else(new_id);
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;
 
-        // Engine-owned resume (zeron sessions.ts:736 — every dispatch read the
+        // Engine-owned resume (clyra sessions.ts:736 — every dispatch read the
         // chat's stored harness session): callers always send `resume: None`;
         // the engine threads the chat's prior harness session back in so a new
         // process (app restart) continues the same harness conversation. The
@@ -564,14 +591,14 @@ impl SessionsEngine {
         let Some((run_id, harness_id, steer_tx, ledger)) = target else {
             return Ok(SteerOutcome::NotSteerable);
         };
-        zeron_proto::invocation::validate_harness_invocations(prompt, harness_id)
+        clyra_proto::invocation::validate_harness_invocations(prompt, harness_id)
             .map_err(EngineError::Other)?;
         let user_id = message_id.unwrap_or_else(new_id);
         let message = SteerMessage {
             prompt: if harness_id == HarnessId::Opencode {
                 prompt.to_owned()
             } else {
-                zeron_proto::invocation::harness_prompt(prompt, harness_id)
+                clyra_proto::invocation::harness_prompt(prompt, harness_id)
             },
             message_id: Some(user_id.clone()),
         };
@@ -681,7 +708,7 @@ impl SessionsEngine {
     /// with a VISIBLE "Run interrupted by engine restart" error part, close the
     /// journal with a synthetic `Done{interrupted}` — and then PICK THE RUN BACK
     /// UP: a fresh crashed turn with revival budget left is re-dispatched against
-    /// the remembered harness session (zeron: "not just eulogized";
+    /// the remembered harness session (clyra: "not just eulogized";
     /// `MAX_AUTO_RESUME` = 3 consecutive revivals, fresh = crashed < 12h ago).
     pub fn recover_stale(&self) -> Result<usize, EngineError> {
         const MAX_AUTO_RESUME: u32 = 3;
@@ -697,7 +724,7 @@ impl SessionsEngine {
             // Harness continuity first: the crashed run's session id may only
             // exist in the journal (the debounced workspace-row write may
             // never have landed) — remember it so the revived run resumes the
-            // same harness conversation (zeron recoverDraft, sessions.ts:538).
+            // same harness conversation (clyra recoverDraft, sessions.ts:538).
             if let Some((session_id, cwd)) = self.inner.journal_harness_session(&chat_id) {
                 self.inner
                     .remember_harness_session(&chat_id, &session_id, &cwd);
@@ -762,7 +789,7 @@ impl SessionsEngine {
                 let request = sessions
                     .last_request(&chat_id)
                     .or_else(|| host.request_from_chat_row(&chat_id, &prompt_text))
-                    // Last resort: the journal's own cwd (zeron's draft config)
+                    // Last resort: the journal's own cwd (clyra's draft config)
                     // — a crash can predate the debounced workspace-row write.
                     .or_else(|| {
                         let (_, cwd) = sessions.inner.journal_harness_session(&chat_id)?;
@@ -773,7 +800,7 @@ impl SessionsEngine {
                             reasoning: None,
                             model_options: Default::default(),
                             cwd,
-                            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                            sandbox: clyra_proto::SandboxLevel::WorkspaceWrite,
                             auto_approve: false,
                             attachments: Vec::new(),
                             resume: None,
@@ -1056,7 +1083,7 @@ impl Inner {
 
     /// Record the chat's harness-native session id (and its cwd): live-process
     /// cache plus the durable workspace chat row — the row is what survives an
-    /// engine restart (zeron sessions.ts:1039).
+    /// engine restart (clyra sessions.ts:1039).
     fn remember_harness_session(&self, chat_id: &str, session_id: &str, cwd: &str) {
         if session_id.is_empty() {
             return;
@@ -1081,7 +1108,7 @@ impl Inner {
     // yields a fresh session whose SessionStarted overwrites the row.
 
     /// The session id to resume for a run in `chat_id` launching from `cwd`
-    /// (zeron sessions.ts:736, looked up on every dispatch):
+    /// (clyra sessions.ts:736, looked up on every dispatch):
     /// live-process cache → workspace chat row → journal scan (the crash path
     /// where the debounced row write never landed — SessionStarted/Done events
     /// are journaled per event, flushed immediately). Cwd-gated throughout:
@@ -1298,7 +1325,7 @@ impl SubagentSink {
         if let Err(err) = finished {
             tracing::warn!(doc = %self.doc_id, error = %err, "subagent sink finish failed");
         }
-        let entries = zeron_doc::join_continuation_entries(self.doc.read_entries().ok()?);
+        let entries = clyra_doc::join_continuation_entries(self.doc.read_entries().ok()?);
         serde_json::to_string(&entries).ok()
     }
 }
@@ -1444,7 +1471,7 @@ fn cursor_unstarted_history(
     // Convert each message before JSON encoding. Rewriting canonical chips in
     // the encoded envelope can introduce unescaped quotes or newlines and can
     // cause Cursor's current message to be converted twice.
-    let prompt = zeron_proto::invocation::harness_prompt(prompt, HarnessId::Cursor);
+    let prompt = clyra_proto::invocation::harness_prompt(prompt, HarnessId::Cursor);
     let entries = doc.read_entries()?;
     let preceding: Vec<_> = entries
         .iter()
@@ -1486,7 +1513,7 @@ fn cursor_unstarted_history(
                 .join("\n")
         })
         .filter(|text| !text.is_empty())
-        .map(|text| zeron_proto::invocation::harness_prompt(&text, HarnessId::Cursor))
+        .map(|text| clyra_proto::invocation::harness_prompt(&text, HarnessId::Cursor))
         .collect();
     if previous.is_empty() {
         return Ok(prompt);
@@ -1536,7 +1563,7 @@ async fn drive_run(
             request.resume.is_some(),
         )
         .map(|prompt| request.prompt = prompt)
-        .map_err(|e| zeron_harness::HarnessError::Protocol(e.to_string()))
+        .map_err(|e| clyra_harness::HarnessError::Protocol(e.to_string()))
     } else {
         Ok(())
     };
@@ -1545,7 +1572,7 @@ async fn drive_run(
             let mut wire_request = request;
             if !matches!(harness_id, HarnessId::Cursor | HarnessId::Opencode) {
                 wire_request.prompt =
-                    zeron_proto::invocation::harness_prompt(&wire_request.prompt, harness_id);
+                    clyra_proto::invocation::harness_prompt(&wire_request.prompt, harness_id);
             }
             harness.run(wire_request, controls).await
         }
@@ -1619,12 +1646,12 @@ async fn drive_run(
     // so the gate still catches real crashes. touch_session throttles at 10s.
     let mut live_heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
     live_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // PERSISTENT SESSION (zeron runsBySession): a completed turn on a
+    // PERSISTENT SESSION (clyra runsBySession): a completed turn on a
     // steerable harness parks here instead of ending the run — the child and
     // its steering mailbox stay warm, and the next user message (dispatch
     // routes into a live run) starts the next turn with zero respawn/resume
     // latency. `Some(when)` = idle since then; the 30-min reaper below ends
-    // a session nobody comes back to (zeron SESSION_IDLE_MS).
+    // a session nobody comes back to (clyra SESSION_IDLE_MS).
     const SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
     let mut idle_since: Option<tokio::time::Instant> = None;
     let steerable = harness.supports_steering();
@@ -1718,7 +1745,7 @@ async fn drive_run(
                     inner.touch_session(&chat_id);
                     continue;
                 }
-                // Idle reaper (zeron SESSION_IDLE_MS): a parked persistent session
+                // Idle reaper (clyra SESSION_IDLE_MS): a parked persistent session
                 // nobody returned to in 30 minutes releases its child. The turn
                 // was finalized at Done, so this end is clean — no aborted stamp.
                 _ = tokio::time::sleep_until(
@@ -1806,7 +1833,7 @@ async fn drive_run(
                     && steerable
                     && !folded.iter().any(|p| match p {
                         MessagePart::Tool { id, resolved: false, .. } => {
-                            id != zeron_proto::LIVE_PLAN_TOOL_ID
+                            id != clyra_proto::LIVE_PLAN_TOOL_ID
                         }
                         MessagePart::Input { resolved: false, .. } => true,
                         _ => false,
@@ -1922,7 +1949,7 @@ async fn drive_run(
                         }
                     }
                 }
-                zeron_doc::fold_event_into_parts(&mut folded, &event);
+                clyra_doc::fold_event_into_parts(&mut folded, &event);
                 if !dirty {
                     dirty = true;
                     flush_at = tokio::time::Instant::now()
@@ -1973,7 +2000,7 @@ async fn drive_run(
                     sink.push_user(&device_id, text);
                     continue;
                 }
-                zeron_doc::fold_event_into_parts(&mut sink.folded, sub_event);
+                clyra_doc::fold_event_into_parts(&mut sink.folded, sub_event);
                 sink.dirty = true;
                 if !chip_streaming && done {
                     // In-place chip refresh on lifecycle transitions only —
@@ -2009,7 +2036,7 @@ async fn drive_run(
                     {
                         host.upload_tool_sidecar(
                             &chat_id,
-                            zeron_doc::SidecarPayload {
+                            clyra_doc::SidecarPayload {
                                 part_id: doc_id,
                                 output: Some(json),
                                 diff: None,
@@ -2091,7 +2118,7 @@ async fn drive_run(
                 ) || matches!(
                     &event,
                     AgentEvent::ToolCall { id, .. }
-                        if id == zeron_proto::LIVE_PLAN_TOOL_ID || !seen_tools.contains(id)
+                        if id == clyra_proto::LIVE_PLAN_TOOL_ID || !seen_tools.contains(id)
                 ));
             if self_continued {
                 tracing::info!(
@@ -2160,8 +2187,8 @@ async fn drive_run(
             // treating its reappearance after a park/steer reset as a stale
             // echo dropped the todo list for the rest of the run — from the
             // first boundary on, plans never rendered again.
-            AgentEvent::ToolCall { id, .. } if id == zeron_proto::LIVE_PLAN_TOOL_ID => {}
-            AgentEvent::ToolResult { id, .. } if id == zeron_proto::LIVE_PLAN_TOOL_ID => {}
+            AgentEvent::ToolCall { id, .. } if id == clyra_proto::LIVE_PLAN_TOOL_ID => {}
+            AgentEvent::ToolResult { id, .. } if id == clyra_proto::LIVE_PLAN_TOOL_ID => {}
             AgentEvent::ToolCall { id, .. } => {
                 if !in_segment(&folded, id) && seen_tools.contains(id) {
                     continue;
@@ -2298,7 +2325,7 @@ async fn drive_run(
 
         inner.publish(&chat_id, &event);
 
-        // Defensive rule from zeron: a mid-run SessionStarted re-emission (Claude SDK
+        // Defensive rule from clyra: a mid-run SessionStarted re-emission (Claude SDK
         // background re-invocations) must not wipe the segment being written.
         let skip_fold = matches!(&event, AgentEvent::SessionStarted { .. }) && !folded.is_empty();
         if !skip_fold {
@@ -2306,7 +2333,7 @@ async fn drive_run(
             // R2 sidecar PARKED (2026-08-10, product call): the fold's
             // summary/stats ARE the doc's whole record — no refs stamped, no
             // uploads. Full outputs survive only in the host's local run
-            // journal. To reintroduce: `zeron_doc::sidecar_payload(&event)`
+            // journal. To reintroduce: `clyra_doc::sidecar_payload(&event)`
             // → `apply_sidecar_refs` → `doc_host.upload_tool_sidecar`, all
             // still in place and tested.
         }
@@ -2423,7 +2450,7 @@ async fn drive_run(
         {
             host.upload_tool_sidecar(
                 &chat_id,
-                zeron_doc::SidecarPayload {
+                clyra_doc::SidecarPayload {
                     part_id: doc_id,
                     output: Some(json),
                     diff: None,
@@ -2492,18 +2519,18 @@ async fn drive_run(
 mod tests {
     #[test]
     fn cursor_recovery_converts_rich_messages_before_json_encoding() {
-        let doc = zeron_doc::SessionDoc::init("cursor-rich-recovery").unwrap();
-        let skill = zeron_proto::invocation::Invocation::Skill {
+        let doc = clyra_doc::SessionDoc::init("cursor-rich-recovery").unwrap();
+        let skill = clyra_proto::invocation::Invocation::Skill {
             name: "review \"quoted\"".into(),
             path: "/repo/quoted \"path\"/SKILL.md".into(),
             command: None,
         }
         .link();
         let previous = format!("Previous {skill}\nSecond line with \\ and \"quotes\"");
-        doc.push_message(&zeron_doc::SessionMessageEntry {
+        doc.push_message(&clyra_doc::SessionMessageEntry {
             id: "u1".into(),
-            role: zeron_doc::MessageRole::User,
-            parts: vec![zeron_doc::MessagePart::Text {
+            role: clyra_doc::MessageRole::User,
+            parts: vec![clyra_doc::MessagePart::Text {
                 id: "u1-text".into(),
                 text: previous.clone(),
             }],
@@ -2520,31 +2547,31 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
         assert_eq!(
             parsed["currentUserMessage"],
-            zeron_proto::invocation::harness_prompt(&current, zeron_proto::HarnessId::Cursor)
+            clyra_proto::invocation::harness_prompt(&current, clyra_proto::HarnessId::Cursor)
         );
         assert_eq!(
             parsed["previousUserMessages"][0],
-            zeron_proto::invocation::harness_prompt(&previous, zeron_proto::HarnessId::Cursor)
+            clyra_proto::invocation::harness_prompt(&previous, clyra_proto::HarnessId::Cursor)
         );
     }
 
     #[test]
     fn cursor_without_a_session_id_retains_only_preceding_user_messages() {
-        let doc = zeron_doc::SessionDoc::init("cursor-unstarted").unwrap();
+        let doc = clyra_doc::SessionDoc::init("cursor-unstarted").unwrap();
         for (id, role, text) in [
             (
                 "u1",
-                zeron_doc::MessageRole::User,
+                clyra_doc::MessageRole::User,
                 "first interrupted request",
             ),
-            ("a1", zeron_doc::MessageRole::Assistant, "partial output"),
-            ("u2", zeron_doc::MessageRole::User, "current request"),
-            ("u3", zeron_doc::MessageRole::User, "future pending request"),
+            ("a1", clyra_doc::MessageRole::Assistant, "partial output"),
+            ("u2", clyra_doc::MessageRole::User, "current request"),
+            ("u3", clyra_doc::MessageRole::User, "future pending request"),
         ] {
-            doc.push_message(&zeron_doc::SessionMessageEntry {
+            doc.push_message(&clyra_doc::SessionMessageEntry {
                 id: id.into(),
                 role,
-                parts: vec![zeron_doc::MessagePart::Text {
+                parts: vec![clyra_doc::MessagePart::Text {
                     id: format!("{id}-text"),
                     text: text.into(),
                 }],
@@ -2582,7 +2609,7 @@ mod tests {
     }
 
     use super::{RuntimeConfig, subagent_doc_id};
-    use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
+    use clyra_proto::{HarnessId, RunRequest, SandboxLevel};
 
     #[tokio::test]
     async fn generated_image_failure_is_sanitized_even_inside_subagents() {
@@ -2613,7 +2640,7 @@ mod tests {
             &mut parts,
             &AgentEvent::ToolCall {
                 id: "i".into(),
-                call: zeron_proto::ToolCall::Unknown {
+                call: clyra_proto::ToolCall::Unknown {
                     name: "Generate image".into(),
                     input: None,
                 },
@@ -2651,7 +2678,7 @@ mod tests {
             prompt: "first".into(),
             harness: None,
             model: Some("grok-4.6".into()),
-            reasoning: Some(zeron_proto::ReasoningLevel::High),
+            reasoning: Some(clyra_proto::ReasoningLevel::High),
             model_options: serde_json::Map::new(),
             cwd: "/tmp".into(),
             sandbox: SandboxLevel::WorkspaceWrite,
@@ -2676,7 +2703,7 @@ mod tests {
         assert!(!config.can_route(HarnessId::Grok, &follow_up));
         follow_up.model = initial.model.clone();
 
-        follow_up.reasoning = Some(zeron_proto::ReasoningLevel::Medium);
+        follow_up.reasoning = Some(clyra_proto::ReasoningLevel::Medium);
         assert!(!config.can_route(HarnessId::Grok, &follow_up));
         follow_up.reasoning = initial.reasoning;
 

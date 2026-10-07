@@ -259,7 +259,7 @@ impl Render for FilesSettingsPage {
                     .track_scroll(&self.scroll.scroll)
                     .child(
                         widgets::page_column()
-                            .child(widgets::page_header(&theme, "Files", None))
+                            .child(widgets::page_header(&theme, crate::shell::SettingsSection::Files.icon(), "Files", None))
                             .child(
                                 widgets::page_subtitle(
                                     &theme,

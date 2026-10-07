@@ -2,11 +2,11 @@
 //! local mock provider; PI_LIVE_DIR contains the wrapper's adapter.pid file.
 #![cfg(unix)]
 
+use clyra_harness::{AcpHarness, CancellationToken, Harness, RunControls, SteerMessage};
+use clyra_proto::{AgentEvent, DoneStatus, RunRequest, SandboxLevel};
 use futures::StreamExt;
 use std::{path::PathBuf, time::Duration};
 use tokio::sync::{mpsc, oneshot};
-use zeron_harness::{AcpHarness, CancellationToken, Harness, RunControls, SteerMessage};
-use zeron_proto::{AgentEvent, DoneStatus, RunRequest, SandboxLevel};
 
 #[tokio::test]
 #[ignore = "requires an isolated real Pi adapter and local mock provider"]

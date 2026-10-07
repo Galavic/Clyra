@@ -144,7 +144,7 @@ foreground focus and was discarded, rather than counted as a resource result.
 
 ## Reproduction
 
-Build with `cargo build --release --locked -p zeron`, and copy each binary to an
+Build with `cargo build --release --locked -p clyra`, and copy each binary to an
 immutable path before profiling. Use an unlocked, awake display with no concurrent
 build or test workload. The native helper sizes the foreground window to 1320×880
 points and rejects focus loss. Default dark appearance and animations are enabled.
@@ -154,7 +154,7 @@ CLAUDE_CODE_EXECUTABLE="$PWD/scripts/replay-claude.py" \
 ZERON_REPLAY_JOURNAL="$PWD/scripts/fixtures/resource-stream.jsonl" \
 ZERON_PROFILE_BACKGROUND_CHATS=50 ZERON_PROFILE_SUBMIT_UI=1 \
 ZERON_PROFILE_PROMPT='Replay fixture.' \
-node scripts/resource-profile.mjs /path/to/zeron /tmp/fresh-profile claude-code
+node scripts/resource-profile.mjs /path/to/clyra /tmp/fresh-profile claude-code
 ```
 
 The fixture emits 52,624 combined text/reasoning bytes with a 40 ms delta delay.

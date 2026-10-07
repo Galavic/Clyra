@@ -15,10 +15,10 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use zeron_doc::{MessageRole, MessageStatus, SessionCommandPayload, SessionMessageEntry};
-use zeron_engine::{EngineCore, HarnessRegistry};
-use zeron_harness::{Harness, HarnessError, RunControls};
-use zeron_proto::{
+use clyra_doc::{MessageRole, MessageStatus, SessionCommandPayload, SessionMessageEntry};
+use clyra_engine::{EngineCore, HarnessRegistry};
+use clyra_harness::{Harness, HarnessError, RunControls};
+use clyra_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
     SteeringMode,
 };
@@ -130,10 +130,10 @@ async fn transcript_survives_open_racing_create_chat() {
         let live_writer_ref = handle.doc_arc();
 
         // The mint lands a beat later, exactly as the composer sends it.
-        let client = zeron_rpc::memory_client(core.rpc_service());
+        let client = clyra_rpc::memory_client(core.rpc_service());
         client
             .call(
-                zeron_rpc::methods::MUTATE,
+                clyra_rpc::methods::MUTATE,
                 serde_json::json!({
                     "op": "createChat",
                     "chatId": CHAT,

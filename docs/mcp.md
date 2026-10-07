@@ -1,12 +1,12 @@
-# Zeron MCP server
+# Clyra MCP server
 
-`zeron mcp` serves the Model Context Protocol on stdin/stdout and proxies every
+`clyra mcp` serves the Model Context Protocol on stdin/stdout and proxies every
 tool into the running engine's localhost IPC (`ws://127.0.0.1:$ZERON_IPC_PORT`,
-default 27654) — the same `zeron_rpc` surface the headed app and `zeron sync`
-dial. It is a subcommand of the one `zeron` binary: no Node runtime, no extra
+default 27654) — the same `clyra_rpc` surface the headed app and `clyra sync`
+dial. It is a subcommand of the one `clyra` binary: no Node runtime, no extra
 install, a few MB resident.
 
-Crate: `crates/mcp` (`zeron-mcp`). The protocol layer is hand-rolled
+Crate: `crates/mcp` (`clyra-mcp`). The protocol layer is hand-rolled
 (`initialize`, `ping`, `tools/list`, `tools/call`; newline-delimited JSON-RPC
 2.0) — the repo already owns JSON-RPC framing for the Codex and ACP drivers and
 the stdio tool-server subset is tiny, so no SDK dependency was taken.
@@ -23,7 +23,7 @@ originating chat in the environment:
 | `ZERON_DEVICE_ID` | That chat's host device.                                      |
 
 When `ZERON_CHAT_ID` is set, every `send_message` is prefixed with a
-`[Message from Zeron chat <title> (<id8>) …]` line so the receiving agent and the
+`[Message from Clyra chat <title> (<id8>) …]` line so the receiving agent and the
 human reading that transcript can tell an agent-to-agent message from a typed
 one, and the server refuses to message its own chat.
 
@@ -44,10 +44,20 @@ require `parent_chat_id == None`. Children remain addressable by id, deep
 link, and every MCP tool; `list_chats { parent }` is how an orchestrator
 finds them.
 
-Nothing is injected yet: every harness still launches with an empty MCP config
-(`claude/mod.rs --strict-mcp-config`, ACP `session/new mcpServers: []`, codex
-`mcp_servers.*.enabled = false`). Wiring the injection per harness is the
-follow-up; the env contract above is what it will set.
+Codex and Claude Code receive the Clyra MCP server automatically in dot
+conversations, scheduled dot runs and their delegated agents, with
+`CLYRA_CHAT_ID`, `CLYRA_DEVICE_ID`, and the configured
+`CLYRA_IPC_PORT`. Title generation stays isolated. Other harnesses do not yet
+receive this injection.
+
+Dots use `delegate_task { title, prompt }` for independent work. Children inherit
+the coordinator's project, checkout, harness, model options and sandbox. Up to
+four children can be active; delegation through this tool cannot recurse. The
+coordinator assigns disjoint file scopes because children share a checkout.
+Every ten seconds the engine checks completed worker turns and queues their
+results back to the coordinator, including when its turn has already ended.
+Reported completion markers are persisted in `automations.json`. Activity lists
+child sessions and their real working, approval and error states.
 
 ## Tools
 
@@ -91,7 +101,7 @@ done (this was the one bug the first live run found).
 ## Smoke recipe
 
 ```sh
-BIN=target/debug/zeron
+BIN=target/debug/clyra
 { echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}'
   echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_chats","arguments":{"limit":5}}}'
   sleep 5; } | ZERON_IPC_PORT=27655 $BIN mcp
@@ -99,5 +109,5 @@ BIN=target/debug/zeron
 
 `create_chat` with `"prompt": "Reply with exactly the word pong", "wait": true`
 against a live daemon returns the assistant's `pong` in a few seconds; archive
-the chat afterwards with `archive_chat`. Unit tests (`cargo test -p zeron-mcp`)
+the chat afterwards with `archive_chat`. Unit tests (`cargo test -p clyra-mcp`)
 drive the whole tool set against an in-memory stub `RpcService`.

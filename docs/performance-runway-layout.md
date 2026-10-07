@@ -74,7 +74,7 @@ claim. Normal shared-host noise limits interpretation of small differences.
 
 ## Reproduction
 
-Build each revision with `cargo build --release --locked -p zeron`, copy each
+Build each revision with `cargo build --release --locked -p clyra`, copy each
 binary to an immutable path, and run `scripts/resource-profile.mjs` sequentially
 in main/candidate/candidate/main order for each workload. Use:
 

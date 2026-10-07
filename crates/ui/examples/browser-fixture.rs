@@ -1,17 +1,17 @@
-#[path = "browser-fixture/transcript_links.rs"]
-mod transcript_links;
 #[cfg(target_os = "linux")]
 #[path = "browser-fixture/linux.rs"]
 mod linux;
+#[path = "browser-fixture/transcript_links.rs"]
+mod transcript_links;
 // Real shell + native WebKit smoke test and screenshot fixture. Synthetic
 // chat data, isolated temp storage, loopback-only website, no engine services.
+use clyra_ui::*;
 use gpui::{AppContext, AsyncApp, Bounds, WindowBounds, WindowOptions, px, size};
 use std::{
     io::{Read, Write},
     path::PathBuf,
     time::Duration,
 };
-use zeron_ui::*;
 
 async fn pause(cx: &mut AsyncApp, ms: u64) {
     cx.background_executor()
@@ -126,7 +126,7 @@ fn main() -> anyhow::Result<()> {
     let output = PathBuf::from(
         std::env::args()
             .nth(1)
-            .unwrap_or_else(|| "/tmp/zeron-browser-captures".into()),
+            .unwrap_or_else(|| "/tmp/clyra-browser-captures".into()),
     );
     std::fs::create_dir_all(&output)?;
     let temp = tempfile::tempdir()?;
@@ -176,8 +176,8 @@ fn main() -> anyhow::Result<()> {
         composer::init(cx, settings.composer_send_behavior); terminal::panel::init(cx); app_menus::init(cx);
         let state = cx.new(|_| {
             let mut s = state::AppState::new();
-            s.connection = zeron_proto::view::ConnectionStatus::Ready;
-            s.workspace_scope = Some(zeron_proto::WorkspaceScope::Local);
+            s.connection = clyra_proto::view::ConnectionStatus::Ready;
+            s.workspace_scope = Some(clyra_proto::WorkspaceScope::Local);
             s.local_device_id = Some("local".into());
             s.devices = vec![serde_json::from_value(serde_json::json!({"id":"local","name":"This device","platform":std::env::consts::OS,"lastSeenAt":null})).unwrap()];
             s.selected_chat = Some("browser-fixture".into()); s.selected_space = Some("project".into());
@@ -206,7 +206,7 @@ fn main() -> anyhow::Result<()> {
                         {"id":"fixture-user","role":"user","parts":[{"id":"text","kind":"text","text":"Build a calm, thoughtful workspace for Fieldnotes. Let’s preview the landing page beside this conversation."}],"createdAt":1788900000000_i64,"deviceId":"local"},
                         {"id":"fixture-assistant","role":"assistant","parts":[{"id":"text","kind":"text","text":"The first layout is ready to review.\n\nIt uses warm neutrals, generous spacing, and a simple hierarchy. The workspace cards stay readable as the preview gets narrower.\n\nOpen **Browser** from the sidebar’s **+** menu to keep the page beside your work."}],"createdAt":1788900001000_i64,"deviceId":"local","status":"complete"}
                     ])).unwrap();
-                    s.receive_transcript_frame(zeron_doc::TranscriptFrame::Reset { reset: entries }, cx).unwrap();
+                    s.receive_transcript_frame(clyra_doc::TranscriptFrame::Reset { reset: entries }, cx).unwrap();
                 });
                 let (first_id, first) = window.update(cx, |shell, w, cx| shell.fixture_open_browser(None, w, cx))?;
                 pause(cx, 500).await;
@@ -349,7 +349,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 #[cfg(target_os = "macos")]
                 {
-                    cx.update(|cx|appearance::set_surface(zeron_theme::SurfacePreference::Frosted,cx));
+                    cx.update(|cx|appearance::set_surface(clyra_theme::SurfacePreference::Frosted,cx));
                     first.read_with(cx, |b,_| b.fixture_eval("(() => {let grid=document.createElement('div'); grid.id='browser-blur-grid'; grid.style='height:140px;background:repeating-conic-gradient(#172f25 0% 25%,#f5f0df 0% 50%) 0 0/16px 16px'; document.body.style.paddingTop='0'; document.body.prepend(grid);})()"));
                     pause(cx,300).await;
                     let mut layout_video = std::process::Command::new("/usr/sbin/screencapture").args(["-v","-V","30","-C","-k","-D","1"]).arg(output.join("browser-layout.mov")).spawn()?;
@@ -442,11 +442,11 @@ fn main() -> anyhow::Result<()> {
                     pause(cx,500).await;
                     capture(&output,"browser-blur-solid-light")?;
                     let window_width=gpui::AnyWindowHandle::from(window).update(cx,|_,w,_|f32::from(w.viewport_size().width))?;
-                    cx.update(|cx|appearance::set_surface(zeron_theme::SurfacePreference::Opaque,cx));
+                    cx.update(|cx|appearance::set_surface(clyra_theme::SurfacePreference::Opaque,cx));
                     pause(cx,500).await;
                     anyhow::ensure!(first.read_with(cx,|b,_|b.fixture_backdrops().is_empty()),"opaque appearance retained native blur");
                     capture(&output,"browser-menu-opaque")?;
-                    cx.update(|cx| {appearance::set_mode(appearance::AppearanceMode::Dark,cx);appearance::set_surface(zeron_theme::SurfacePreference::Frosted,cx);});
+                    cx.update(|cx| {appearance::set_mode(appearance::AppearanceMode::Dark,cx);appearance::set_surface(clyra_theme::SurfacePreference::Frosted,cx);});
                     window.update(cx,|s,_,cx|s.fixture_browser_menu(false,cx))?;
                     pause(cx,500).await;
                     anyhow::ensure!(first.read_with(cx,|b,_|b.fixture_backdrops().is_empty()),"dismissed menu retained native blur");

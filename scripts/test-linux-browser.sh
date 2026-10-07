@@ -76,7 +76,7 @@ record_fixture() {
 }
 export WAYLAND_DISPLAY= GDK_BACKEND=x11
 record_fixture x11
-export WAYLAND_DISPLAY=zeron-browser-test GDK_BACKEND=wayland
+export WAYLAND_DISPLAY=clyra-browser-test GDK_BACKEND=wayland
 weston --backend=x11 --renderer=pixman --shell=kiosk-shell.so --socket="$WAYLAND_DISPLAY" \
   --idle-time=0 --width=1000 --height=680 >"$output/weston.log" 2>&1 &
 processes+=("$!")

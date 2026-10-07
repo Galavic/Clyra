@@ -5,7 +5,7 @@ name: deploy
 # gracefully until the CLOUDFLARE_API_TOKEN secret is configured (until then:
 # `npm -C edge run deploy` from a wrangler-authenticated machine).
 #
-# The token needs: Workers Scripts (edit), Workers Routes (edit) on zeron.sh,
+# The token needs: Workers Scripts (edit), Workers Routes (edit) on clyra-cli.xyz,
 # Workers R2 Storage (edit). Account id is pinned in edge/wrangler.jsonc.
 
 on:
@@ -66,70 +66,6 @@ jobs:
         working-directory: edge
         run: npx wrangler deploy
 
-  # Static landing page (zeron.sh) — assets-only worker, no build step.
-  landing:
-    runs-on: ubuntu-latest
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: detect landing changes
-        id: changed
-        shell: bash
-        run: |
-          before="${{ github.event.before }}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
-            || [ -z "$before" ] || ! git cat-file -e "$before" 2>/dev/null; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          if git diff --name-only "$before" "$GITHUB_SHA" | grep -qE "^(apps/landing/|\.github/workflows/deploy\.yml)"; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
-      - uses: actions/setup-node@v4
-        if: steps.changed.outputs.changed == 'true'
-        with:
-          node-version: 22
-      - name: test
-        if: steps.changed.outputs.changed == 'true'
-        working-directory: apps/landing
-        run: node --test *.test.mjs
-      - name: deploy
-        if: steps.changed.outputs.changed == 'true' && env.CLOUDFLARE_API_TOKEN != ''
-        working-directory: apps/landing
-        run: npx wrangler@4 deploy
-
-  # www.zeron.sh → zeron.sh 301 (see apps/www-redirect/wrangler.jsonc).
-  www-redirect:
-    runs-on: ubuntu-latest
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: detect www-redirect changes
-        id: changed
-        shell: bash
-        run: |
-          before="${{ github.event.before }}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
-            || [ -z "$before" ] || ! git cat-file -e "$before" 2>/dev/null; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          if git diff --name-only "$before" "$GITHUB_SHA" | grep -qE "^(apps/www-redirect/|\.github/workflows/deploy\.yml)"; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
-      - uses: actions/setup-node@v4
-        if: steps.changed.outputs.changed == 'true'
-        with:
-          node-version: 22
-      - name: deploy
-        if: steps.changed.outputs.changed == 'true' && env.CLOUDFLARE_API_TOKEN != ''
-        working-directory: apps/www-redirect
-        run: npx wrangler@4 deploy
+  # NOTE: the landing page lives on Vercel (clyra-cli.xyz), NOT on Cloudflare.
+  # The old CF landing + www-redirect jobs were removed so CI never clobbers
+  # the Vercel site. www → apex redirect is handled in the Vercel dashboard.

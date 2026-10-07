@@ -1,7 +1,7 @@
 //! The pending-message queue, docked above the composer.
 //!
 //! Everything you typed while the agent was busy, in the order it will be sent.
-//! The rows live on the session doc ([`zeron_doc::QueuedMessage`]), so the phone
+//! The rows live on the session doc ([`clyra_doc::QueuedMessage`]), so the phone
 //! shows the same queue and either device can reorder it.
 //!
 //! Each row exposes a `Send now` control that interrupts the active response.
@@ -13,8 +13,8 @@ use gpui::{
     SharedString, StatefulInteractiveElement as _, Styled, Window, div, prelude::*, px,
 };
 
-use zeron_doc::{QueueDeliveryGate, QueuedMessage};
-use zeron_rpc::methods;
+use clyra_doc::{QueueDeliveryGate, QueuedMessage};
+use clyra_rpc::methods;
 
 use crate::composer::{Composer, QUEUE_COMPOSER_OVERLAP};
 use crate::icons::{self, icon};
@@ -181,6 +181,7 @@ fn one_line(text: &str) -> SharedString {
 /// an older client may still have stored the attachment trailer in `text`.
 /// Hide it only when the parsed paths exactly match the row's attachment field.
 fn queue_visible_text(text: &str, attachments: &[String]) -> String {
+    let text = crate::teams::conversation_message(text);
     let text = crate::appshots::strip_context_for_display(text);
     if text.trim().is_empty() && !attachments.is_empty() {
         return crate::attachments::ATTACHMENT_ONLY_TEXT.to_string();
@@ -298,7 +299,7 @@ impl Composer {
             let chat_id = state.selected_chat.clone()?;
             let host_supports_actions = state.chat_host_supports(
                 &chat_id,
-                zeron_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1,
+                clyra_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1,
             );
             (state.queue.clone(), chat_id, host_supports_actions)
         };
@@ -1117,7 +1118,7 @@ impl Composer {
             };
             let supported = state.chat_host_supports(
                 &chat_id,
-                zeron_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1,
+                clyra_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1,
             );
             (chat_id, host_device_id, supported)
         };
@@ -1236,7 +1237,7 @@ impl Composer {
                 item.delivery_gate.is_some(),
                 state.chat_host_supports(
                     chat_id,
-                    zeron_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1,
+                    clyra_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1,
                 ),
             )
         };
@@ -1268,7 +1269,7 @@ impl Composer {
             else {
                 return;
             };
-            let capability = zeron_proto::capabilities::MESSAGE_QUEUE_EDIT_LEASE_V1;
+            let capability = clyra_proto::capabilities::MESSAGE_QUEUE_EDIT_LEASE_V1;
             let supported = engine.engine_info().supports(capability)
                 && state.chat_host_supports(&chat_id, capability);
             (chat_id, host_device_id, supported)
@@ -1509,6 +1510,7 @@ impl Composer {
             return;
         };
         let expected = self.queue_edit_base_text_hash.clone();
+        let text = text.map(|text| self.dot_prompt(&text));
         let mut staged = self.staged().to_vec();
         let staged_appshots = self.staged_appshots().to_vec();
         staged.extend(staged_appshots.iter().map(|shot| shot.screenshot.clone()));
@@ -1691,7 +1693,7 @@ impl Composer {
             let supported = !queue_action_needs_host(method)
                 || state.chat_host_supports(
                     &chat_id,
-                    zeron_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1,
+                    clyra_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1,
                 );
             (chat_id, host, supported)
         };
@@ -1787,7 +1789,7 @@ impl Composer {
 
 #[cfg(test)]
 mod tests {
-    use zeron_rpc::methods;
+    use clyra_rpc::methods;
 
     use super::{
         PANEL_PAD_TOP, QueuePrimaryAction, ROW_SLOT, available_queue_primary_action,
@@ -1831,8 +1833,8 @@ mod tests {
     #[test]
     fn queue_shortcut_targets_the_most_recently_added_row() {
         let items = vec![
-            zeron_doc::QueuedMessage::new("older", "first", "device"),
-            zeron_doc::QueuedMessage::new("newer", "second", "device"),
+            clyra_doc::QueuedMessage::new("older", "first", "device"),
+            clyra_doc::QueuedMessage::new("newer", "second", "device"),
         ];
         assert_eq!(latest_queued_message(&items).unwrap().id, "newer");
         assert!(latest_queued_message(&[]).is_none());
