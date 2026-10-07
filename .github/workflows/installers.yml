@@ -1,0 +1,97 @@
+name: Clyra installers
+
+# Builds downloadable installers without publishing a release or updating any feed.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Locate shader compiler
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/fxc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe is required' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+      - name: Install setup compiler
+        run: choco install innosetup --yes --no-progress
+      - name: Build installer
+        run: ./scripts/build-windows-installer.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Clyra-Windows-x64
+          path: |
+            target/package/*-setup.exe
+            target/package/*.sha256
+            target/package/*.zip
+          if-no-files-found: error
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Build disk image
+        run: bash scripts/package-macos.sh
+      - name: Verify app and disk image
+        run: |
+          target/package/Clyra.app/Contents/MacOS/clyra --version
+          codesign --verify --strict target/package/Clyra.app
+          hdiutil verify target/package/*.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Clyra-macOS-${{ runner.arch }}
+          path: target/package/*.dmg
+          if-no-files-found: error
+
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Desktop and packaging dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev dpkg-dev
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Build desktop installers
+        run: bash scripts/package-linux.sh
+      - name: Verify Debian installer
+        run: |
+          test "$(find target/package -maxdepth 1 -name '*.deb' | wc -l)" = 1
+          sudo apt-get install -y ./target/package/*.deb
+          clyra --version
+          test -f /usr/share/applications/clyra.desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Clyra-Linux-${{ runner.arch }}
+          path: |
+            target/package/*.deb
+            target/package/*.tar.gz
+          if-no-files-found: error

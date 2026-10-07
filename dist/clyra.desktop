@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Clyra
+GenericName=Coding Agent Controller
+Comment=Multi-device controller for coding agents
+Exec=clyra %u
+TryExec=clyra
+Icon=clyra
+Terminal=false
+Categories=Development;Utility;
+Keywords=agent;claude;codex;ai;coding;
+StartupWMClass=clyra
+MimeType=x-scheme-handler/clyra;
