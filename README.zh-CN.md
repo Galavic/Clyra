@@ -4,7 +4,7 @@
 
 *[English](README.md) | 简体中文*
 
-![Clyra 驱动一个 Claude Code 会话，侧边栏是实时的分支 diff](apps/landing/public/assets/app-screenshot.jpg)
+![Clyra 巨像主视觉](assets/colossus-bg.png)
 
 每台设备各跑一个小引擎，会话就存在这台设备上。装完默认是纯本地模式，不用账号，也不用联网。
 

@@ -4,7 +4,7 @@ One window for every coding agent you run — Claude Code, Codex, Cursor, Devin,
 
 *English | [简体中文](README.zh-CN.md)*
 
-![Clyra driving a Claude Code session with a live branch diff sidebar](apps/landing/public/assets/app-screenshot.jpg)
+![Clyra colossus artwork](assets/colossus-bg.png)
 
 Each of your devices runs a small engine that keeps its sessions right there. A fresh install starts local-only: no account, no network needed.
 
