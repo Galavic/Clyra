@@ -21,6 +21,9 @@ The source changes must be committed in the Clyra repository before running it.
   if it is not discovered by GPUI. `-CompilerPath` accepts a portable `ISCC.exe`.
   `-SkipBuild` packages an already compiled release. An optional HTTPS `-ReleasesUrl`
   configures the managed Windows update feed.
+  The setup also includes the x64 Visual C++ runtime from the installed Visual Studio
+  redistributable directory alongside the executable, using Microsoft's
+  [app-local deployment](https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files).
 - macOS: run `bash scripts/package-macos.sh` on each architecture. The existing
   `CODESIGN_IDENTITY` and `NOTARY_*` variables enable Developer ID signing and notarization.
   The installer workflow uses ad-hoc signing unless a separate signed release is built.

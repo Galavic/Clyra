@@ -38,6 +38,16 @@ try {
     $stage = Join-Path $out "clyra-$version-windows-x86_64"
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
     Copy-Item -LiteralPath './target/release/clyra.exe' -Destination (Join-Path $stage 'clyra.exe')
+    # App-local CRT deployment lets the per-user installer run on machines
+    # without Visual Studio or a separately installed VC++ redistributable.
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+    if (-not (Test-Path -LiteralPath $vswhere)) { throw 'Visual Studio redistributable runtime locator is missing' }
+    $vsRoot = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    if (-not $vsRoot) { throw 'Visual Studio C++ build tools are required to package their redistributable runtime' }
+    $runtime = Get-ChildItem -Path "$vsRoot/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT/vcruntime140.dll" |
+        Sort-Object FullName -Descending | Select-Object -First 1
+    if (-not $runtime) { throw 'Visual C++ x64 redistributable runtime is missing' }
+    Copy-Item -Path (Join-Path $runtime.DirectoryName '*.dll') -Destination $stage
     $updateConfig = Join-Path $stage 'clyra-update.json'
     if ($ReleasesUrl) {
         [IO.File]::WriteAllText($updateConfig, (@{ releases_url = $ReleasesUrl } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
