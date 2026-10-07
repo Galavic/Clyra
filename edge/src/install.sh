@@ -1,7 +1,7 @@
 #!/bin/sh
 # Clyra (native) headless installer.
 #
-#   curl -fsSL https://zeron.sh/install.sh | sh
+#   curl -fsSL https://clyra-cli.xyz/install.sh | sh
 #
 # Installs the self-contained native binary (no runtime deps) to
 # ~/.clyra/app, puts `clyra` on PATH, and runs it as a local-only
@@ -13,8 +13,6 @@
 # client-id configuration needed. Overrides (if any) go in ~/.clyra/env.
 set -eu
 
-BASE="${CLYRA_BASE_URL:-${ZERON_BASE_URL:-https://zeron.sh}}"
-
 # --- platform ---------------------------------------------------------------
 os="$(uname -s)"
 arch="$(uname -m)"
@@ -22,7 +20,7 @@ case "$os" in
   Linux) plat=linux ;;
   Darwin)
     echo "clyra install: on macOS, download the desktop app instead:" >&2
-    echo "  $BASE/releases/latest.txt → $BASE/releases/clyra-<version>-macos-arm64.dmg" >&2
+    echo "  https://github.com/Galavic/Clyra/releases/latest (clyra-<version>-macos-arm64.dmg)" >&2
     exit 1
     ;;
   *)
@@ -40,9 +38,14 @@ case "$arch" in
 esac
 
 # --- download ----------------------------------------------------------------
-ver="$(curl -fsSL "$BASE/releases/latest.txt" | tr -d '[:space:]')"
-[ -n "$ver" ] || { echo "clyra install: could not resolve latest version" >&2; exit 1; }
+# Latest version resolves from the GitHub release tag (no extra file host).
+ver="$(curl -fsSL https://api.github.com/repos/Galavic/Clyra/releases/latest \
+  | grep '"tag_name"' | head -1 | cut -d'"' -f4 | sed 's/^v//')"
+case "$ver" in
+  *[!0-9.]* | "" | *.*.*.*) echo "clyra install: could not resolve latest version" >&2; exit 1 ;;
+esac
 file="clyra-$ver-$plat-$arch.tar.gz"
+url="https://github.com/Galavic/Clyra/releases/download/v$ver/$file"
 data_root="$HOME/.clyra"
 app_root="$data_root/app"
 dest="$app_root/$ver"
@@ -53,7 +56,7 @@ else
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
   echo "downloading clyra $ver ($plat-$arch)…"
-  curl -fSL --progress-bar "$BASE/releases/$file" -o "$tmp/$file"
+  curl -fSL --progress-bar "$url" -o "$tmp/$file"
   mkdir -p "$dest"
   tar -xzf "$tmp/$file" -C "$dest" --strip-components=1
 fi

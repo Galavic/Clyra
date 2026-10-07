@@ -1,12 +1,12 @@
 # Clyra
 
-Control your coding agents (Claude Code, Codex, Cursor, Devin, Grok, Hermes, Pi, Antigravity) locally by default, with optional multi-device sync.
+One window for every coding agent you run — Claude Code, Codex, Cursor, Devin, Grok, Hermes, Pi, Antigravity — on your own hardware first, with optional sync between your devices.
 
 *English | [简体中文](README.zh-CN.md)*
 
 ![Clyra driving a Claude Code session with a live branch diff sidebar](apps/landing/public/assets/app-screenshot.jpg)
 
-Every device runs a small engine that stores sessions on that device. A new installation starts in local-only mode without an account or a network connection.
+Each of your devices runs a small engine that keeps its sessions right there. A fresh install starts local-only: no account, no network needed.
 
 ## Desktop installers (Windows, macOS, Linux)
 
@@ -66,6 +66,6 @@ and run `clyra.exe`. See the [development notes](docs/reference/windows-developm
 
 ---
 
-Developing or curious how it works? [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/zeronsh/clyra) or check out [ARCHITECTURE.md](ARCHITECTURE.md).
+Developing or curious how it works? [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Galavic/Clyra) or check out [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Licensed under the [MIT License](LICENSE).
